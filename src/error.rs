@@ -17,6 +17,12 @@ pub enum RingDbError {
     #[error("invalid query: {0}")]
     InvalidQuery(String),
 
+    #[error("backend unavailable: {0}")]
+    BackendUnavailable(String),
+
+    #[error("backend error: {0}")]
+    Backend(String),
+
     #[error(
         "storage mode mismatch: use fetch_pod() for Pod storage and fetch_payload() for Serde storage"
     )]

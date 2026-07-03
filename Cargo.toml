@@ -16,6 +16,10 @@ documentation = "https://docs.rs/ring-db"
 name = "ringdb"
 path = "src/lib.rs"
 
+[features]
+default = []
+cuda = []
+
 [[example]]
 name = "cli"
 path = "examples/cli.rs"

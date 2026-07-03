@@ -1,6 +1,6 @@
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use rand::{RngExt, SeedableRng};
-use ringdb::{QueryResult, RingDb, RingDbConfig, RingQuery};
+use ringdb::{BackendPreference, QueryResult, RingDb, RingDbConfig, RingQuery};
 
 /// ringdb CLI — generate a random dataset and run a ring query.
 ///
@@ -29,12 +29,31 @@ struct Cli {
     /// Random seed for reproducibility.
     #[arg(long, default_value_t = 42)]
     seed: u64,
+
+    /// Compute backend to use.
+    #[arg(long, value_enum, default_value_t = CliBackend::Cpu)]
+    backend: CliBackend,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliBackend {
+    Cpu,
+    Cuda,
+}
+
+impl From<CliBackend> for BackendPreference {
+    fn from(value: CliBackend) -> Self {
+        match value {
+            CliBackend::Cpu => BackendPreference::Cpu,
+            CliBackend::Cuda => BackendPreference::Cuda,
+        }
+    }
 }
 
 fn main() {
     let cli = Cli::parse();
 
-    let config = RingDbConfig::new(cli.dims);
+    let config = RingDbConfig::new(cli.dims).with_backend_preference(cli.backend.into());
 
     println!("ringdb demo");
     println!("  dataset : {} vectors × {} dims", cli.n, cli.dims);

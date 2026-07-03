@@ -2,6 +2,8 @@ use std::path::Path;
 use std::time::Instant;
 
 use crate::BackendPreference;
+#[cfg(feature = "cuda")]
+use crate::backend::CudaBackend;
 use crate::backend::{CpuBackend, RingComputeBackend};
 use crate::config::RingDbConfig;
 use crate::error::{Result, RingDbError};
@@ -18,6 +20,25 @@ fn into_hits(responses: Vec<crate::backend::QueryResponse>) -> Vec<Hit> {
             dist_sq: r.dist_sq,
         })
         .collect()
+}
+
+fn make_backend(preference: BackendPreference) -> Result<Box<dyn RingComputeBackend>> {
+    match preference {
+        BackendPreference::Cpu => Ok(Box::new(CpuBackend::new())),
+        BackendPreference::Cuda => {
+            #[cfg(feature = "cuda")]
+            {
+                Ok(Box::new(CudaBackend::new()?))
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                Err(RingDbError::BackendUnavailable(
+                    "CUDA backend requires building ring-db with the `cuda` Cargo feature"
+                        .to_string(),
+                ))
+            }
+        }
+    }
 }
 
 // ─── RingDb (builder) ────────────────────────────────────────────────────────
@@ -85,9 +106,7 @@ impl<T: Payload> RingDb<T> {
     /// let payloads = db.fetch_payloads(&result.ids()).unwrap();
     /// ```
     pub fn new(config: RingDbConfig) -> Result<Self> {
-        let backend = match config.backend_preference {
-            BackendPreference::Cpu => Box::new(CpuBackend::new()),
-        };
+        let backend = make_backend(config.backend_preference)?;
         Ok(Self {
             config,
             backend,
@@ -204,9 +223,7 @@ impl<T: Payload> RingDb<T> {
             )));
         }
 
-        let mut backend: Box<dyn RingComputeBackend> = match backend_preference {
-            crate::config::BackendPreference::Cpu => Box::new(CpuBackend::new()),
-        };
+        let mut backend = make_backend(backend_preference)?;
         backend.upload_f32_dataset(dims, vectors, norms_sq)?;
 
         let payload_store = T::load_store(dir)?;

@@ -163,6 +163,109 @@ fn test_backend_name() {
     assert_eq!(db.backend_name(), "cpu");
 }
 
+#[cfg(not(feature = "cuda"))]
+#[test]
+fn test_cuda_backend_requires_feature() {
+    let err = match RingDb::<()>::new(
+        RingDbConfig::new(4).with_backend_preference(BackendPreference::Cuda),
+    ) {
+        Ok(_) => panic!("CUDA backend should require the `cuda` Cargo feature"),
+        Err(err) => err,
+    };
+    assert!(matches!(err, RingDbError::BackendUnavailable(_)));
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn test_cuda_backend_matches_cpu_when_requested() {
+    if std::env::var_os("RINGDB_CUDA_TEST").is_none() {
+        return;
+    }
+
+    let dims = 4;
+    let vectors = [
+        [1.0f32, 0.0, 0.0, 0.0],
+        [0.0, 2.0, 0.0, 0.0],
+        [3.0, 4.0, 0.0, 0.0],
+        [1.0, 1.0, 1.0, 1.0],
+        [10.0, 0.0, 0.0, 0.0],
+    ];
+
+    let mut cpu = RingDb::new(RingDbConfig::new(dims)).unwrap();
+    let mut cuda =
+        RingDb::new(RingDbConfig::new(dims).with_backend_preference(BackendPreference::Cuda))
+            .unwrap();
+    for vector in vectors {
+        cpu.add_vector(&vector, ()).unwrap();
+        cuda.add_vector(&vector, ()).unwrap();
+    }
+    let cpu = cpu.build().unwrap();
+    let cuda = cuda.build().unwrap();
+    assert_eq!(cuda.backend_name(), "cuda");
+
+    let query = [0.0f32; 4];
+    let cpu_ring = cpu
+        .query(&RingQuery {
+            query: &query,
+            d: 2.0,
+            lambda: 0.5,
+        })
+        .unwrap();
+    let cuda_ring = cuda
+        .query(&RingQuery {
+            query: &query,
+            d: 2.0,
+            lambda: 0.5,
+        })
+        .unwrap();
+    let mut cpu_ids = cpu_ring.ids();
+    let mut cuda_ids = cuda_ring.ids();
+    cpu_ids.sort_unstable();
+    cuda_ids.sort_unstable();
+    assert_eq!(cpu_ids, cuda_ids);
+
+    let cpu_disk = cpu
+        .query_disk(&DiskQuery {
+            query: &query,
+            d_max: 5.0,
+        })
+        .unwrap();
+    let cuda_disk = cuda
+        .query_disk(&DiskQuery {
+            query: &query,
+            d_max: 5.0,
+        })
+        .unwrap();
+    let mut cpu_ids = cpu_disk.ids();
+    let mut cuda_ids = cuda_disk.ids();
+    cpu_ids.sort_unstable();
+    cuda_ids.sort_unstable();
+    assert_eq!(cpu_ids, cuda_ids);
+
+    let shifted = [1.0f32, 0.0, 0.0, 0.0];
+    let disks = [
+        DiskQuery {
+            query: &query,
+            d_max: 5.0,
+        },
+        DiskQuery {
+            query: &shifted,
+            d_max: 4.5,
+        },
+    ];
+    let cpu_intersection = cpu
+        .query_disk_intersection(&DiskIntersectionQuery { disks: &disks })
+        .unwrap();
+    let cuda_intersection = cuda
+        .query_disk_intersection(&DiskIntersectionQuery { disks: &disks })
+        .unwrap();
+    let mut cpu_ids = cpu_intersection.ids();
+    let mut cuda_ids = cuda_intersection.ids();
+    cpu_ids.sort_unstable();
+    cuda_ids.sort_unstable();
+    assert_eq!(cpu_ids, cuda_ids);
+}
+
 #[test]
 fn test_dims_and_len() {
     let mut db = cpu_db(8);

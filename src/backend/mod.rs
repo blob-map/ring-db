@@ -1,9 +1,12 @@
 use crate::error::Result;
-use std::collections::HashSet;
 
 pub mod cpu;
+#[cfg(feature = "cuda")]
+pub mod cuda;
 
 pub use cpu::CpuBackend;
+#[cfg(feature = "cuda")]
+pub use cuda::CudaBackend;
 
 pub(crate) struct QueryResponse {
     pub(crate) id: u32,
@@ -48,38 +51,17 @@ pub trait RingComputeBackend: Send + Sync {
 
     /// Execute a float32 disk (ball) search: all vectors within radius `d_max`.
     ///
-    /// This is semantically equivalent to `ring_query_f32` with `d_min = 0`, but
-    /// skips the lower-bound comparison so backends can squeeze out extra performance.
-    ///
-    /// The default implementation delegates to `ring_query_f32`.
-    fn disk_query_f32(&self, dims: usize, query: &[f32], d_max: f32) -> Result<Vec<QueryResponse>> {
-        self.ring_query_f32(dims, query, 0.0, d_max)
-    }
+    /// This is semantically equivalent to `ring_query_f32` with `d_min = 0`.
+    fn disk_query_f32(&self, dims: usize, query: &[f32], d_max: f32) -> Result<Vec<QueryResponse>>;
 
     /// Execute a float32 disk-intersection search.
     ///
     /// Returns all vectors that fall within every `(query, d_max)` disk. The
     /// returned distance is measured against the first disk's query vector.
     ///
-    /// The default implementation intersects ordinary disk-query result IDs.
     fn disk_intersection_query_f32(
         &self,
         dims: usize,
         disks: &[(&[f32], f32)],
-    ) -> Result<Vec<QueryResponse>> {
-        let Some(&(first_query, first_d_max)) = disks.first() else {
-            return Ok(Vec::new());
-        };
-
-        let mut hits = self.disk_query_f32(dims, first_query, first_d_max)?;
-        for &(query, d_max) in &disks[1..] {
-            let ids: HashSet<u32> = self
-                .disk_query_f32(dims, query, d_max)?
-                .into_iter()
-                .map(|hit| hit.id)
-                .collect();
-            hits.retain(|hit| ids.contains(&hit.id));
-        }
-        Ok(hits)
-    }
+    ) -> Result<Vec<QueryResponse>>;
 }

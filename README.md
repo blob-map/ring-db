@@ -30,6 +30,7 @@ Four query shapes are supported out of the box:
 - [Quick start](#quick-start)
 - [Payload strategies](#payload-strategies)
 - [API overview](#api-overview)
+- [CUDA backend](#cuda-backend)
 - [Persistence](#persistence)
 - [Architecture](#architecture)
 - [Performance](#performance)
@@ -304,13 +305,41 @@ let config = RingDbConfig::new(dims).with_persist_dir("/my/db"); // persisted to
 | Field | Type | Description |
 |---|---|---|
 | `dims` | `usize` | Number of dimensions per vector. Must be > 0. |
-| `backend_preference` | `BackendPreference` | Backend selection. Only `Cpu` is available today. |
+| `backend_preference` | `BackendPreference` | Backend selection. `Cpu` is always available; `Cuda` requires the `cuda` Cargo feature and an NVIDIA CUDA driver. |
 | `persist_dir` | `Option<PathBuf>` | Directory to persist the database. `None` = in-memory only. |
 
 | Builder method | Description |
 |---|---|
 | `with_persist_dir(path)` | Enable persistence to the given directory (created automatically). |
 | `with_backend_preference(p)` | Override the backend (default: `BackendPreference::Cpu`). |
+
+### CUDA backend
+
+CUDA support is opt-in so CPU-only production builds keep the same dependency
+and runtime profile:
+
+```bash
+cargo build --release --features cuda
+```
+
+Use `BackendPreference::Cuda` when constructing or loading a database:
+
+```rust
+use ringdb::{BackendPreference, RingDb, RingDbConfig};
+
+let config = RingDbConfig::new(128)
+    .with_backend_preference(BackendPreference::Cuda);
+let mut db = RingDb::<()>::new(config)?;
+```
+
+The CUDA backend loads the NVIDIA driver dynamically at runtime and uses the
+first CUDA device. If the crate was not built with `--features cuda`, or if no
+driver/device is available, construction returns `RingDbError::BackendUnavailable`.
+
+`RingQuery`, `RangeQuery`, `DiskQuery`, and `DiskIntersectionQuery` run as CUDA
+kernels over the resident VRAM dataset. Disk intersection is a single scan:
+each CUDA thread evaluates every disk for one candidate vector and exits early
+as soon as a disk fails.
 
 ### `RingDb<T>` — builder
 
@@ -597,27 +626,23 @@ pub trait RingComputeBackend: Send + Sync {
     fn ring_query_f32(&self, dims: usize, query: &[f32], d_min: f32, d_max: f32) -> Result<Vec<Hit>>;
 
     // Disk (ball) search: returns all vectors with dist in [0, d_max]
-    // Default impl delegates to ring_query_f32; backends can override for a
-    // tighter loop that skips the lower-bound comparison entirely.
-    fn disk_query_f32(&self, dims: usize, query: &[f32], d_max: f32) -> Result<Vec<Hit>> { … }
+    fn disk_query_f32(&self, dims: usize, query: &[f32], d_max: f32) -> Result<Vec<Hit>>;
 
     // Disk intersection search: returns all vectors inside every disk.
-    // Default impl intersects ordinary disk-query IDs; backends can override
-    // for a single-pass implementation.
-    fn disk_intersection_query_f32(&self, dims: usize, disks: &[(&[f32], f32)]) -> Result<Vec<Hit>> { … }
+    fn disk_intersection_query_f32(&self, dims: usize, disks: &[(&[f32], f32)]) -> Result<Vec<Hit>>;
 }
 ```
 
 `query` and `query_range` delegate to `ring_query_f32`. `query_disk` delegates
-to `disk_query_f32`, which the CPU backend overrides to remove the
-`dist_sq >= lower_sq` branch — a small but measurable saving when scanning
-hundreds of millions of vectors. `query_disk_intersection` delegates to
-`disk_intersection_query_f32`; the CPU backend overrides this with a single scan
-that evaluates every disk for each candidate row.
+to `disk_query_f32`, which backends implement directly so they can remove the
+`dist_sq >= lower_sq` branch. `query_disk_intersection` delegates to
+`disk_intersection_query_f32`; backends must provide an explicit implementation
+instead of falling back to repeated disk queries.
 
-New backends (WGPU, CUDA, AVX-512 hand-rolled) can be added without touching
-the public API. Backends that do not override `disk_query_f32` or
-`disk_intersection_query_f32` get the default behavior for free.
+New backends (WGPU, AVX-512 hand-rolled, additional CUDA variants) can be added
+without touching the public API. The trait intentionally has no query fallbacks:
+a missing backend-specific query path is a compile error, not a silent
+performance trap.
 
 ### CPU backend implementation
 
@@ -692,6 +717,15 @@ cargo bench --bench query_backends cpu_disk_f32
 cargo bench --bench query_backends cpu_disk_intersection_f32
 cargo bench --bench query_backends payload_fetch
 
+# CUDA groups. They compile only with the `cuda` feature and skip cleanly
+# when the NVIDIA driver/device is unavailable.
+cargo bench --features cuda --bench query_backends cuda_f32
+cargo bench --features cuda --bench query_backends cuda_disk_f32
+cargo bench --features cuda --bench query_backends cuda_disk_intersection_f32
+
+# Override the CUDA dataset size when VRAM is limited.
+RINGDB_CUDA_BENCH_N=5000000 cargo bench --features cuda --bench query_backends cuda_f32
+
 # With native CPU optimisations (recommended)
 RUSTFLAGS="-C target-cpu=native" cargo bench
 ```
@@ -728,6 +762,10 @@ cargo run --example cli -- --help
 # 100 000 vectors, 64 dims, ring centred at d=5.0 with λ=0.2
 cargo run --release --example cli -- \
     --n 100000 --dims 64 --d 5.0 --lambda 0.2
+
+# Same demo on CUDA, when built on a machine with an NVIDIA driver
+cargo run --release --features cuda --example cli -- \
+    --n 100000 --dims 64 --d 5.0 --lambda 0.2 --backend cuda
 ```
 
 Sample output:
@@ -754,7 +792,7 @@ Results:
 ## Roadmap
 
 - [ ] GPU backend via `wgpu` (compute shaders, cross-platform)
-- [ ] CUDA backend for datacenter workloads
+- [x] CUDA backend for datacenter workloads
 - [ ] AVX-512 hand-rolled kernel (skipping Rayon for very small datasets)
 - [ ] Approximate ring search (LSH / quantisation) for datasets > 1 B vectors
 - [x] Persistent on-disk format (`build()` writes, `RingDb::load()` rehydrates)

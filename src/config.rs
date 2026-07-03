@@ -2,13 +2,23 @@ use std::path::PathBuf;
 
 /// Which compute backend to use for ring queries.
 ///
-/// Only CPU is supported for now. This enum exists so the config is ready
-/// to be extended with additional backends later.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// CPU is always available. CUDA support is opt-in via the `cuda` Cargo
+/// feature and requires a CUDA-capable NVIDIA driver at runtime.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum BackendPreference {
     /// CPU brute-force (always available).
     #[default]
     Cpu,
+
+    /// CUDA brute-force on the first NVIDIA device.
+    ///
+    /// This variant is always part of the public API, but constructing a
+    /// CUDA-backed database returns [`RingDbError::BackendUnavailable`] when
+    /// the crate was not built with the `cuda` feature or no CUDA driver/device
+    /// is available.
+    ///
+    /// [`RingDbError::BackendUnavailable`]: crate::RingDbError::BackendUnavailable
+    Cuda,
 }
 
 /// Configuration for a `RingDb` instance.

@@ -27,7 +27,8 @@ ring-db/
 │   ├── persist.rs         # read/write helpers for binary files
 │   └── backend/
 │       ├── mod.rs         # RingComputeBackend trait
-│       └── cpu.rs         # CpuBackend: brute-force, Rayon-parallel, SIMD-friendly
+│       ├── cpu.rs         # CpuBackend: brute-force, Rayon-parallel, SIMD-friendly
+│       └── cuda.rs        # CudaBackend: optional CUDA driver backend (`cuda` feature)
 │   └── payload/
 │       ├── mod.rs         # Payload trait, OwnedPayloadStore, RefPayloadStore
 │       ├── traits.rs      # PayloadBuilderOps trait + open_mmap helper
@@ -136,11 +137,22 @@ All three normalize to `(d_min, d_max)` and delegate to `backend.ring_query_f32(
 
 ### [src/backend/cpu.rs](src/backend/cpu.rs)
 
-The only available backend. Key optimizations:
+Always-available reference backend. Key optimizations:
 1. **Four-accumulator dot product** — breaks dependency chains so LLVM emits `fmla.4s` / `vfmadd231ps`; ~4× FP throughput
 2. **Precomputed `‖x‖²`** — inserted at index time, only dot product computed at query time
 3. **Squared bounds** — `d_min²` and `d_max²` computed once before the loop (no `sqrt`)
 4. **Rayon `par_chunks_exact(dims)`** — parallelizes the scan across all logical cores
+
+### [src/backend/cuda.rs](src/backend/cuda.rs)
+
+Optional backend behind the `cuda` Cargo feature. It dynamically loads the
+NVIDIA CUDA driver at runtime, creates a context on device 0, uploads vectors
+and norms to VRAM once, and launches one thread per vector for ring/range/disk
+queries. It does not add link-time CUDA requirements to CPU-only builds.
+
+`DiskIntersectionQuery` has a dedicated CUDA kernel: a single scan over the
+resident dataset where each thread evaluates every disk for one vector and exits
+early as soon as any disk fails.
 
 Distance formula: `dist_sq = norm_sq_i + norm_sq_q − 2·dot(row, query)`
 
@@ -194,10 +206,13 @@ Use `#[payload(storage = "pod")]` when retrieval latency is the bottleneck.
 # Build
 cargo build
 cargo build --release
+cargo build --release --features cuda
 RUSTFLAGS="-C target-cpu=native" cargo build --release  # native SIMD
 
 # Test
 cargo test
+cargo test --features cuda
+RINGDB_CUDA_TEST=1 cargo test --features cuda test_cuda_backend_matches_cpu_when_requested
 cargo test --test correctness
 cargo test --test random
 cargo test -- --nocapture
@@ -205,6 +220,8 @@ cargo test -- --nocapture
 # Benchmark (recommended with native CPU features)
 RUSTFLAGS="-C target-cpu=native" cargo bench
 cargo bench --bench query_backends cpu_f32
+cargo bench --features cuda --bench query_backends cuda_f32
+RINGDB_CUDA_BENCH_N=5000000 cargo bench --features cuda --bench query_backends cuda_f32
 cargo bench --bench query_backends payload_fetch
 
 # Example CLI
@@ -231,6 +248,7 @@ cargo doc --open
 | `serde` | Serialization framework |
 | `bytemuck` | Pod cast for zero-copy payload storage |
 | `ring-db-derive` | `#[derive(Payload)]` proc-macro |
+| CUDA driver | Runtime-loaded only when the `cuda` feature and `BackendPreference::Cuda` are used |
 | `criterion` (dev) | Statistical benchmarking |
 | `rand` (dev) | Deterministic random generation |
 | `clap` (dev) | CLI argument parsing (example only) |
