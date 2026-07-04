@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "ring-db"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2024"
 description = "A Rust library for ring queries in high-dimensional vector spaces."
 license = "MIT OR Apache-2.0"
@@ -37,7 +37,7 @@ bincode = "1"
 tempfile = "3"
 serde = { version = "1", features = ["derive"] }
 bytemuck = { version = "1", features = ["derive"] }
-ring-db-derive = { path = "derive", version = "0.7.0" }
+ring-db-derive = { path = "derive", version = "0.7.1" }
 
 [dev-dependencies]
 criterion = { version = "0.8.2", features = ["html_reports"] }

@@ -1,6 +1,6 @@
 [package]
 name = "ring-db-derive"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2024"
 description = "Procedural macros for ring-db."
 license = "MIT OR Apache-2.0"
