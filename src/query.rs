@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 /// A single match returned by a query.
+#[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Hit {
     /// Insertion-order ID of the matching vector (first inserted = 0).

@@ -1,5 +1,6 @@
-use crate::backend::{QueryResponse, RingComputeBackend};
+use crate::backend::RingComputeBackend;
 use crate::error::{Result, RingDbError};
+use crate::query::Hit;
 use rayon::iter::IndexedParallelIterator;
 use rayon::iter::ParallelIterator;
 use rayon::prelude::{IntoParallelRefIterator, ParallelSlice};
@@ -105,7 +106,7 @@ impl RingComputeBackend for CpuBackend {
         query: &[f32],
         d_min: f32,
         d_max: f32,
-    ) -> Result<Vec<QueryResponse>> {
+    ) -> Result<Vec<Hit>> {
         if self.n_vectors == 0 {
             return Ok(Vec::new());
         }
@@ -128,7 +129,7 @@ impl RingComputeBackend for CpuBackend {
             .filter_map(|(i, (row, &norm_sq_i))| {
                 let dot = dot_f32(row, query);
                 let dist_sq = norm_sq_i + norm_sq_q - 2.0 * dot;
-                (dist_sq >= lower_sq && dist_sq <= upper_sq).then_some(QueryResponse {
+                (dist_sq >= lower_sq && dist_sq <= upper_sq).then_some(Hit {
                     id: i as u32,
                     dist_sq,
                 })
@@ -136,7 +137,7 @@ impl RingComputeBackend for CpuBackend {
             .collect())
     }
 
-    fn disk_query_f32(&self, dims: usize, query: &[f32], d_max: f32) -> Result<Vec<QueryResponse>> {
+    fn disk_query_f32(&self, dims: usize, query: &[f32], d_max: f32) -> Result<Vec<Hit>> {
         if self.n_vectors == 0 {
             return Ok(Vec::new());
         }
@@ -158,7 +159,7 @@ impl RingComputeBackend for CpuBackend {
             .filter_map(|(i, (row, &norm_sq_i))| {
                 let dot = dot_f32(row, query);
                 let dist_sq = norm_sq_i + norm_sq_q - 2.0 * dot;
-                (dist_sq <= upper_sq).then_some(QueryResponse {
+                (dist_sq <= upper_sq).then_some(Hit {
                     id: i as u32,
                     dist_sq,
                 })
@@ -170,7 +171,7 @@ impl RingComputeBackend for CpuBackend {
         &self,
         dims: usize,
         disks: &[(&[f32], f32)],
-    ) -> Result<Vec<QueryResponse>> {
+    ) -> Result<Vec<Hit>> {
         if self.n_vectors == 0 || disks.is_empty() {
             return Ok(Vec::new());
         }
@@ -205,7 +206,7 @@ impl RingComputeBackend for CpuBackend {
                         first_dist_sq = dist_sq;
                     }
                 }
-                Some(QueryResponse {
+                Some(Hit {
                     id: i as u32,
                     dist_sq: first_dist_sq,
                 })

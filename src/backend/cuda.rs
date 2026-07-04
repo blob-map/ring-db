@@ -1,5 +1,6 @@
-use crate::backend::{QueryResponse, RingComputeBackend};
+use crate::backend::RingComputeBackend;
 use crate::error::{Result, RingDbError};
+use crate::query::Hit;
 use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
 use std::ptr;
 use std::sync::{Arc, Mutex};
@@ -400,6 +401,30 @@ impl<T: Copy> DeviceBuffer<T> {
         Ok(())
     }
 
+    fn copy_from_slice_at(&self, offset: usize, data: &[T]) -> Result<()> {
+        assert!(offset <= self.len);
+        assert!(data.len() <= self.len - offset);
+        if !data.is_empty() {
+            let byte_offset = offset
+                .checked_mul(std::mem::size_of::<T>())
+                .ok_or_else(|| RingDbError::Backend("CUDA copy offset overflow".to_string()))?;
+            let dst = self.ptr.checked_add(byte_offset as u64).ok_or_else(|| {
+                RingDbError::Backend("CUDA destination pointer overflow".to_string())
+            })?;
+            unsafe {
+                self.driver.check(
+                    (self.driver.cu_memcpy_htod)(
+                        dst,
+                        data.as_ptr().cast(),
+                        std::mem::size_of_val(data),
+                    ),
+                    "cuMemcpyHtoD_v2",
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     fn copy_to_vec(&self, len: usize) -> Result<Vec<T>> {
         assert!(len <= self.len);
         let mut out: Vec<T> = Vec::with_capacity(len);
@@ -458,8 +483,7 @@ impl<T> Drop for DeviceBuffer<T> {
 pub struct CudaBackend {
     vectors: Option<DeviceBuffer<f32>>,
     norms_sq: Option<DeviceBuffer<f32>>,
-    out_ids: Option<DeviceBuffer<u32>>,
-    out_dists: Option<DeviceBuffer<f32>>,
+    out_hits: Option<DeviceBuffer<Hit>>,
     out_count: Option<DeviceBuffer<u32>>,
     _module: CudaModule,
     context: CudaContext,
@@ -470,6 +494,7 @@ pub struct CudaBackend {
     ring_kernel: CUfunction,
     disk_kernel: CUfunction,
     disk_intersection_kernel: CUfunction,
+    disk_intersection3_kernel: CUfunction,
 }
 
 unsafe impl Send for CudaBackend {}
@@ -483,12 +508,13 @@ impl CudaBackend {
         let ring_kernel = module.function(b"ring_query_f32_kernel\0")?;
         let disk_kernel = module.function(b"disk_query_f32_kernel\0")?;
         let disk_intersection_kernel = module.function(b"disk_intersection_query_f32_kernel\0")?;
+        let disk_intersection3_kernel =
+            module.function(b"disk_intersection3_query_f32_kernel\0")?;
 
         Ok(Self {
             vectors: None,
             norms_sq: None,
-            out_ids: None,
-            out_dists: None,
+            out_hits: None,
             out_count: None,
             _module: module,
             context,
@@ -499,6 +525,7 @@ impl CudaBackend {
             ring_kernel,
             disk_kernel,
             disk_intersection_kernel,
+            disk_intersection3_kernel,
         })
     }
 
@@ -517,20 +544,14 @@ impl CudaBackend {
         Ok((vectors, norms_sq))
     }
 
-    fn require_output_buffers(
-        &self,
-    ) -> Result<(&DeviceBuffer<u32>, &DeviceBuffer<f32>, &DeviceBuffer<u32>)> {
-        let out_ids = self
-            .out_ids
-            .as_ref()
-            .ok_or_else(|| RingDbError::Backend("CUDA output IDs are not allocated".to_string()))?;
-        let out_dists = self.out_dists.as_ref().ok_or_else(|| {
-            RingDbError::Backend("CUDA output distances are not allocated".to_string())
+    fn require_output_buffers(&self) -> Result<(&DeviceBuffer<Hit>, &DeviceBuffer<u32>)> {
+        let out_hits = self.out_hits.as_ref().ok_or_else(|| {
+            RingDbError::Backend("CUDA output hits are not allocated".to_string())
         })?;
         let out_count = self.out_count.as_ref().ok_or_else(|| {
             RingDbError::Backend("CUDA output counter is not allocated".to_string())
         })?;
-        Ok((out_ids, out_dists, out_count))
+        Ok((out_hits, out_count))
     }
 
     fn validate_query(&self, dims: usize, query: &[f32]) -> Result<()> {
@@ -549,13 +570,30 @@ impl CudaBackend {
         Ok(())
     }
 
+    fn upload_transposed_vectors(
+        &self,
+        vectors: &[f32],
+        dims: usize,
+        n_vectors: usize,
+    ) -> Result<DeviceBuffer<f32>> {
+        let buffer = DeviceBuffer::uninit(self.driver.clone(), vectors.len())?;
+        let mut column = vec![0.0f32; n_vectors];
+        for dim in 0..dims {
+            for (dst, row) in column.iter_mut().zip(vectors.chunks_exact(dims)) {
+                *dst = row[dim];
+            }
+            buffer.copy_from_slice_at(dim * n_vectors, &column)?;
+        }
+        Ok(buffer)
+    }
+
     fn launch_ring(
         &self,
         query: &[f32],
         lower_sq: f32,
         upper_sq: f32,
         disk_mode: bool,
-    ) -> Result<Vec<QueryResponse>> {
+    ) -> Result<Vec<Hit>> {
         if self.n_vectors == 0 {
             return Ok(Vec::new());
         }
@@ -577,7 +615,7 @@ impl CudaBackend {
         self.context.set_current()?;
 
         let (vectors, norms_sq) = self.require_uploaded()?;
-        let (out_ids, out_dists, out_count) = self.require_output_buffers()?;
+        let (out_hits, out_count) = self.require_output_buffers()?;
         let query_buf = DeviceBuffer::from_slice(self.driver.clone(), query)?;
         let zero = [0u32];
         out_count.copy_from_slice(&zero)?;
@@ -590,8 +628,7 @@ impl CudaBackend {
         let mut norm_sq_q = Self::query_norm_sq(query);
         let mut lower_sq = lower_sq;
         let mut upper_sq = upper_sq;
-        let mut out_ids_ptr = out_ids.ptr;
-        let mut out_dists_ptr = out_dists.ptr;
+        let mut out_hits_ptr = out_hits.ptr;
         let mut out_count_ptr = out_count.ptr;
 
         let grid_x = n_vectors_u32.div_ceil(THREADS_PER_BLOCK);
@@ -604,8 +641,8 @@ impl CudaBackend {
             (&mut norm_sq_q as *mut f32).cast::<c_void>(),
             (&mut lower_sq as *mut f32).cast::<c_void>(),
             (&mut upper_sq as *mut f32).cast::<c_void>(),
-            (&mut out_ids_ptr as *mut CUdeviceptr).cast::<c_void>(),
-            (&mut out_dists_ptr as *mut CUdeviceptr).cast::<c_void>(),
+            (&mut out_hits_ptr as *mut CUdeviceptr).cast::<c_void>(),
+            (&mut out_hits_ptr as *mut CUdeviceptr).cast::<c_void>(),
             (&mut out_count_ptr as *mut CUdeviceptr).cast::<c_void>(),
         ];
         let mut disk_params = [
@@ -616,8 +653,8 @@ impl CudaBackend {
             (&mut query_ptr as *mut CUdeviceptr).cast::<c_void>(),
             (&mut norm_sq_q as *mut f32).cast::<c_void>(),
             (&mut upper_sq as *mut f32).cast::<c_void>(),
-            (&mut out_ids_ptr as *mut CUdeviceptr).cast::<c_void>(),
-            (&mut out_dists_ptr as *mut CUdeviceptr).cast::<c_void>(),
+            (&mut out_hits_ptr as *mut CUdeviceptr).cast::<c_void>(),
+            (&mut out_hits_ptr as *mut CUdeviceptr).cast::<c_void>(),
             (&mut out_count_ptr as *mut CUdeviceptr).cast::<c_void>(),
         ];
 
@@ -649,14 +686,7 @@ impl CudaBackend {
 
         let hit_count = out_count.copy_to_vec(1)?[0] as usize;
         let hit_count = hit_count.min(self.n_vectors);
-        let ids = out_ids.copy_to_vec(hit_count)?;
-        let dists = out_dists.copy_to_vec(hit_count)?;
-
-        Ok(ids
-            .into_iter()
-            .zip(dists)
-            .map(|(id, dist_sq)| QueryResponse { id, dist_sq })
-            .collect())
+        out_hits.copy_to_vec(hit_count)
     }
 
     fn validate_disks(&self, dims: usize, disks: &[(&[f32], f32)]) -> Result<()> {
@@ -682,7 +712,7 @@ impl CudaBackend {
         Ok(())
     }
 
-    fn launch_disk_intersection(&self, disks: &[(&[f32], f32)]) -> Result<Vec<QueryResponse>> {
+    fn launch_disk_intersection(&self, disks: &[(&[f32], f32)]) -> Result<Vec<Hit>> {
         if self.n_vectors == 0 || disks.is_empty() {
             return Ok(Vec::new());
         }
@@ -713,7 +743,7 @@ impl CudaBackend {
         self.context.set_current()?;
 
         let (vectors, norms_sq) = self.require_uploaded()?;
-        let (out_ids, out_dists, out_count) = self.require_output_buffers()?;
+        let (out_hits, out_count) = self.require_output_buffers()?;
         let disk_queries_buf = DeviceBuffer::from_slice(self.driver.clone(), &disk_queries)?;
         let disk_norms_buf = DeviceBuffer::from_slice(self.driver.clone(), &disk_norms_sq)?;
         let disk_upper_buf = DeviceBuffer::from_slice(self.driver.clone(), &disk_upper_sq)?;
@@ -727,11 +757,15 @@ impl CudaBackend {
         let mut disk_norms_ptr = disk_norms_buf.ptr;
         let mut disk_upper_ptr = disk_upper_buf.ptr;
         let mut n_disks_u32 = disks.len() as u32;
-        let mut out_ids_ptr = out_ids.ptr;
-        let mut out_dists_ptr = out_dists.ptr;
+        let mut out_hits_ptr = out_hits.ptr;
         let mut out_count_ptr = out_count.ptr;
 
         let grid_x = n_vectors_u32.div_ceil(THREADS_PER_BLOCK);
+        let kernel = if disks.len() == 3 {
+            self.disk_intersection3_kernel
+        } else {
+            self.disk_intersection_kernel
+        };
         let mut params = [
             (&mut vectors_ptr as *mut CUdeviceptr).cast::<c_void>(),
             (&mut norms_ptr as *mut CUdeviceptr).cast::<c_void>(),
@@ -741,15 +775,15 @@ impl CudaBackend {
             (&mut disk_norms_ptr as *mut CUdeviceptr).cast::<c_void>(),
             (&mut disk_upper_ptr as *mut CUdeviceptr).cast::<c_void>(),
             (&mut n_disks_u32 as *mut u32).cast::<c_void>(),
-            (&mut out_ids_ptr as *mut CUdeviceptr).cast::<c_void>(),
-            (&mut out_dists_ptr as *mut CUdeviceptr).cast::<c_void>(),
+            (&mut out_hits_ptr as *mut CUdeviceptr).cast::<c_void>(),
+            (&mut out_hits_ptr as *mut CUdeviceptr).cast::<c_void>(),
             (&mut out_count_ptr as *mut CUdeviceptr).cast::<c_void>(),
         ];
 
         unsafe {
             self.driver.check(
                 (self.driver.cu_launch_kernel)(
-                    self.disk_intersection_kernel,
+                    kernel,
                     grid_x,
                     1,
                     1,
@@ -769,14 +803,7 @@ impl CudaBackend {
 
         let hit_count = out_count.copy_to_vec(1)?[0] as usize;
         let hit_count = hit_count.min(self.n_vectors);
-        let ids = out_ids.copy_to_vec(hit_count)?;
-        let dists = out_dists.copy_to_vec(hit_count)?;
-
-        Ok(ids
-            .into_iter()
-            .zip(dists)
-            .map(|(id, dist_sq)| QueryResponse { id, dist_sq })
-            .collect())
+        out_hits.copy_to_vec(hit_count)
     }
 }
 
@@ -827,10 +854,9 @@ impl RingComputeBackend for CudaBackend {
 
         self.dims = dims;
         self.n_vectors = norms_sq.len();
-        self.vectors = Some(DeviceBuffer::from_slice(self.driver.clone(), &vectors)?);
+        self.vectors = Some(self.upload_transposed_vectors(&vectors, dims, self.n_vectors)?);
         self.norms_sq = Some(DeviceBuffer::from_slice(self.driver.clone(), &norms_sq)?);
-        self.out_ids = Some(DeviceBuffer::uninit(self.driver.clone(), self.n_vectors)?);
-        self.out_dists = Some(DeviceBuffer::uninit(self.driver.clone(), self.n_vectors)?);
+        self.out_hits = Some(DeviceBuffer::uninit(self.driver.clone(), self.n_vectors)?);
         self.out_count = Some(DeviceBuffer::from_slice(self.driver.clone(), &[0u32])?);
         Ok(())
     }
@@ -841,12 +867,12 @@ impl RingComputeBackend for CudaBackend {
         query: &[f32],
         d_min: f32,
         d_max: f32,
-    ) -> Result<Vec<QueryResponse>> {
+    ) -> Result<Vec<Hit>> {
         self.validate_query(dims, query)?;
         self.launch_ring(query, d_min * d_min, d_max * d_max, false)
     }
 
-    fn disk_query_f32(&self, dims: usize, query: &[f32], d_max: f32) -> Result<Vec<QueryResponse>> {
+    fn disk_query_f32(&self, dims: usize, query: &[f32], d_max: f32) -> Result<Vec<Hit>> {
         self.validate_query(dims, query)?;
         self.launch_ring(query, 0.0, d_max * d_max, true)
     }
@@ -855,7 +881,7 @@ impl RingComputeBackend for CudaBackend {
         &self,
         dims: usize,
         disks: &[(&[f32], f32)],
-    ) -> Result<Vec<QueryResponse>> {
+    ) -> Result<Vec<Hit>> {
         self.validate_disks(dims, disks)?;
         self.launch_disk_intersection(disks)
     }
@@ -905,7 +931,11 @@ const CUDA_PTX: &str = concat!(
     setp.ge.u32 %p1, %r4, %r6;
     @%p1 ret;
 
-    mul.wide.u32 %rd10, %r4, %r5;
+    cvt.u64.u32 %rd10, %r4;
+    shl.b64 %rd10, %rd10, 2;
+    add.u64 %rd10, %rd1, %rd10;
+    cvt.u64.u32 %rd12, %r6;
+    shl.b64 %rd12, %rd12, 2;
     mov.u32 %r7, 0;
     mov.f32 %f1, 0f00000000;
 
@@ -913,14 +943,12 @@ ring_loop:
     setp.ge.u32 %p2, %r7, %r5;
     @%p2 bra ring_done;
     cvt.u64.u32 %rd11, %r7;
-    add.u64 %rd12, %rd10, %rd11;
-    shl.b64 %rd13, %rd12, 2;
-    add.u64 %rd14, %rd1, %rd13;
-    ld.global.f32 %f2, [%rd14];
+    ld.global.f32 %f2, [%rd10];
     shl.b64 %rd15, %rd11, 2;
     add.u64 %rd16, %rd3, %rd15;
     ld.global.f32 %f3, [%rd16];
     fma.rn.f32 %f1, %f2, %f3, %f1;
+    add.u64 %rd10, %rd10, %rd12;
     add.u32 %r7, %r7, 1;
     bra ring_loop;
 
@@ -938,10 +966,10 @@ ring_done:
 
     atom.global.add.u32 %r8, [%rd6], 1;
     cvt.u64.u32 %rd20, %r8;
-    shl.b64 %rd21, %rd20, 2;
+    shl.b64 %rd21, %rd20, 3;
     add.u64 %rd22, %rd4, %rd21;
     st.global.u32 [%rd22], %r4;
-    add.u64 %rd23, %rd5, %rd21;
+    add.u64 %rd23, %rd22, 4;
     st.global.f32 [%rd23], %f6;
     ret;
 }
@@ -982,7 +1010,11 @@ ring_done:
     setp.ge.u32 %p1, %r4, %r6;
     @%p1 ret;
 
-    mul.wide.u32 %rd10, %r4, %r5;
+    cvt.u64.u32 %rd10, %r4;
+    shl.b64 %rd10, %rd10, 2;
+    add.u64 %rd10, %rd1, %rd10;
+    cvt.u64.u32 %rd12, %r6;
+    shl.b64 %rd12, %rd12, 2;
     mov.u32 %r7, 0;
     mov.f32 %f1, 0f00000000;
 
@@ -990,14 +1022,12 @@ disk_loop:
     setp.ge.u32 %p2, %r7, %r5;
     @%p2 bra disk_done;
     cvt.u64.u32 %rd11, %r7;
-    add.u64 %rd12, %rd10, %rd11;
-    shl.b64 %rd13, %rd12, 2;
-    add.u64 %rd14, %rd1, %rd13;
-    ld.global.f32 %f2, [%rd14];
+    ld.global.f32 %f2, [%rd10];
     shl.b64 %rd15, %rd11, 2;
     add.u64 %rd16, %rd3, %rd15;
     ld.global.f32 %f3, [%rd16];
     fma.rn.f32 %f1, %f2, %f3, %f1;
+    add.u64 %rd10, %rd10, %rd12;
     add.u32 %r7, %r7, 1;
     bra disk_loop;
 
@@ -1013,10 +1043,10 @@ disk_done:
 
     atom.global.add.u32 %r8, [%rd6], 1;
     cvt.u64.u32 %rd20, %r8;
-    shl.b64 %rd21, %rd20, 2;
+    shl.b64 %rd21, %rd20, 3;
     add.u64 %rd22, %rd4, %rd21;
     st.global.u32 [%rd22], %r4;
-    add.u64 %rd23, %rd5, %rd21;
+    add.u64 %rd23, %rd22, 4;
     st.global.f32 [%rd23], %f6;
     ret;
 }
@@ -1059,7 +1089,6 @@ disk_done:
     setp.ge.u32 %p1, %r4, %r6;
     @%p1 ret;
 
-    mul.wide.u32 %rd10, %r4, %r5;
     cvt.u64.u32 %rd17, %r4;
     shl.b64 %rd18, %rd17, 2;
     add.u64 %rd19, %rd2, %rd18;
@@ -1073,6 +1102,11 @@ isect_disk_loop:
     @%p2 bra isect_emit;
 
     mul.wide.u32 %rd24, %r9, %r5;
+    cvt.u64.u32 %rd32, %r4;
+    shl.b64 %rd32, %rd32, 2;
+    add.u64 %rd32, %rd1, %rd32;
+    cvt.u64.u32 %rd33, %r6;
+    shl.b64 %rd33, %rd33, 2;
     mov.u32 %r7, 0;
     mov.f32 %f1, 0f00000000;
 
@@ -1080,15 +1114,13 @@ isect_dim_loop:
     setp.ge.u32 %p3, %r7, %r5;
     @%p3 bra isect_disk_done;
     cvt.u64.u32 %rd11, %r7;
-    add.u64 %rd12, %rd10, %rd11;
-    shl.b64 %rd13, %rd12, 2;
-    add.u64 %rd14, %rd1, %rd13;
-    ld.global.f32 %f2, [%rd14];
+    ld.global.f32 %f2, [%rd32];
     add.u64 %rd25, %rd24, %rd11;
     shl.b64 %rd26, %rd25, 2;
     add.u64 %rd27, %rd3, %rd26;
     ld.global.f32 %f3, [%rd27];
     fma.rn.f32 %f1, %f2, %f3, %f1;
+    add.u64 %rd32, %rd32, %rd33;
     add.u32 %r7, %r7, 1;
     bra isect_dim_loop;
 
@@ -1111,11 +1143,140 @@ isect_disk_done:
 isect_emit:
     atom.global.add.u32 %r8, [%rd8], 1;
     cvt.u64.u32 %rd20, %r8;
-    shl.b64 %rd21, %rd20, 2;
+    shl.b64 %rd21, %rd20, 3;
     add.u64 %rd22, %rd6, %rd21;
     st.global.u32 [%rd22], %r4;
-    add.u64 %rd23, %rd7, %rd21;
+    add.u64 %rd23, %rd22, 4;
     st.global.f32 [%rd23], %f10;
+    ret;
+}
+
+.visible .entry disk_intersection3_query_f32_kernel(
+    .param .u64 isect3_vectors,
+    .param .u64 isect3_norms_sq,
+    .param .u32 isect3_dims,
+    .param .u32 isect3_n_vectors,
+    .param .u64 isect3_disk_queries,
+    .param .u64 isect3_disk_norms_sq,
+    .param .u64 isect3_disk_upper_sq,
+    .param .u32 isect3_n_disks,
+    .param .u64 isect3_out_ids,
+    .param .u64 isect3_out_dists,
+    .param .u64 isect3_out_count
+)
+{
+    .reg .pred %p<10>;
+    .reg .b32 %r<48>;
+    .reg .b64 %rd<52>;
+    .reg .f32 %f<24>;
+
+    ld.param.u64 %rd1, [isect3_vectors];
+    ld.param.u64 %rd2, [isect3_norms_sq];
+    ld.param.u32 %r5, [isect3_dims];
+    ld.param.u32 %r6, [isect3_n_vectors];
+    ld.param.u64 %rd3, [isect3_disk_queries];
+    ld.param.u64 %rd4, [isect3_disk_norms_sq];
+    ld.param.u64 %rd5, [isect3_disk_upper_sq];
+    ld.param.u32 %r10, [isect3_n_disks];
+    ld.param.u64 %rd6, [isect3_out_ids];
+    ld.param.u64 %rd7, [isect3_out_dists];
+    ld.param.u64 %rd8, [isect3_out_count];
+
+    setp.ne.u32 %p1, %r10, 3;
+    @%p1 ret;
+
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    mad.lo.u32 %r4, %r1, %r2, %r3;
+    and.b32 %r11, %r3, 31;
+    shr.u32 %r12, %r3, 5;
+    setp.ge.u32 %p2, %r4, %r6;
+    @%p2 ret;
+
+    cvt.u64.u32 %rd44, %r4;
+    shl.b64 %rd44, %rd44, 2;
+    add.u64 %rd44, %rd1, %rd44;
+    cvt.u64.u32 %rd45, %r6;
+    shl.b64 %rd45, %rd45, 2;
+    cvt.u64.u32 %rd46, %r5;
+    shl.b64 %rd46, %rd46, 2;
+    mov.u64 %rd47, %rd3;
+    add.u64 %rd48, %rd3, %rd46;
+    add.u64 %rd49, %rd48, %rd46;
+    mov.u32 %r7, 0;
+    mov.f32 %f1, 0f00000000;
+    mov.f32 %f2, 0f00000000;
+    mov.f32 %f3, 0f00000000;
+
+isect3_dim_loop:
+    setp.ge.u32 %p3, %r7, %r5;
+    @%p3 bra isect3_done;
+    ld.global.f32 %f4, [%rd44];
+    ld.global.f32 %f5, [%rd47];
+    fma.rn.f32 %f1, %f4, %f5, %f1;
+    ld.global.f32 %f6, [%rd48];
+    fma.rn.f32 %f2, %f4, %f6, %f2;
+    ld.global.f32 %f7, [%rd49];
+    fma.rn.f32 %f3, %f4, %f7, %f3;
+    add.u64 %rd44, %rd44, %rd45;
+    add.u64 %rd47, %rd47, 4;
+    add.u64 %rd48, %rd48, 4;
+    add.u64 %rd49, %rd49, 4;
+    add.u32 %r7, %r7, 1;
+    bra isect3_dim_loop;
+
+isect3_done:
+    cvt.u64.u32 %rd25, %r4;
+    shl.b64 %rd26, %rd25, 2;
+    add.u64 %rd27, %rd2, %rd26;
+    ld.global.f32 %f11, [%rd27];
+    ld.global.f32 %f12, [%rd4];
+    add.u64 %rd28, %rd4, 4;
+    ld.global.f32 %f13, [%rd28];
+    add.u64 %rd29, %rd4, 8;
+    ld.global.f32 %f14, [%rd29];
+    ld.global.f32 %f15, [%rd5];
+    add.u64 %rd30, %rd5, 4;
+    ld.global.f32 %f16, [%rd30];
+    add.u64 %rd31, %rd5, 8;
+    ld.global.f32 %f17, [%rd31];
+
+    fma.rn.f32 %f18, %f1, 0fC0000000, %f11;
+    add.rn.f32 %f18, %f18, %f12;
+    fma.rn.f32 %f19, %f2, 0fC0000000, %f11;
+    add.rn.f32 %f19, %f19, %f13;
+    fma.rn.f32 %f20, %f3, 0fC0000000, %f11;
+    add.rn.f32 %f20, %f20, %f14;
+    setp.le.f32 %p5, %f18, %f15;
+    setp.le.f32 %p6, %f19, %f16;
+    and.pred %p5, %p5, %p6;
+    setp.le.f32 %p7, %f20, %f17;
+    and.pred %p5, %p5, %p7;
+
+    vote.ballot.b32 %r21, %p5;
+    setp.eq.u32 %p8, %r21, 0;
+    @%p8 ret;
+    mov.u32 %r22, %lanemask_lt;
+    and.b32 %r23, %r21, %r22;
+    popc.b32 %r24, %r23;
+    popc.b32 %r25, %r21;
+
+    setp.ne.u32 %p8, %r11, 0;
+    @%p8 bra isect3_skip_warp_reserve;
+    atom.global.add.u32 %r31, [%rd8], %r25;
+
+isect3_skip_warp_reserve:
+    shfl.idx.b32 %r31, %r31, 0, 31;
+    @!%p5 ret;
+
+    add.u32 %r32, %r31, %r24;
+    cvt.u64.u32 %rd40, %r32;
+    shl.b64 %rd41, %rd40, 3;
+    add.u64 %rd42, %rd6, %rd41;
+    st.global.u32 [%rd42], %r4;
+    add.u64 %rd43, %rd42, 4;
+    st.global.f32 [%rd43], %f18;
     ret;
 }
 "#,

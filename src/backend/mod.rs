@@ -1,4 +1,5 @@
 use crate::error::Result;
+use crate::query::Hit;
 
 pub mod cpu;
 #[cfg(feature = "cuda")]
@@ -7,11 +8,6 @@ pub mod cuda;
 pub use cpu::CpuBackend;
 #[cfg(feature = "cuda")]
 pub use cuda::CudaBackend;
-
-pub(crate) struct QueryResponse {
-    pub(crate) id: u32,
-    pub(crate) dist_sq: f32,
-}
 
 /// Trait implemented by all compute backends.
 ///
@@ -47,21 +43,18 @@ pub trait RingComputeBackend: Send + Sync {
         query: &[f32],
         d_min: f32,
         d_max: f32,
-    ) -> Result<Vec<QueryResponse>>;
+    ) -> Result<Vec<Hit>>;
 
     /// Execute a float32 disk (ball) search: all vectors within radius `d_max`.
     ///
     /// This is semantically equivalent to `ring_query_f32` with `d_min = 0`.
-    fn disk_query_f32(&self, dims: usize, query: &[f32], d_max: f32) -> Result<Vec<QueryResponse>>;
+    fn disk_query_f32(&self, dims: usize, query: &[f32], d_max: f32) -> Result<Vec<Hit>>;
 
     /// Execute a float32 disk-intersection search.
     ///
     /// Returns all vectors that fall within every `(query, d_max)` disk. The
     /// returned distance is measured against the first disk's query vector.
     ///
-    fn disk_intersection_query_f32(
-        &self,
-        dims: usize,
-        disks: &[(&[f32], f32)],
-    ) -> Result<Vec<QueryResponse>>;
+    fn disk_intersection_query_f32(&self, dims: usize, disks: &[(&[f32], f32)])
+    -> Result<Vec<Hit>>;
 }

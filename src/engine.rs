@@ -9,18 +9,7 @@ use crate::config::RingDbConfig;
 use crate::error::{Result, RingDbError};
 use crate::payload::{OwnedPayloadStore, Payload, PayloadBuilderOps, RefPayloadStore};
 use crate::persist::{read_f32_file, read_meta, write_f32_file, write_meta};
-use crate::query::Hit;
 use crate::query::{DiskIntersectionQuery, DiskQuery, QueryResult, RangeQuery, RingQuery};
-
-fn into_hits(responses: Vec<crate::backend::QueryResponse>) -> Vec<Hit> {
-    responses
-        .into_iter()
-        .map(|r| Hit {
-            id: r.id,
-            dist_sq: r.dist_sq,
-        })
-        .collect()
-}
 
 fn make_backend(preference: BackendPreference) -> Result<Box<dyn RingComputeBackend>> {
     match preference {
@@ -287,12 +276,12 @@ impl<T: Payload> SealedRingDb<T> {
             });
         }
         let t = Instant::now();
-        let hits = into_hits(self.backend.ring_query_f32(
+        let hits = self.backend.ring_query_f32(
             dims,
             q.query,
             (q.d - q.lambda).max(0.0),
             q.d + q.lambda,
-        )?);
+        )?;
         Ok(QueryResult {
             hits,
             backend_used: self.backend.name(),
@@ -310,10 +299,9 @@ impl<T: Payload> SealedRingDb<T> {
             });
         }
         let t = Instant::now();
-        let hits = into_hits(
-            self.backend
-                .ring_query_f32(dims, q.query, q.d_min, q.d_max)?,
-        );
+        let hits = self
+            .backend
+            .ring_query_f32(dims, q.query, q.d_min, q.d_max)?;
         Ok(QueryResult {
             hits,
             backend_used: self.backend.name(),
@@ -331,7 +319,7 @@ impl<T: Payload> SealedRingDb<T> {
             });
         }
         let t = Instant::now();
-        let hits = into_hits(self.backend.disk_query_f32(dims, q.query, q.d_max)?);
+        let hits = self.backend.disk_query_f32(dims, q.query, q.d_max)?;
         Ok(QueryResult {
             hits,
             backend_used: self.backend.name(),
@@ -364,7 +352,7 @@ impl<T: Payload> SealedRingDb<T> {
             .map(|disk| (disk.query, disk.d_max))
             .collect();
         let t = Instant::now();
-        let hits = into_hits(self.backend.disk_intersection_query_f32(dims, &disks)?);
+        let hits = self.backend.disk_intersection_query_f32(dims, &disks)?;
         Ok(QueryResult {
             hits,
             backend_used: self.backend.name(),

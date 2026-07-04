@@ -264,6 +264,33 @@ fn test_cuda_backend_matches_cpu_when_requested() {
     cpu_ids.sort_unstable();
     cuda_ids.sort_unstable();
     assert_eq!(cpu_ids, cuda_ids);
+
+    let shifted_back = [-1.0f32, 0.0, 0.0, 0.0];
+    let disks = [
+        DiskQuery {
+            query: &query,
+            d_max: 5.0,
+        },
+        DiskQuery {
+            query: &shifted,
+            d_max: 4.5,
+        },
+        DiskQuery {
+            query: &shifted_back,
+            d_max: 6.0,
+        },
+    ];
+    let cpu_intersection = cpu
+        .query_disk_intersection(&DiskIntersectionQuery { disks: &disks })
+        .unwrap();
+    let cuda_intersection = cuda
+        .query_disk_intersection(&DiskIntersectionQuery { disks: &disks })
+        .unwrap();
+    let mut cpu_ids = cpu_intersection.ids();
+    let mut cuda_ids = cuda_intersection.ids();
+    cpu_ids.sort_unstable();
+    cuda_ids.sort_unstable();
+    assert_eq!(cpu_ids, cuda_ids);
 }
 
 #[test]
