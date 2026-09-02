@@ -2,9 +2,10 @@
 
 A Rust library for **ring queries** in high-dimensional vector spaces.
 
-Instead of nearest-neighbour search, ring-db retrieves every vector whose
-Euclidean distance to a query falls inside a specified interval or satisfies a
-set of disk constraints.  
+Instead of nearest-neighbour search, ring-db retrieves every vector whose L2
+distance to a query falls inside a specified interval or satisfies a set of
+disk constraints. Each query can optionally apply independent, non-negative
+weights to the vector dimensions.
 Four query shapes are supported out of the box:
 
 | Query type | Interval | Typical use |
@@ -57,12 +58,12 @@ The four query types let you express the constraint directly:
   half-width `λ`: interval `[d-λ, d+λ]`.
 - **`RangeQuery`** — arbitrary interval `[d_min, d_max]`, no conversion needed.
 - **`DiskQuery`** — full ball of radius `d_max`, equivalent to
-  `RangeQuery { d_min: 0, d_max }`.
+  `RangeQuery::new(query, 0.0, d_max)`.
 - **`DiskIntersectionQuery`** — multiple `DiskQuery` constraints; a vector is
   returned only if it lies inside every disk.
 
 Internally, the library avoids computing square roots by working with squared
-L2 distances:
+distances. Ordinary L2 uses the cached-norm identity:
 
 ```
 lower_sq = d_min²
@@ -72,6 +73,19 @@ dist_sq  = ‖x‖² + ‖q‖² − 2·(x · q)
 
 The dot product and norms are computed with four independent accumulators so
 the compiler can emit fused multiply-add instructions (`fmla`/`vfmadd`).
+
+An optional weight vector changes only the distance calculation for that
+query:
+
+```text
+weighted_dist_sq = Σᵢ wᵢ (xᵢ - qᵢ)²
+```
+
+Every weight must be finite and non-negative, and the weight vector must have
+the same length as the stored vectors. Zero weights are valid. Values are the
+final multiplicative coefficients; ring-db does not square them. Weights are
+borrowed query data, so changing them never rebuilds the database, duplicates
+stored vectors, or creates persisted weighted norms.
 
 ---
 
@@ -94,8 +108,8 @@ Add to `Cargo.toml`:
 
 ```toml
 [dependencies]
-ring-db = "0.5"
-ring-db-derive = "0.5"
+ring-db = "0.7"
+ring-db-derive = "0.7"
 serde = { version = "1", features = ["derive"] }   # only needed for serde payloads
 bytemuck = { version = "1", features = ["derive"] } # only needed for pod payloads
 ```
@@ -113,11 +127,9 @@ db.add_vector(&[3.0, 4.0, 0.0, 0.0], ()).unwrap(); // dist = 5.0 from origin
 let db = db.build().unwrap();
 
 // Find all vectors at distance ≈ 5 from the origin (band: [4.5, 5.5])
-let result = db.query(&RingQuery {
-    query: &[0.0f32; 4],
-    d: 5.0,
-    lambda: 0.5,
-}).unwrap();
+let result = db
+    .query(&RingQuery::new(&[0.0f32; 4], 5.0, 0.5))
+    .unwrap();
 
 // result.hits is Vec<Hit> — each Hit carries the id and squared distance
 for hit in &result.hits {
@@ -140,11 +152,9 @@ db.add_vector(&[1.0f32, 0.0, 0.0, 0.0], ()).unwrap();
 db.add_vector(&[3.0, 4.0, 0.0, 0.0], ()).unwrap();
 let db = db.build().unwrap();
 
-let result = db.query_range(&RangeQuery {
-    query: &[0.0f32; 4],
-    d_min: 3.0,
-    d_max: 6.0,
-}).unwrap();
+let result = db
+    .query_range(&RangeQuery::new(&[0.0f32; 4], 3.0, 6.0))
+    .unwrap();
 ```
 
 ### Disk query — everything within radius d_max
@@ -157,10 +167,9 @@ db.add_vector(&[1.0f32, 0.0, 0.0, 0.0], ()).unwrap();
 db.add_vector(&[3.0, 4.0, 0.0, 0.0], ()).unwrap();
 let db = db.build().unwrap();
 
-let result = db.query_disk(&DiskQuery {
-    query: &[0.0f32; 4],
-    d_max: 5.0,
-}).unwrap();
+let result = db
+    .query_disk(&DiskQuery::new(&[0.0f32; 4], 5.0))
+    .unwrap();
 ```
 
 ### Disk intersection query — inside every disk
@@ -178,22 +187,46 @@ let db = db.build().unwrap();
 let left = [0.0f32, 0.0];
 let right = [2.0f32, 0.0];
 let disks = [
-    DiskQuery {
-        query: &left,
-        d_max: 2.0,
-    },
-    DiskQuery {
-        query: &right,
-        d_max: 1.0,
-    },
+    DiskQuery::new(&left, 2.0),
+    DiskQuery::new(&right, 1.0),
 ];
 
 let result = db
-    .query_disk_intersection(&DiskIntersectionQuery { disks: &disks })
+    .query_disk_intersection(&DiskIntersectionQuery::new(&disks))
     .unwrap();
 
 let ids = result.ids(); // vectors inside both disks: [1, 2]
 ```
+
+### Weighted L2 — scale dimensions per query
+
+```rust
+use ringdb::{DiskIntersectionQuery, DiskQuery, RingDb, RingDbConfig};
+
+let mut db = RingDb::new(RingDbConfig::new(4)).unwrap();
+db.add_vector(&[1.0f32, 1.0, 0.0, 0.0], ()).unwrap();
+let db = db.build().unwrap();
+
+let query = [0.0f32; 4];
+let weights = [1.0, 0.2, 4.0, 0.5];
+let result = db
+    .query_disk(&DiskQuery::new(&query, 2.0).with_weights(&weights))
+    .unwrap();
+
+let other_query = [1.0f32, 0.0, 0.0, 0.0];
+let other_weights = [0.25, 2.0, 1.0, 1.0];
+let disks = [
+    DiskQuery::new(&query, 2.0).with_weights(&weights),
+    DiskQuery::new(&other_query, 1.5).with_weights(&other_weights),
+];
+let intersection = db
+    .query_disk_intersection(&DiskIntersectionQuery::new(&disks))
+    .unwrap();
+```
+
+Each disk owns its optional weight slice, so one exact intersection scan can
+combine independently weighted disks with ordinary L2 disks. For an
+intersection, `Hit::dist_sq` is always measured under the first disk's metric.
 
 ---
 
@@ -234,7 +267,9 @@ db.add_vector(&[0.0, 1.0, 0.0, 0.0], Document {
 }).unwrap();
 
 let db = db.build().unwrap();
-let result = db.query(&RingQuery { query: &[0.8f32, 0.0, 0.0, 0.0], d: 0.2, lambda: 0.1 }).unwrap();
+let result = db
+    .query(&RingQuery::new(&[0.8f32, 0.0, 0.0, 0.0], 0.2, 0.1))
+    .unwrap();
 
 // Fetches payloads by deserializing from mmap via bincode
 let docs = db.fetch_payloads(&result.ids()).unwrap();
@@ -275,7 +310,9 @@ db.add_vector(&[48.8566f32, 2.3522, 35.0], GeoPoint { lat: 48.8566, lon: 2.3522,
 db.add_vector(&[51.5074f32, -0.1278, 11.0], GeoPoint { lat: 51.5074, lon: -0.1278, altitude: 11.0 }).unwrap();
 
 let db = db.build().unwrap();
-let result = db.query(&RingQuery { query: &[48.0f32, 2.0, 30.0], d: 1.5, lambda: 0.5 }).unwrap();
+let result = db
+    .query(&RingQuery::new(&[48.0f32, 2.0, 30.0], 1.5, 0.5))
+    .unwrap();
 
 // Zero-copy: &GeoPoint points directly into the mmap — no heap allocation
 let points: Vec<&GeoPoint> = db.fetch_pods(&result.ids());
@@ -336,10 +373,10 @@ The CUDA backend loads the NVIDIA driver dynamically at runtime and uses the
 first CUDA device. If the crate was not built with `--features cuda`, or if no
 driver/device is available, construction returns `RingDbError::BackendUnavailable`.
 
-`RingQuery`, `RangeQuery`, `DiskQuery`, and `DiskIntersectionQuery` run as CUDA
-kernels over the resident VRAM dataset. Disk intersection is a single scan:
-each CUDA thread evaluates every disk for one candidate vector and exits early
-as soon as a disk fails.
+Ordinary and weighted `RingQuery`, `RangeQuery`, `DiskQuery`, and
+`DiskIntersectionQuery` requests run as native CUDA kernels over the resident
+VRAM dataset; weighted requests never fall back to the CPU. Disk intersection
+uses one candidate scan and supports independent weights for every disk.
 
 ### `RingDb<T>` — builder
 
@@ -391,45 +428,39 @@ struct MyRecord { x: f32, y: f32 }
 
 ### `RingQuery<'a>`
 
-```
-RingQuery {
-    query: &[f32],   // query vector, length == dims
-    d: f32,          // centre of the ring (target distance)
-    lambda: f32,     // half-width; interval = [max(0, d-λ), d+λ]
-}
+```rust
+let query = RingQuery::new(query_vector, d, lambda);
+let weighted = RingQuery::new(query_vector, d, lambda).with_weights(weights);
 ```
 
 ### `RangeQuery<'a>`
 
-```
-RangeQuery {
-    query: &[f32],   // query vector, length == dims
-    d_min: f32,      // lower bound of the distance interval (inclusive, ≥ 0)
-    d_max: f32,      // upper bound of the distance interval (inclusive, ≥ d_min)
-}
+```rust
+let query = RangeQuery::new(query_vector, d_min, d_max);
+let weighted = RangeQuery::new(query_vector, d_min, d_max).with_weights(weights);
 ```
 
 ### `DiskQuery<'a>`
 
+```rust
+let query = DiskQuery::new(query_vector, d_max);
+let weighted = DiskQuery::new(query_vector, d_max).with_weights(weights);
 ```
-DiskQuery {
-    query: &[f32],   // query vector, length == dims
-    d_max: f32,      // radius of the ball (inclusive, ≥ 0)
-}
-// Equivalent to RangeQuery { d_min: 0.0, d_max }
-```
+
+The ordinary form is equivalent to `RangeQuery::new(query_vector, 0.0,
+d_max)`. For every weighted query, `weights.len()` must equal the database
+dimensions and each value must be finite and at least zero.
 
 ### `DiskIntersectionQuery<'a>`
 
-```
-DiskIntersectionQuery {
-    disks: &[DiskQuery], // non-empty list of disk constraints
-}
+```rust
+let query = DiskIntersectionQuery::new(&disks); // non-empty disk slice
 ```
 
 Every disk query vector must have length equal to `dims`. The result contains
 only vectors whose distance to each disk center is at most that disk's `d_max`.
-`Hit::dist_sq` is measured against the first disk's query vector.
+Each disk may use ordinary L2 or its own weighted L2. `Hit::dist_sq` is measured
+under the first disk's actual metric.
 
 ### `QueryResult`
 
@@ -447,8 +478,8 @@ Each entry in `result.hits` is a `Hit`:
 
 ```
 hit.id               // u32  — insertion-order ID of the matching vector
-hit.dist_sq          // f32  — squared Euclidean distance to the query
-                     //        call hit.dist_sq.sqrt() for the actual distance
+hit.dist_sq          // f32  — squared distance under the query's metric
+                     //        call hit.dist_sq.sqrt() for the distance
 ```
 
 `Hit` is 8 bytes (two `f32`-sized fields, no padding) and derives `Debug`, `Clone`, `Copy`, and `PartialEq`.
@@ -528,6 +559,10 @@ let _sealed = db.build().unwrap(); // writes files to /tmp/mydb
 | `payloads.bin` | Serde: bincode bytes · Pod: raw `T` bytes |
 | `offsets.bin` | Serde only: byte offsets (`u64`) into `payloads.bin` |
 
+Query weights are deliberately absent from this format. Persisted databases
+contain one copy of each vector and its ordinary squared norm; arbitrary weight
+vectors can be supplied after loading without changing any stored data.
+
 ### Loading
 
 Pass the directory and your chosen backend to `RingDb::load()`. The correct
@@ -542,11 +577,9 @@ let db = RingDb::<()>::load(
     BackendPreference::Cpu,
 ).unwrap();
 
-let result = db.query(&RingQuery {
-    query: &[1.0f32, 0.0, 0.0, 0.0],
-    d: 1.0,
-    lambda: 0.1,
-}).unwrap();
+let result = db
+    .query(&RingQuery::new(&[1.0f32, 0.0, 0.0, 0.0], 1.0, 0.1))
+    .unwrap();
 ```
 
 `load()` validates the file sizes against the stored metadata and returns
@@ -623,13 +656,13 @@ pub trait RingComputeBackend: Send + Sync {
     fn upload_f32_dataset(&mut self, dims: usize, vectors: Vec<f32>, norms_sq: Vec<f32>) -> Result<()>;
 
     // Ring / range search: returns all vectors with dist in [d_min, d_max]
-    fn ring_query_f32(&self, dims: usize, query: &[f32], d_min: f32, d_max: f32) -> Result<Vec<Hit>>;
+    fn ring_query_f32(&self, dims: usize, query: &[f32], weights: Option<&[f32]>, d_min: f32, d_max: f32) -> Result<Vec<Hit>>;
 
     // Disk (ball) search: returns all vectors with dist in [0, d_max]
-    fn disk_query_f32(&self, dims: usize, query: &[f32], d_max: f32) -> Result<Vec<Hit>>;
+    fn disk_query_f32(&self, dims: usize, query: &[f32], weights: Option<&[f32]>, d_max: f32) -> Result<Vec<Hit>>;
 
     // Disk intersection search: returns all vectors inside every disk.
-    fn disk_intersection_query_f32(&self, dims: usize, disks: &[(&[f32], f32)]) -> Result<Vec<Hit>>;
+    fn disk_intersection_query_f32(&self, dims: usize, disks: &[DiskSpec<'_>]) -> Result<Vec<Hit>>;
 }
 ```
 
@@ -653,6 +686,9 @@ performance trap.
   (AVX), yielding ~4× FP throughput on the reduction.
 - **Precomputed norms** — `‖x‖²` is stored at insertion time; only a dot
   product is computed per vector at query time (no square root).
+- **Dedicated weighted kernel** — weighted L2 directly accumulates
+  `wᵢ(xᵢ-qᵢ)²` with independent accumulators. It does not allocate, transform
+  vectors, or read the ordinary cached norm.
 - **Squared bounds** — both bounds are squared once before the loop to avoid
   `sqrt` entirely.
 - **Dedicated disk path** — `disk_query_f32` removes the lower-bound
@@ -660,7 +696,8 @@ performance trap.
   one fewer condition to evaluate per vector.
 - **Dedicated disk-intersection path** — `disk_intersection_query_f32` prepares
   the disk norms and squared radii once, then scans the dataset once and exits
-  each row early as soon as any disk fails.
+  each row early as soon as any disk fails. Mixed intersections choose the
+  ordinary or weighted kernel once per disk, outside the coordinate loop.
 
 ---
 
@@ -715,6 +752,7 @@ cargo bench
 cargo bench --bench query_backends cpu_f32
 cargo bench --bench query_backends cpu_disk_f32
 cargo bench --bench query_backends cpu_disk_intersection_f32
+cargo bench --bench query_backends cpu_weighted_intersection_scaling_f32
 cargo bench --bench query_backends payload_fetch
 
 # CUDA groups. They compile only with the `cuda` feature and skip cleanly
@@ -723,7 +761,8 @@ cargo bench --features cuda --bench query_backends cuda_f32
 cargo bench --features cuda --bench query_backends cuda_disk_f32
 cargo bench --features cuda --bench query_backends cuda_disk_intersection_f32
 
-# Override the CUDA dataset size when VRAM is limited.
+# Override dataset sizes for faster local runs or limited VRAM.
+RINGDB_BENCH_N=1000000 cargo bench --bench query_backends cpu_f32
 RINGDB_CUDA_BENCH_N=5000000 cargo bench --features cuda --bench query_backends cuda_f32
 
 # With native CPU optimisations (recommended)
@@ -745,6 +784,9 @@ cargo test --test correctness
 
 # Randomised sanity tests
 cargo test --test random
+
+# Weighted analytical, validation, persistence, and scalar-reference tests
+cargo test --test weighted
 
 # With output (useful to see ring stats)
 cargo test -- --nocapture

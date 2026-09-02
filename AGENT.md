@@ -4,7 +4,7 @@
 
 ## What is ring-db?
 
-**ring-db** is a Rust library (published as `ringdb` on crates.io) for **ring queries** in high-dimensional vector spaces. Unlike nearest-neighbor databases, it retrieves all vectors whose Euclidean distance to a query falls within a specified distance interval `[d_min, d_max]`.
+**ring-db** is a Rust library (published as `ringdb` on crates.io) for **ring queries** in high-dimensional vector spaces. Unlike nearest-neighbor databases, it retrieves all vectors whose ordinary or per-dimension weighted L2 distance to a query falls within a specified distance interval `[d_min, d_max]`.
 
 Use cases: anomaly detection, content deduplication, recommendation diversity, spatial shells (GPS bands), audio fingerprinting, security threat detection.
 
@@ -21,7 +21,7 @@ ring-db/
 ├── src/
 │   ├── lib.rs             # Public API root, re-exports, #[doc(hidden)] __private
 │   ├── engine.rs          # RingDb (builder) and SealedRingDb (immutable DB)
-│   ├── query.rs           # RingQuery, RangeQuery, DiskQuery, QueryResult
+│   ├── query.rs           # RingQuery, RangeQuery, DiskQuery, DiskIntersectionQuery, results
 │   ├── config.rs          # RingDbConfig and BackendPreference
 │   ├── error.rs           # RingDbError enum and Result alias
 │   ├── persist.rs         # read/write helpers for binary files
@@ -43,7 +43,8 @@ ring-db/
 │   └── query_backends.rs  # Criterion.rs benchmarks (30M vector scale)
 ├── tests/
 │   ├── correctness.rs     # Hand-crafted vectors, analytically verified
-│   └── random.rs          # Randomized sanity tests
+│   ├── random.rs          # Randomized sanity tests
+│   └── weighted.rs        # Weighted analytical, validation, property, persistence tests
 ├── .github/workflows/
 │   ├── rust.yml           # CI: build + test on push/PR to master
 │   └── publish.yml        # Publish ring-db-derive then ring-db on v*.*.* tags
@@ -67,7 +68,7 @@ Two main public types:
 **`SealedRingDb<T: Payload>`** — immutable, `Send + Sync`
 - Owns the backend's hot data (vectors + norms) via `Box<dyn RingComputeBackend>`
 - Owns `payload_store: T::Store` as a **concrete field**
-- Methods: `query()`, `query_range()`, `query_disk()`, `fetch_payload()`, `fetch_payloads()`
+- Methods: `query()`, `query_range()`, `query_disk()`, `query_disk_intersection()`, `fetch_payload()`, `fetch_payloads()`
 - Additional impl block (gated on `T::Store: RefPayloadStore<T>`): `fetch_pod()`, `fetch_pods()`
 
 ### [src/payload/mod.rs](src/payload/mod.rs)
@@ -123,17 +124,22 @@ module re-exporting the concrete store types.
 
 ### [src/query.rs](src/query.rs)
 
-All query types take a borrowed `query: &[f32]`:
+The primitive query types are constructed with `new` and take a borrowed
+`query: &[f32]`. Calling `.with_weights(weights)` selects per-dimension
+weighted L2 for that query; otherwise ordinary L2 is used.
 
 | Type | Semantics |
 |------|-----------|
 | `RingQuery` | Symmetric band `[d − λ, d + λ]` |
 | `RangeQuery` | Explicit `[d_min, d_max]` interval |
 | `DiskQuery` | Full ball `[0, d_max]` |
+| `DiskIntersectionQuery` | Intersection of independently weighted/unweighted disks |
 
-All three normalize to `(d_min, d_max)` and delegate to `backend.ring_query_f32()`.
+Ring and range queries delegate to `backend.ring_query_f32()`. Disk and disk
+intersection queries have dedicated backend entry points. Weight vectors are
+query-only data and are never persisted or cached with the database.
 
-`QueryResult` — `ids: Vec<u32>`, `backend_used: &'static str`, `elapsed: Duration`
+`QueryResult` — `hits: Vec<Hit>`, `backend_used: &'static str`, `elapsed: Duration`
 
 ### [src/backend/cpu.rs](src/backend/cpu.rs)
 
@@ -142,6 +148,10 @@ Always-available reference backend. Key optimizations:
 2. **Precomputed `‖x‖²`** — inserted at index time, only dot product computed at query time
 3. **Squared bounds** — `d_min²` and `d_max²` computed once before the loop (no `sqrt`)
 4. **Rayon `par_chunks_exact(dims)`** — parallelizes the scan across all logical cores
+5. **Dedicated weighted kernel** — directly accumulates `wᵢ(xᵢ-qᵢ)²` with
+   independent accumulators; it does not use or create cached weighted norms
+6. **Outer dispatch** — ordinary queries retain the original norm-plus-dot hot
+   path; there is no weights branch inside the coordinate loop
 
 ### [src/backend/cuda.rs](src/backend/cuda.rs)
 
@@ -150,11 +160,19 @@ NVIDIA CUDA driver at runtime, creates a context on device 0, uploads vectors
 and norms to VRAM once, and launches one thread per vector for ring/range/disk
 queries. It does not add link-time CUDA requirements to CPU-only builds.
 
+Weighted ring and disk queries use dedicated PTX kernels. Mixed disk
+intersections pack each disk's optional weights with an offset/sentinel, branch
+once per disk, and retain per-candidate early rejection. All-unweighted queries
+continue to use the original kernels, including the specialized three-disk
+intersection kernel.
+
 `DiskIntersectionQuery` has a dedicated CUDA kernel: a single scan over the
 resident dataset where each thread evaluates every disk for one vector and exits
 early as soon as any disk fails.
 
-Distance formula: `dist_sq = norm_sq_i + norm_sq_q − 2·dot(row, query)`
+Ordinary distance formula: `dist_sq = norm_sq_i + norm_sq_q − 2·dot(row, query)`
+
+Weighted distance formula: `dist_sq = Σᵢ weights[i]·(row[i] − query[i])²`
 
 ### [src/error.rs](src/error.rs)
 
@@ -164,6 +182,10 @@ pub enum RingDbError {
     Payload(String),        // bincode error
     Io(std::io::Error),     // temp file / persist I/O
     Corrupt(String),        // inconsistent persist files on load
+    InvalidQuery(String),   // malformed weight values or invalid query semantics
+    BackendUnavailable(String),
+    Backend(String),
+    StorageMismatch,
 }
 ```
 
@@ -180,6 +202,8 @@ pub enum RingDbError {
 | Pod storage: no offset table | `size_of::<T>()` is a compile-time constant; position arithmetic beats an array lookup |
 | Cold payload storage via mmap | Scales beyond available RAM; OS pages out under pressure |
 | No `sqrt` in distance computation | Preserves ordering; avoids expensive operation; better SIMD scheduling |
+| Weights live only in query state | One stored vector supports arbitrary weighted queries without rebuilds or persisted weighted norms |
+| Independent disk weights | Mixed metrics remain exact in one intersection scan; `Hit::dist_sq` uses the first disk's metric |
 | Backend trait abstraction | Add GPU/CUDA/AVX-512 backends without changing public API |
 | Payload streamed to disk immediately | O(1) peak memory during build regardless of `T` size |
 
@@ -215,11 +239,15 @@ cargo test --features cuda
 RINGDB_CUDA_TEST=1 cargo test --features cuda test_cuda_backend_matches_cpu_when_requested
 cargo test --test correctness
 cargo test --test random
+cargo test --test weighted
 cargo test -- --nocapture
 
 # Benchmark (recommended with native CPU features)
 RUSTFLAGS="-C target-cpu=native" cargo bench
 cargo bench --bench query_backends cpu_f32
+cargo bench --bench query_backends cpu_disk_f32
+cargo bench --bench query_backends cpu_disk_intersection_f32
+cargo bench --bench query_backends cpu_weighted_intersection_scaling_f32
 cargo bench --features cuda --bench query_backends cuda_f32
 RINGDB_CUDA_BENCH_N=5000000 cargo bench --features cuda --bench query_backends cuda_f32
 cargo bench --bench query_backends payload_fetch
@@ -280,15 +308,20 @@ db.build()
 
 ### Query
 ```
-db.query(&RingQuery { query, d, lambda })
+let query = RingQuery::new(query, d, lambda);
+let query = query.with_weights(weights); // optional
+db.query(&query)
   → normalize to (d_min, d_max)
-  → backend.ring_query_f32(dims, query, d_min, d_max)
-      → compute norm_sq_q
+  → validate query and optional weights once
+  → backend.ring_query_f32(dims, query, weights, d_min, d_max)
+      → dispatch once to ordinary or weighted scan
+      → ordinary: compute norm_sq_q
       → square bounds: lower_sq, upper_sq
       → par_chunks_exact(dims):
-          dist_sq = norm_sq_i + norm_sq_q - 2·dot(row_i, query)
+          ordinary: dist_sq = norm_sq_i + norm_sq_q - 2·dot(row_i, query)
+          weighted: dist_sq = Σ weights[i]·(row_i[i] - query[i])²
           if lower_sq ≤ dist_sq ≤ upper_sq → include id i
-  → QueryResult { ids, backend_used, elapsed }
+  → QueryResult { hits, backend_used, elapsed }
 ```
 
 ### Payload fetch — Serde
@@ -329,18 +362,19 @@ db.add_vector(&vec_f32, my_doc)?;
 let db = db.build()?;  // → SealedRingDb<MyDoc>
 
 // Query variants
-let r = db.query(&RingQuery { query: &q, d: 5.0, lambda: 0.5 })?;
-let r = db.query_range(&RangeQuery { query: &q, d_min: 4.5, d_max: 5.5 })?;
-let r = db.query_disk(&DiskQuery { query: &q, d_max: 5.5 })?;
+let weights = vec![1.0f32; dims];
+let r = db.query(&RingQuery::new(&q, 5.0, 0.5))?;
+let r = db.query_range(&RangeQuery::new(&q, 4.5, 5.5).with_weights(&weights))?;
+let r = db.query_disk(&DiskQuery::new(&q, 5.5))?;
 
 // Fetch payloads (serde or pod — owned T)
-let payloads: Vec<MyDoc> = db.fetch_payloads(&r.ids)?;
+let payloads: Vec<MyDoc> = db.fetch_payloads(&r.ids())?;
 
 // Fetch payloads (pod only — zero-copy &T)
 let mut db2: RingDb<MyRecord> = RingDb::new(RingDbConfig::new(dims))?;
 // ... add_vector calls ...
 let db2 = db2.build()?;
-let refs: Vec<&MyRecord> = db2.fetch_pods(&r.ids);  // no allocation
+let refs: Vec<&MyRecord> = db2.fetch_pods(&r.ids());  // no payload copies
 ```
 
 `T` defaults to `()` (no payload). Any `T: Payload` works; use `#[derive(Payload)]`.
@@ -358,4 +392,3 @@ let refs: Vec<&MyRecord> = db2.fetch_pods(&r.ids);  // no allocation
   5. Create GitHub release
 
 ---
-

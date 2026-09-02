@@ -4,7 +4,7 @@ use std::time::Instant;
 use crate::BackendPreference;
 #[cfg(feature = "cuda")]
 use crate::backend::CudaBackend;
-use crate::backend::{CpuBackend, RingComputeBackend};
+use crate::backend::{CpuBackend, DiskSpec, RingComputeBackend};
 use crate::config::RingDbConfig;
 use crate::error::{Result, RingDbError};
 use crate::payload::{OwnedPayloadStore, Payload, PayloadBuilderOps, RefPayloadStore};
@@ -30,6 +30,44 @@ fn make_backend(preference: BackendPreference) -> Result<Box<dyn RingComputeBack
     }
 }
 
+fn validate_query_input(
+    dims: usize,
+    query: &[f32],
+    weights: Option<&[f32]>,
+    disk_index: Option<usize>,
+) -> Result<()> {
+    if query.len() != dims {
+        return Err(RingDbError::DimensionMismatch {
+            expected: dims,
+            got: query.len(),
+        });
+    }
+
+    let Some(weights) = weights else {
+        return Ok(());
+    };
+    if weights.len() != dims {
+        return Err(RingDbError::DimensionMismatch {
+            expected: dims,
+            got: weights.len(),
+        });
+    }
+    for (weight_index, &weight) in weights.iter().enumerate() {
+        if !weight.is_finite() || weight < 0.0 {
+            let location = match disk_index {
+                Some(disk_index) => {
+                    format!("disk {disk_index} weight at index {weight_index}")
+                }
+                None => format!("weight at index {weight_index}"),
+            };
+            return Err(RingDbError::InvalidQuery(format!(
+                "{location} must be finite and non-negative, got {weight}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 // ─── RingDb (builder) ────────────────────────────────────────────────────────
 
 /// Builder for a ring-query vector database.
@@ -51,7 +89,7 @@ fn make_backend(preference: BackendPreference) -> Result<Box<dyn RingComputeBack
 /// db.add_vector(&[0.0, 1.0, 0.0, 0.0], ()).unwrap();
 ///
 /// let db = db.build().unwrap();
-/// let result = db.query(&RingQuery { query: &[1.0f32, 0.0, 0.0, 0.0], d: 1.0, lambda: 0.1 }).unwrap();
+/// let result = db.query(&RingQuery::new(&[1.0f32, 0.0, 0.0, 0.0], 1.0, 0.1)).unwrap();
 /// println!("hits: {:?}", result.ids());
 /// ```
 pub struct RingDb<T: Payload = ()> {
@@ -91,7 +129,7 @@ impl<T: Payload> RingDb<T> {
     /// db.add_vector(&[0.0, 1.0], Meta { label: "cat".into() }).unwrap();
     ///
     /// let db = db.build().unwrap();
-    /// let result = db.query(&RingQuery { query: &[1.0f32, 0.0], d: 1.0, lambda: 0.1 }).unwrap();
+    /// let result = db.query(&RingQuery::new(&[1.0f32, 0.0], 1.0, 0.1)).unwrap();
     /// let payloads = db.fetch_payloads(&result.ids()).unwrap();
     /// ```
     pub fn new(config: RingDbConfig) -> Result<Self> {
@@ -269,16 +307,12 @@ impl<T: Payload> SealedRingDb<T> {
     /// Execute a ring query and return matching vector IDs.
     pub fn query(&self, q: &RingQuery<'_>) -> Result<QueryResult> {
         let dims = self.config.dims;
-        if q.query.len() != dims {
-            return Err(RingDbError::DimensionMismatch {
-                expected: dims,
-                got: q.query.len(),
-            });
-        }
+        validate_query_input(dims, q.query, q.weights, None)?;
         let t = Instant::now();
         let hits = self.backend.ring_query_f32(
             dims,
             q.query,
+            q.weights,
             (q.d - q.lambda).max(0.0),
             q.d + q.lambda,
         )?;
@@ -292,16 +326,11 @@ impl<T: Payload> SealedRingDb<T> {
     /// Execute a range query: all vectors with distance in `[d_min, d_max]`.
     pub fn query_range(&self, q: &RangeQuery<'_>) -> Result<QueryResult> {
         let dims = self.config.dims;
-        if q.query.len() != dims {
-            return Err(RingDbError::DimensionMismatch {
-                expected: dims,
-                got: q.query.len(),
-            });
-        }
+        validate_query_input(dims, q.query, q.weights, None)?;
         let t = Instant::now();
         let hits = self
             .backend
-            .ring_query_f32(dims, q.query, q.d_min, q.d_max)?;
+            .ring_query_f32(dims, q.query, q.weights, q.d_min, q.d_max)?;
         Ok(QueryResult {
             hits,
             backend_used: self.backend.name(),
@@ -312,14 +341,11 @@ impl<T: Payload> SealedRingDb<T> {
     /// Execute a disk query: all vectors within radius `d_max`.
     pub fn query_disk(&self, q: &DiskQuery<'_>) -> Result<QueryResult> {
         let dims = self.config.dims;
-        if q.query.len() != dims {
-            return Err(RingDbError::DimensionMismatch {
-                expected: dims,
-                got: q.query.len(),
-            });
-        }
+        validate_query_input(dims, q.query, q.weights, None)?;
         let t = Instant::now();
-        let hits = self.backend.disk_query_f32(dims, q.query, q.d_max)?;
+        let hits = self
+            .backend
+            .disk_query_f32(dims, q.query, q.weights, q.d_max)?;
         Ok(QueryResult {
             hits,
             backend_used: self.backend.name(),
@@ -329,7 +355,7 @@ impl<T: Payload> SealedRingDb<T> {
 
     /// Execute a disk-intersection query: all vectors inside every disk.
     ///
-    /// Returned hit distances are measured against the first disk.
+    /// Returned hit distances are measured using the first disk's metric.
     pub fn query_disk_intersection(&self, q: &DiskIntersectionQuery<'_>) -> Result<QueryResult> {
         let dims = self.config.dims;
         if q.disks.is_empty() {
@@ -337,19 +363,18 @@ impl<T: Payload> SealedRingDb<T> {
                 "disk intersection requires at least one disk".to_string(),
             ));
         }
-        for disk in q.disks {
-            if disk.query.len() != dims {
-                return Err(RingDbError::DimensionMismatch {
-                    expected: dims,
-                    got: disk.query.len(),
-                });
-            }
+        for (disk_index, disk) in q.disks.iter().enumerate() {
+            validate_query_input(dims, disk.query, disk.weights, Some(disk_index))?;
         }
 
-        let disks: Vec<(&[f32], f32)> = q
+        let disks: Vec<DiskSpec<'_>> = q
             .disks
             .iter()
-            .map(|disk| (disk.query, disk.d_max))
+            .map(|disk| DiskSpec {
+                query: disk.query,
+                d_max: disk.d_max,
+                weights: disk.weights,
+            })
             .collect();
         let t = Instant::now();
         let hits = self.backend.disk_intersection_query_f32(dims, &disks)?;

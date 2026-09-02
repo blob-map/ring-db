@@ -87,11 +87,7 @@ fn main() {
     println!("  backend : {}", db.backend_name());
     println!();
 
-    let rq = RingQuery {
-        query: &query_vec,
-        d: cli.d,
-        lambda: cli.lambda,
-    };
+    let rq = RingQuery::new(&query_vec, cli.d, cli.lambda);
 
     print!("Running ring query … ");
     let QueryResult {

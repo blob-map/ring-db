@@ -3,7 +3,9 @@
 //! A vector database specialised for **ring queries** in high-dimensional spaces.
 //!
 //! Instead of nearest-neighbour search, ringDB retrieves all vectors whose
-//! Euclidean distance to a query lies within a specified interval `[d-λ, d+λ]`.
+//! distance to a query lies within a specified interval `[d-λ, d+λ]`.
+//! Queries use ordinary L2 by default and can optionally provide final
+//! per-dimension coefficients for weighted L2.
 //!
 //! ## Quick start
 //!
@@ -15,7 +17,7 @@
 //! db.add_vector(&[0.0, 5.0, 0.0, 0.0], ()).unwrap();
 //!
 //! let db = db.build().unwrap();
-//! let result = db.query(&RingQuery { query: &[0.0f32; 4], d: 1.0, lambda: 0.1 }).unwrap();
+//! let result = db.query(&RingQuery::new(&[0.0f32; 4], 1.0, 0.1)).unwrap();
 //! // result.hits contains all matching vectors with their squared distances
 //! ```
 mod backend;

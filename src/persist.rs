@@ -38,6 +38,7 @@ fn write_le_file<T: Copy, const N: usize>(
 /// Read a file of raw little-endian values into a `Vec<T>`.
 ///
 /// Returns `RingDbError::Corrupt` if the file length is not a multiple of `N`.
+#[allow(clippy::chunks_exact_to_as_chunks)]
 fn read_le_file<T, const N: usize>(path: &Path, from_le: fn([u8; N]) -> T) -> Result<Vec<T>> {
     let bytes = std::fs::read(path)?;
     if bytes.len() % N != 0 {

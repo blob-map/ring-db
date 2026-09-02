@@ -1,4 +1,4 @@
-use crate::backend::RingComputeBackend;
+use crate::backend::{DiskSpec, RingComputeBackend};
 use crate::error::{Result, RingDbError};
 use crate::query::Hit;
 use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
@@ -493,8 +493,11 @@ pub struct CudaBackend {
     n_vectors: usize,
     ring_kernel: CUfunction,
     disk_kernel: CUfunction,
+    weighted_ring_kernel: CUfunction,
+    weighted_disk_kernel: CUfunction,
     disk_intersection_kernel: CUfunction,
     disk_intersection3_kernel: CUfunction,
+    mixed_disk_intersection_kernel: CUfunction,
 }
 
 unsafe impl Send for CudaBackend {}
@@ -507,9 +510,13 @@ impl CudaBackend {
         let module = CudaModule::load(driver.clone())?;
         let ring_kernel = module.function(b"ring_query_f32_kernel\0")?;
         let disk_kernel = module.function(b"disk_query_f32_kernel\0")?;
+        let weighted_ring_kernel = module.function(b"weighted_ring_query_f32_kernel\0")?;
+        let weighted_disk_kernel = module.function(b"weighted_disk_query_f32_kernel\0")?;
         let disk_intersection_kernel = module.function(b"disk_intersection_query_f32_kernel\0")?;
         let disk_intersection3_kernel =
             module.function(b"disk_intersection3_query_f32_kernel\0")?;
+        let mixed_disk_intersection_kernel =
+            module.function(b"mixed_disk_intersection_query_f32_kernel\0")?;
 
         Ok(Self {
             vectors: None,
@@ -524,8 +531,11 @@ impl CudaBackend {
             n_vectors: 0,
             ring_kernel,
             disk_kernel,
+            weighted_ring_kernel,
+            weighted_disk_kernel,
             disk_intersection_kernel,
             disk_intersection3_kernel,
+            mixed_disk_intersection_kernel,
         })
     }
 
@@ -565,6 +575,16 @@ impl CudaBackend {
             return Err(RingDbError::DimensionMismatch {
                 expected: self.dims,
                 got: dims,
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_weights(dims: usize, weights: &[f32]) -> Result<()> {
+        if weights.len() != dims {
+            return Err(RingDbError::DimensionMismatch {
+                expected: dims,
+                got: weights.len(),
             });
         }
         Ok(())
@@ -689,7 +709,121 @@ impl CudaBackend {
         out_hits.copy_to_vec(hit_count)
     }
 
-    fn validate_disks(&self, dims: usize, disks: &[(&[f32], f32)]) -> Result<()> {
+    fn launch_weighted_ring(
+        &self,
+        query: &[f32],
+        weights: &[f32],
+        lower_sq: f32,
+        upper_sq: f32,
+        disk_mode: bool,
+    ) -> Result<Vec<Hit>> {
+        if self.n_vectors == 0 {
+            return Ok(Vec::new());
+        }
+        if self.n_vectors > u32::MAX as usize {
+            return Err(RingDbError::Backend(
+                "CUDA backend supports at most u32::MAX vectors".to_string(),
+            ));
+        }
+        if self.dims > u32::MAX as usize {
+            return Err(RingDbError::Backend(
+                "CUDA backend supports at most u32::MAX dimensions".to_string(),
+            ));
+        }
+
+        let packed_len = query
+            .len()
+            .checked_add(weights.len())
+            .ok_or_else(|| RingDbError::Backend("CUDA query packing overflow".to_string()))?;
+        let mut query_and_weights = Vec::with_capacity(packed_len);
+        query_and_weights.extend_from_slice(query);
+        query_and_weights.extend_from_slice(weights);
+
+        let _guard = self
+            .launch_lock
+            .lock()
+            .map_err(|_| RingDbError::Backend("CUDA launch mutex is poisoned".to_string()))?;
+        self.context.set_current()?;
+
+        let (vectors, _) = self.require_uploaded()?;
+        let (out_hits, out_count) = self.require_output_buffers()?;
+        let query_buf = DeviceBuffer::from_slice(self.driver.clone(), &query_and_weights)?;
+        out_count.copy_from_slice(&[0u32])?;
+
+        let weights_byte_offset = query
+            .len()
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| RingDbError::Backend("CUDA query offset overflow".to_string()))?;
+        let mut vectors_ptr = vectors.ptr;
+        let mut dims_u32 = self.dims as u32;
+        let mut n_vectors_u32 = self.n_vectors as u32;
+        let mut query_ptr = query_buf.ptr;
+        let mut weights_ptr = query_buf
+            .ptr
+            .checked_add(weights_byte_offset as u64)
+            .ok_or_else(|| RingDbError::Backend("CUDA query pointer overflow".to_string()))?;
+        let mut lower_sq = lower_sq;
+        let mut upper_sq = upper_sq;
+        let mut out_hits_ptr = out_hits.ptr;
+        let mut out_count_ptr = out_count.ptr;
+
+        let grid_x = n_vectors_u32.div_ceil(THREADS_PER_BLOCK);
+        let mut ring_params = [
+            (&mut vectors_ptr as *mut CUdeviceptr).cast::<c_void>(),
+            (&mut dims_u32 as *mut u32).cast::<c_void>(),
+            (&mut n_vectors_u32 as *mut u32).cast::<c_void>(),
+            (&mut query_ptr as *mut CUdeviceptr).cast::<c_void>(),
+            (&mut weights_ptr as *mut CUdeviceptr).cast::<c_void>(),
+            (&mut lower_sq as *mut f32).cast::<c_void>(),
+            (&mut upper_sq as *mut f32).cast::<c_void>(),
+            (&mut out_hits_ptr as *mut CUdeviceptr).cast::<c_void>(),
+            (&mut out_hits_ptr as *mut CUdeviceptr).cast::<c_void>(),
+            (&mut out_count_ptr as *mut CUdeviceptr).cast::<c_void>(),
+        ];
+        let mut disk_params = [
+            (&mut vectors_ptr as *mut CUdeviceptr).cast::<c_void>(),
+            (&mut dims_u32 as *mut u32).cast::<c_void>(),
+            (&mut n_vectors_u32 as *mut u32).cast::<c_void>(),
+            (&mut query_ptr as *mut CUdeviceptr).cast::<c_void>(),
+            (&mut weights_ptr as *mut CUdeviceptr).cast::<c_void>(),
+            (&mut upper_sq as *mut f32).cast::<c_void>(),
+            (&mut out_hits_ptr as *mut CUdeviceptr).cast::<c_void>(),
+            (&mut out_hits_ptr as *mut CUdeviceptr).cast::<c_void>(),
+            (&mut out_count_ptr as *mut CUdeviceptr).cast::<c_void>(),
+        ];
+
+        unsafe {
+            let (kernel, params) = if disk_mode {
+                (self.weighted_disk_kernel, disk_params.as_mut_ptr())
+            } else {
+                (self.weighted_ring_kernel, ring_params.as_mut_ptr())
+            };
+            self.driver.check(
+                (self.driver.cu_launch_kernel)(
+                    kernel,
+                    grid_x,
+                    1,
+                    1,
+                    THREADS_PER_BLOCK,
+                    1,
+                    1,
+                    0,
+                    ptr::null_mut(),
+                    params,
+                    ptr::null_mut(),
+                ),
+                "cuLaunchKernel",
+            )?;
+            self.driver
+                .check((self.driver.cu_ctx_synchronize)(), "cuCtxSynchronize")?;
+        }
+
+        let hit_count = out_count.copy_to_vec(1)?[0] as usize;
+        let hit_count = hit_count.min(self.n_vectors);
+        out_hits.copy_to_vec(hit_count)
+    }
+
+    fn validate_disks(&self, dims: usize, disks: &[DiskSpec<'_>]) -> Result<()> {
         if dims != self.dims {
             return Err(RingDbError::DimensionMismatch {
                 expected: self.dims,
@@ -701,18 +835,21 @@ impl CudaBackend {
                 "CUDA backend supports at most u32::MAX disks".to_string(),
             ));
         }
-        for &(query, _) in disks {
-            if query.len() != dims {
+        for disk in disks {
+            if disk.query.len() != dims {
                 return Err(RingDbError::DimensionMismatch {
                     expected: dims,
-                    got: query.len(),
+                    got: disk.query.len(),
                 });
+            }
+            if let Some(weights) = disk.weights {
+                Self::validate_weights(dims, weights)?;
             }
         }
         Ok(())
     }
 
-    fn launch_disk_intersection(&self, disks: &[(&[f32], f32)]) -> Result<Vec<Hit>> {
+    fn launch_disk_intersection(&self, disks: &[DiskSpec<'_>]) -> Result<Vec<Hit>> {
         if self.n_vectors == 0 || disks.is_empty() {
             return Ok(Vec::new());
         }
@@ -730,10 +867,11 @@ impl CudaBackend {
         let mut disk_queries = Vec::with_capacity(disks.len() * self.dims);
         let mut disk_norms_sq = Vec::with_capacity(disks.len());
         let mut disk_upper_sq = Vec::with_capacity(disks.len());
-        for &(query, d_max) in disks {
-            disk_queries.extend_from_slice(query);
-            disk_norms_sq.push(Self::query_norm_sq(query));
-            disk_upper_sq.push(d_max * d_max);
+        for disk in disks {
+            debug_assert!(disk.weights.is_none());
+            disk_queries.extend_from_slice(disk.query);
+            disk_norms_sq.push(Self::query_norm_sq(disk.query));
+            disk_upper_sq.push(disk.d_max * disk.d_max);
         }
 
         let _guard = self
@@ -784,6 +922,159 @@ impl CudaBackend {
             self.driver.check(
                 (self.driver.cu_launch_kernel)(
                     kernel,
+                    grid_x,
+                    1,
+                    1,
+                    THREADS_PER_BLOCK,
+                    1,
+                    1,
+                    0,
+                    ptr::null_mut(),
+                    params.as_mut_ptr(),
+                    ptr::null_mut(),
+                ),
+                "cuLaunchKernel",
+            )?;
+            self.driver
+                .check((self.driver.cu_ctx_synchronize)(), "cuCtxSynchronize")?;
+        }
+
+        let hit_count = out_count.copy_to_vec(1)?[0] as usize;
+        let hit_count = hit_count.min(self.n_vectors);
+        out_hits.copy_to_vec(hit_count)
+    }
+
+    fn launch_mixed_disk_intersection(&self, disks: &[DiskSpec<'_>]) -> Result<Vec<Hit>> {
+        if self.n_vectors == 0 || disks.is_empty() {
+            return Ok(Vec::new());
+        }
+        if self.n_vectors > u32::MAX as usize {
+            return Err(RingDbError::Backend(
+                "CUDA backend supports at most u32::MAX vectors".to_string(),
+            ));
+        }
+        if self.dims > u32::MAX as usize {
+            return Err(RingDbError::Backend(
+                "CUDA backend supports at most u32::MAX dimensions".to_string(),
+            ));
+        }
+
+        let query_values_len = disks
+            .len()
+            .checked_mul(self.dims)
+            .ok_or_else(|| RingDbError::Backend("CUDA query packing overflow".to_string()))?;
+        let weighted_disks = disks.iter().filter(|disk| disk.weights.is_some()).count();
+        let weight_values_len = weighted_disks
+            .checked_mul(self.dims)
+            .ok_or_else(|| RingDbError::Backend("CUDA weight packing overflow".to_string()))?;
+        if weight_values_len > u32::MAX as usize {
+            return Err(RingDbError::Backend(
+                "CUDA packed weights exceed the u32 offset range".to_string(),
+            ));
+        }
+        let packed_values_len = query_values_len
+            .checked_add(weight_values_len)
+            .ok_or_else(|| RingDbError::Backend("CUDA query packing overflow".to_string()))?;
+
+        let mut disk_data = Vec::with_capacity(packed_values_len);
+        for disk in disks {
+            disk_data.extend_from_slice(disk.query);
+        }
+        let weights_start = disk_data.len();
+
+        // Offsets count f32 elements from the packed weight suffix. The
+        // sentinel keeps the metric decision outside both dimension loops.
+        let mut weight_offsets = Vec::with_capacity(disks.len());
+        for disk in disks {
+            if let Some(weights) = disk.weights {
+                let offset = disk_data.len() - weights_start;
+                let offset = u32::try_from(offset).map_err(|_| {
+                    RingDbError::Backend(
+                        "CUDA packed weights exceed the u32 offset range".to_string(),
+                    )
+                })?;
+                weight_offsets.push(offset);
+                disk_data.extend_from_slice(weights);
+            } else {
+                weight_offsets.push(u32::MAX);
+            }
+        }
+
+        let scalar_values_len = disks
+            .len()
+            .checked_mul(2)
+            .ok_or_else(|| RingDbError::Backend("CUDA disk packing overflow".to_string()))?;
+        let mut disk_scalars = Vec::with_capacity(scalar_values_len);
+        disk_scalars.extend(disks.iter().map(|disk| {
+            if disk.weights.is_some() {
+                0.0
+            } else {
+                Self::query_norm_sq(disk.query)
+            }
+        }));
+        disk_scalars.extend(disks.iter().map(|disk| disk.d_max * disk.d_max));
+
+        let _guard = self
+            .launch_lock
+            .lock()
+            .map_err(|_| RingDbError::Backend("CUDA launch mutex is poisoned".to_string()))?;
+        self.context.set_current()?;
+
+        let (vectors, norms_sq) = self.require_uploaded()?;
+        let (out_hits, out_count) = self.require_output_buffers()?;
+        let disk_data_buf = DeviceBuffer::from_slice(self.driver.clone(), &disk_data)?;
+        let disk_scalars_buf = DeviceBuffer::from_slice(self.driver.clone(), &disk_scalars)?;
+        let weight_offsets_buf = DeviceBuffer::from_slice(self.driver.clone(), &weight_offsets)?;
+        out_count.copy_from_slice(&[0u32])?;
+
+        let weights_byte_offset = weights_start
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| RingDbError::Backend("CUDA weight pointer overflow".to_string()))?;
+        let upper_byte_offset = disks
+            .len()
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| RingDbError::Backend("CUDA disk pointer overflow".to_string()))?;
+
+        let mut vectors_ptr = vectors.ptr;
+        let mut norms_ptr = norms_sq.ptr;
+        let mut dims_u32 = self.dims as u32;
+        let mut n_vectors_u32 = self.n_vectors as u32;
+        let mut disk_queries_ptr = disk_data_buf.ptr;
+        let mut disk_weights_ptr = disk_data_buf
+            .ptr
+            .checked_add(weights_byte_offset as u64)
+            .ok_or_else(|| RingDbError::Backend("CUDA weight pointer overflow".to_string()))?;
+        let mut disk_norms_ptr = disk_scalars_buf.ptr;
+        let mut disk_upper_ptr = disk_scalars_buf
+            .ptr
+            .checked_add(upper_byte_offset as u64)
+            .ok_or_else(|| RingDbError::Backend("CUDA disk pointer overflow".to_string()))?;
+        let mut weight_offsets_ptr = weight_offsets_buf.ptr;
+        let mut n_disks_u32 = disks.len() as u32;
+        let mut out_hits_ptr = out_hits.ptr;
+        let mut out_count_ptr = out_count.ptr;
+
+        let grid_x = n_vectors_u32.div_ceil(THREADS_PER_BLOCK);
+        let mut params = [
+            (&mut vectors_ptr as *mut CUdeviceptr).cast::<c_void>(),
+            (&mut norms_ptr as *mut CUdeviceptr).cast::<c_void>(),
+            (&mut dims_u32 as *mut u32).cast::<c_void>(),
+            (&mut n_vectors_u32 as *mut u32).cast::<c_void>(),
+            (&mut disk_queries_ptr as *mut CUdeviceptr).cast::<c_void>(),
+            (&mut disk_weights_ptr as *mut CUdeviceptr).cast::<c_void>(),
+            (&mut disk_norms_ptr as *mut CUdeviceptr).cast::<c_void>(),
+            (&mut disk_upper_ptr as *mut CUdeviceptr).cast::<c_void>(),
+            (&mut weight_offsets_ptr as *mut CUdeviceptr).cast::<c_void>(),
+            (&mut n_disks_u32 as *mut u32).cast::<c_void>(),
+            (&mut out_hits_ptr as *mut CUdeviceptr).cast::<c_void>(),
+            (&mut out_hits_ptr as *mut CUdeviceptr).cast::<c_void>(),
+            (&mut out_count_ptr as *mut CUdeviceptr).cast::<c_void>(),
+        ];
+
+        unsafe {
+            self.driver.check(
+                (self.driver.cu_launch_kernel)(
+                    self.mixed_disk_intersection_kernel,
                     grid_x,
                     1,
                     1,
@@ -865,25 +1156,42 @@ impl RingComputeBackend for CudaBackend {
         &self,
         dims: usize,
         query: &[f32],
+        weights: Option<&[f32]>,
         d_min: f32,
         d_max: f32,
     ) -> Result<Vec<Hit>> {
         self.validate_query(dims, query)?;
-        self.launch_ring(query, d_min * d_min, d_max * d_max, false)
+        if let Some(weights) = weights {
+            Self::validate_weights(dims, weights)?;
+            self.launch_weighted_ring(query, weights, d_min * d_min, d_max * d_max, false)
+        } else {
+            self.launch_ring(query, d_min * d_min, d_max * d_max, false)
+        }
     }
 
-    fn disk_query_f32(&self, dims: usize, query: &[f32], d_max: f32) -> Result<Vec<Hit>> {
-        self.validate_query(dims, query)?;
-        self.launch_ring(query, 0.0, d_max * d_max, true)
-    }
-
-    fn disk_intersection_query_f32(
+    fn disk_query_f32(
         &self,
         dims: usize,
-        disks: &[(&[f32], f32)],
+        query: &[f32],
+        weights: Option<&[f32]>,
+        d_max: f32,
     ) -> Result<Vec<Hit>> {
+        self.validate_query(dims, query)?;
+        if let Some(weights) = weights {
+            Self::validate_weights(dims, weights)?;
+            self.launch_weighted_ring(query, weights, 0.0, d_max * d_max, true)
+        } else {
+            self.launch_ring(query, 0.0, d_max * d_max, true)
+        }
+    }
+
+    fn disk_intersection_query_f32(&self, dims: usize, disks: &[DiskSpec<'_>]) -> Result<Vec<Hit>> {
         self.validate_disks(dims, disks)?;
-        self.launch_disk_intersection(disks)
+        if disks.iter().all(|disk| disk.weights.is_none()) {
+            self.launch_disk_intersection(disks)
+        } else {
+            self.launch_mixed_disk_intersection(disks)
+        }
     }
 }
 
@@ -1051,6 +1359,156 @@ disk_done:
     ret;
 }
 
+.visible .entry weighted_ring_query_f32_kernel(
+    .param .u64 wring_vectors,
+    .param .u32 wring_dims,
+    .param .u32 wring_n_vectors,
+    .param .u64 wring_query,
+    .param .u64 wring_weights,
+    .param .f32 wring_lower_sq,
+    .param .f32 wring_upper_sq,
+    .param .u64 wring_out_ids,
+    .param .u64 wring_out_dists,
+    .param .u64 wring_out_count
+)
+{
+    .reg .pred %p<6>;
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<28>;
+    .reg .f32 %f<12>;
+
+    ld.param.u64 %rd1, [wring_vectors];
+    ld.param.u32 %r5, [wring_dims];
+    ld.param.u32 %r6, [wring_n_vectors];
+    ld.param.u64 %rd3, [wring_query];
+    ld.param.u64 %rd4, [wring_weights];
+    ld.param.f32 %f8, [wring_lower_sq];
+    ld.param.f32 %f9, [wring_upper_sq];
+    ld.param.u64 %rd5, [wring_out_ids];
+    ld.param.u64 %rd6, [wring_out_dists];
+    ld.param.u64 %rd7, [wring_out_count];
+
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    mad.lo.u32 %r4, %r1, %r2, %r3;
+    setp.ge.u32 %p1, %r4, %r6;
+    @%p1 ret;
+
+    cvt.u64.u32 %rd10, %r4;
+    shl.b64 %rd10, %rd10, 2;
+    add.u64 %rd10, %rd1, %rd10;
+    cvt.u64.u32 %rd12, %r6;
+    shl.b64 %rd12, %rd12, 2;
+    mov.u64 %rd16, %rd3;
+    mov.u64 %rd17, %rd4;
+    mov.u32 %r7, 0;
+    mov.f32 %f1, 0f00000000;
+
+wring_loop:
+    setp.ge.u32 %p2, %r7, %r5;
+    @%p2 bra wring_done;
+    ld.global.f32 %f2, [%rd10];
+    ld.global.f32 %f3, [%rd16];
+    ld.global.f32 %f4, [%rd17];
+    sub.rn.f32 %f5, %f2, %f3;
+    mul.rn.f32 %f6, %f5, %f5;
+    fma.rn.f32 %f1, %f4, %f6, %f1;
+    add.u64 %rd10, %rd10, %rd12;
+    add.u64 %rd16, %rd16, 4;
+    add.u64 %rd17, %rd17, 4;
+    add.u32 %r7, %r7, 1;
+    bra wring_loop;
+
+wring_done:
+    setp.ge.f32 %p3, %f1, %f8;
+    setp.le.f32 %p4, %f1, %f9;
+    and.pred %p5, %p3, %p4;
+    @!%p5 ret;
+
+    atom.global.add.u32 %r8, [%rd7], 1;
+    cvt.u64.u32 %rd20, %r8;
+    shl.b64 %rd21, %rd20, 3;
+    add.u64 %rd22, %rd5, %rd21;
+    st.global.u32 [%rd22], %r4;
+    add.u64 %rd23, %rd22, 4;
+    st.global.f32 [%rd23], %f1;
+    ret;
+}
+
+.visible .entry weighted_disk_query_f32_kernel(
+    .param .u64 wdisk_vectors,
+    .param .u32 wdisk_dims,
+    .param .u32 wdisk_n_vectors,
+    .param .u64 wdisk_query,
+    .param .u64 wdisk_weights,
+    .param .f32 wdisk_upper_sq,
+    .param .u64 wdisk_out_ids,
+    .param .u64 wdisk_out_dists,
+    .param .u64 wdisk_out_count
+)
+{
+    .reg .pred %p<4>;
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<28>;
+    .reg .f32 %f<11>;
+
+    ld.param.u64 %rd1, [wdisk_vectors];
+    ld.param.u32 %r5, [wdisk_dims];
+    ld.param.u32 %r6, [wdisk_n_vectors];
+    ld.param.u64 %rd3, [wdisk_query];
+    ld.param.u64 %rd4, [wdisk_weights];
+    ld.param.f32 %f9, [wdisk_upper_sq];
+    ld.param.u64 %rd5, [wdisk_out_ids];
+    ld.param.u64 %rd6, [wdisk_out_dists];
+    ld.param.u64 %rd7, [wdisk_out_count];
+
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    mad.lo.u32 %r4, %r1, %r2, %r3;
+    setp.ge.u32 %p1, %r4, %r6;
+    @%p1 ret;
+
+    cvt.u64.u32 %rd10, %r4;
+    shl.b64 %rd10, %rd10, 2;
+    add.u64 %rd10, %rd1, %rd10;
+    cvt.u64.u32 %rd12, %r6;
+    shl.b64 %rd12, %rd12, 2;
+    mov.u64 %rd16, %rd3;
+    mov.u64 %rd17, %rd4;
+    mov.u32 %r7, 0;
+    mov.f32 %f1, 0f00000000;
+
+wdisk_loop:
+    setp.ge.u32 %p2, %r7, %r5;
+    @%p2 bra wdisk_done;
+    ld.global.f32 %f2, [%rd10];
+    ld.global.f32 %f3, [%rd16];
+    ld.global.f32 %f4, [%rd17];
+    sub.rn.f32 %f5, %f2, %f3;
+    mul.rn.f32 %f6, %f5, %f5;
+    fma.rn.f32 %f1, %f4, %f6, %f1;
+    add.u64 %rd10, %rd10, %rd12;
+    add.u64 %rd16, %rd16, 4;
+    add.u64 %rd17, %rd17, 4;
+    add.u32 %r7, %r7, 1;
+    bra wdisk_loop;
+
+wdisk_done:
+    setp.le.f32 %p3, %f1, %f9;
+    @!%p3 ret;
+
+    atom.global.add.u32 %r8, [%rd7], 1;
+    cvt.u64.u32 %rd20, %r8;
+    shl.b64 %rd21, %rd20, 3;
+    add.u64 %rd22, %rd5, %rd21;
+    st.global.u32 [%rd22], %r4;
+    add.u64 %rd23, %rd22, 4;
+    st.global.f32 [%rd23], %f1;
+    ret;
+}
+
 .visible .entry disk_intersection_query_f32_kernel(
     .param .u64 isect_vectors,
     .param .u64 isect_norms_sq,
@@ -1145,6 +1603,139 @@ isect_emit:
     cvt.u64.u32 %rd20, %r8;
     shl.b64 %rd21, %rd20, 3;
     add.u64 %rd22, %rd6, %rd21;
+    st.global.u32 [%rd22], %r4;
+    add.u64 %rd23, %rd22, 4;
+    st.global.f32 [%rd23], %f10;
+    ret;
+}
+
+.visible .entry mixed_disk_intersection_query_f32_kernel(
+    .param .u64 mixed_vectors,
+    .param .u64 mixed_norms_sq,
+    .param .u32 mixed_dims,
+    .param .u32 mixed_n_vectors,
+    .param .u64 mixed_disk_queries,
+    .param .u64 mixed_disk_weights,
+    .param .u64 mixed_disk_norms_sq,
+    .param .u64 mixed_disk_upper_sq,
+    .param .u64 mixed_weight_offsets,
+    .param .u32 mixed_n_disks,
+    .param .u64 mixed_out_ids,
+    .param .u64 mixed_out_dists,
+    .param .u64 mixed_out_count
+)
+{
+    .reg .pred %p<9>;
+    .reg .b32 %r<20>;
+    .reg .b64 %rd<44>;
+    .reg .f32 %f<14>;
+
+    ld.param.u64 %rd1, [mixed_vectors];
+    ld.param.u64 %rd2, [mixed_norms_sq];
+    ld.param.u32 %r5, [mixed_dims];
+    ld.param.u32 %r6, [mixed_n_vectors];
+    ld.param.u64 %rd3, [mixed_disk_queries];
+    ld.param.u64 %rd4, [mixed_disk_weights];
+    ld.param.u64 %rd5, [mixed_disk_norms_sq];
+    ld.param.u64 %rd6, [mixed_disk_upper_sq];
+    ld.param.u64 %rd7, [mixed_weight_offsets];
+    ld.param.u32 %r10, [mixed_n_disks];
+    ld.param.u64 %rd8, [mixed_out_ids];
+    ld.param.u64 %rd9, [mixed_out_dists];
+    ld.param.u64 %rd10, [mixed_out_count];
+
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    mad.lo.u32 %r4, %r1, %r2, %r3;
+    setp.ge.u32 %p1, %r4, %r6;
+    @%p1 ret;
+
+    cvt.u64.u32 %rd17, %r4;
+    shl.b64 %rd18, %rd17, 2;
+    add.u64 %rd19, %rd2, %rd18;
+    ld.global.f32 %f4, [%rd19];
+
+    mov.u32 %r9, 0;
+    mov.f32 %f10, 0f00000000;
+
+mixed_disk_loop:
+    setp.ge.u32 %p2, %r9, %r10;
+    @%p2 bra mixed_emit;
+
+    mul.wide.u32 %rd24, %r9, %r5;
+    cvt.u64.u32 %rd25, %r9;
+    shl.b64 %rd26, %rd25, 2;
+    add.u64 %rd27, %rd7, %rd26;
+    ld.global.u32 %r11, [%rd27];
+    shl.b64 %rd29, %rd24, 2;
+    add.u64 %rd30, %rd3, %rd29;
+
+    cvt.u64.u32 %rd32, %r4;
+    shl.b64 %rd32, %rd32, 2;
+    add.u64 %rd32, %rd1, %rd32;
+    cvt.u64.u32 %rd33, %r6;
+    shl.b64 %rd33, %rd33, 2;
+    mov.u32 %r7, 0;
+    mov.f32 %f1, 0f00000000;
+
+    setp.eq.u32 %p6, %r11, 0xffffffff;
+    @%p6 bra mixed_unweighted_loop;
+    cvt.u64.u32 %rd34, %r11;
+    shl.b64 %rd36, %rd34, 2;
+    add.u64 %rd37, %rd4, %rd36;
+
+mixed_weighted_loop:
+    setp.ge.u32 %p4, %r7, %r5;
+    @%p4 bra mixed_weighted_done;
+    ld.global.f32 %f2, [%rd32];
+    ld.global.f32 %f3, [%rd30];
+    ld.global.f32 %f7, [%rd37];
+    sub.rn.f32 %f5, %f2, %f3;
+    mul.rn.f32 %f8, %f5, %f5;
+    fma.rn.f32 %f1, %f7, %f8, %f1;
+    add.u64 %rd32, %rd32, %rd33;
+    add.u64 %rd30, %rd30, 4;
+    add.u64 %rd37, %rd37, 4;
+    add.u32 %r7, %r7, 1;
+    bra mixed_weighted_loop;
+
+mixed_weighted_done:
+    mov.f32 %f6, %f1;
+    bra mixed_compare;
+
+mixed_unweighted_loop:
+    setp.ge.u32 %p3, %r7, %r5;
+    @%p3 bra mixed_unweighted_done;
+    ld.global.f32 %f2, [%rd32];
+    ld.global.f32 %f3, [%rd30];
+    fma.rn.f32 %f1, %f2, %f3, %f1;
+    add.u64 %rd32, %rd32, %rd33;
+    add.u64 %rd30, %rd30, 4;
+    add.u32 %r7, %r7, 1;
+    bra mixed_unweighted_loop;
+
+mixed_unweighted_done:
+    add.u64 %rd30, %rd5, %rd26;
+    ld.global.f32 %f11, [%rd30];
+    fma.rn.f32 %f5, %f1, 0fC0000000, %f4;
+    add.rn.f32 %f6, %f5, %f11;
+
+mixed_compare:
+    add.u64 %rd31, %rd6, %rd26;
+    ld.global.f32 %f9, [%rd31];
+    setp.gt.f32 %p5, %f6, %f9;
+    @%p5 ret;
+    setp.eq.u32 %p7, %r9, 0;
+    @%p7 mov.f32 %f10, %f6;
+    add.u32 %r9, %r9, 1;
+    bra mixed_disk_loop;
+
+mixed_emit:
+    atom.global.add.u32 %r8, [%rd10], 1;
+    cvt.u64.u32 %rd20, %r8;
+    shl.b64 %rd21, %rd20, 3;
+    add.u64 %rd22, %rd8, %rd21;
     st.global.u32 [%rd22], %r4;
     add.u64 %rd23, %rd22, 4;
     st.global.f32 [%rd23], %f10;
