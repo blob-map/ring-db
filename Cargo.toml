@@ -1,6 +1,6 @@
 [package]
 name = "ring-db"
-version = "0.8.0"
+version = "0.8.1"
 edition = "2024"
 description = "Exact CPU and CUDA vector search with ring queries, weighted KNN, and metadata filtering."
 license = "MIT OR Apache-2.0"
