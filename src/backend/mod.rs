@@ -1,4 +1,5 @@
 use crate::error::Result;
+use crate::metadata::CandidateSetView;
 use crate::query::Hit;
 
 pub mod cpu;
@@ -30,16 +31,10 @@ pub trait RingComputeBackend: Send + Sync {
     ///
     /// - `dims`: number of dimensions per vector.
     /// - `vectors`: flat row-major buffer, length `n * dims`.
-    /// - `norms_sq`: precomputed squared L2 norm per vector, length `n`.
     ///
     /// Ownership is transferred: the backend decides whether to keep or
     /// consume the data (e.g. a GPU backend would copy to VRAM and drop).
-    fn upload_f32_dataset(
-        &mut self,
-        dims: usize,
-        vectors: Vec<f32>,
-        norms_sq: Vec<f32>,
-    ) -> Result<()>;
+    fn upload_f32_dataset(&mut self, dims: usize, vectors: Vec<f32>) -> Result<()>;
 
     /// Execute a float32 range search.
     ///
@@ -53,6 +48,7 @@ pub trait RingComputeBackend: Send + Sync {
         weights: Option<&[f32]>,
         d_min: f32,
         d_max: f32,
+        candidates: CandidateSetView<'_>,
     ) -> Result<Vec<Hit>>;
 
     /// Execute a float32 disk (ball) search: all vectors within radius `d_max`.
@@ -64,6 +60,7 @@ pub trait RingComputeBackend: Send + Sync {
         query: &[f32],
         weights: Option<&[f32]>,
         d_max: f32,
+        candidates: CandidateSetView<'_>,
     ) -> Result<Vec<Hit>>;
 
     /// Execute a float32 disk-intersection search.
@@ -72,5 +69,21 @@ pub trait RingComputeBackend: Send + Sync {
     /// selects ordinary or weighted L2. The returned distance uses the first
     /// disk's metric.
     ///
-    fn disk_intersection_query_f32(&self, dims: usize, disks: &[DiskSpec<'_>]) -> Result<Vec<Hit>>;
+    fn disk_intersection_query_f32(
+        &self,
+        dims: usize,
+        disks: &[DiskSpec<'_>],
+        candidates: CandidateSetView<'_>,
+    ) -> Result<Vec<Hit>>;
+
+    /// Execute an exact nearest-neighbor search and return up to `k` hits in
+    /// ascending `(distance squared, vector ID)` order.
+    fn knn_query_f32(
+        &self,
+        dims: usize,
+        query: &[f32],
+        weights: Option<&[f32]>,
+        k: usize,
+        candidates: CandidateSetView<'_>,
+    ) -> Result<Vec<Hit>>;
 }

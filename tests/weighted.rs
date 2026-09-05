@@ -520,7 +520,7 @@ fn persisted_database_accepts_arbitrary_query_weights_without_storing_them() {
         .map(|entry| entry.unwrap().file_name())
         .collect();
     assert!(files_before.contains(std::ffi::OsStr::new("vectors.bin")));
-    assert!(files_before.contains(std::ffi::OsStr::new("norms_sq.bin")));
+    assert!(!files_before.contains(std::ffi::OsStr::new("norms_sq.bin")));
     assert!(
         files_before
             .iter()

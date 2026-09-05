@@ -58,29 +58,6 @@ function Update-PackageVersion {
     Write-Utf8NoBom $Path $updated
 }
 
-function Update-DeriveDependencyVersion {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Path,
-        [Parameter(Mandatory = $true)]
-        [string]$Version
-    )
-
-    $content = [System.IO.File]::ReadAllText($Path)
-    $regex = [regex]::new('(ring-db-derive\s*=\s*\{\s*path\s*=\s*"derive"\s*,\s*version\s*=\s*")[^"]+(")')
-
-    if (-not $regex.IsMatch($content)) {
-        throw "Could not find ring-db-derive path dependency in $Path"
-    }
-
-    $updated = $regex.Replace($content, {
-        param($match)
-        $match.Groups[1].Value + $Version + $match.Groups[2].Value
-    }, 1)
-
-    Write-Utf8NoBom $Path $updated
-}
-
 if ([string]::IsNullOrWhiteSpace($Version)) {
     Write-Usage
     exit 1
@@ -102,23 +79,17 @@ try {
     Invoke-Checked "cargo" @("update")
 
     Write-Host "Pre-release checks..."
-    Invoke-Checked "cargo" @("check")
-    Invoke-Checked "cargo" @("test")
+    Invoke-Checked "cargo" @("check", "--all-features")
+    Invoke-Checked "cargo" @("test", "--all-features")
     Invoke-Checked "cargo" @("fmt")
-    Invoke-Checked "cargo" @("clippy", "--", "-D", "warnings")
+    Invoke-Checked "cargo" @("clippy", "--all-targets", "--all-features", "--", "-D", "warnings")
 
     Write-Host "Updating Cargo.toml to $Version"
     Update-PackageVersion "Cargo.toml" $Version
 
-    Write-Host "Updating derive/Cargo.toml to $Version"
-    Update-PackageVersion "derive/Cargo.toml" $Version
-
-    Write-Host "Updating ring-db-derive version reference in Cargo.toml"
-    Update-DeriveDependencyVersion "Cargo.toml" $Version
-
     Write-Host "Post-version build check..."
-    Invoke-Checked "cargo" @("check")
-    Invoke-Checked "cargo" @("test")
+    Invoke-Checked "cargo" @("check", "--all-features")
+    Invoke-Checked "cargo" @("test", "--all-features")
 
     Invoke-Checked "git" @("add", ".")
     Invoke-Checked "git" @("commit", "-m", "Release v$Version")

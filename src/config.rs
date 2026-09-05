@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-/// Which compute backend to use for ring queries.
+/// Which compute backend to use for vector queries.
 ///
 /// CPU is always available. CUDA support is opt-in via the `cuda` Cargo
 /// feature and requires a CUDA-capable NVIDIA driver at runtime.
@@ -31,7 +31,7 @@ pub struct RingDbConfig {
     /// Optional directory for persisting the database.
     ///
     /// When set, [`RingDb::build()`](crate::engine::RingDb::build) writes the
-    /// full database (vectors, norms, payloads, offsets, and metadata) to this
+    /// full database (vectors, Pod payloads, and metadata indexes) to this
     /// directory. The sealed database can later be reloaded with
     /// [`RingDb::load()`](crate::engine::RingDb::load).
     ///
@@ -52,7 +52,8 @@ impl RingDbConfig {
     /// Set the directory to which the database will be persisted on
     /// [`build()`](crate::engine::RingDb::build).
     ///
-    /// The directory is created automatically if it does not exist.
+    /// The directory is created automatically if it does not exist and must be
+    /// empty when it already exists.
     ///
     /// # Example
     ///

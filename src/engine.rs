@@ -1,5 +1,8 @@
+use std::mem::{align_of, size_of};
 use std::path::Path;
 use std::time::Instant;
+
+use bytemuck::Pod;
 
 use crate::BackendPreference;
 #[cfg(feature = "cuda")]
@@ -7,9 +10,15 @@ use crate::backend::CudaBackend;
 use crate::backend::{CpuBackend, DiskSpec, RingComputeBackend};
 use crate::config::RingDbConfig;
 use crate::error::{Result, RingDbError};
-use crate::payload::{OwnedPayloadStore, Payload, PayloadBuilderOps, RefPayloadStore};
-use crate::persist::{read_f32_file, read_meta, write_f32_file, write_meta};
-use crate::query::{DiskIntersectionQuery, DiskQuery, QueryResult, RangeQuery, RingQuery};
+use crate::metadata::{
+    CandidateSet, CandidateSetView, MetadataIndex, MetadataIndexBuilder, MetadataKey, MetadataTag,
+    MetadataValue,
+};
+use crate::payload::{read_pod_file, write_pod_file};
+use crate::persist::{DatabaseMeta, read_f32_file, read_meta, write_f32_file, write_meta};
+use crate::query::{
+    DiskIntersectionQuery, DiskQuery, KnnQuery, QueryResult, RangeQuery, RingQuery,
+};
 
 fn make_backend(preference: BackendPreference) -> Result<Box<dyn RingComputeBackend>> {
     match preference {
@@ -22,25 +31,29 @@ fn make_backend(preference: BackendPreference) -> Result<Box<dyn RingComputeBack
             #[cfg(not(feature = "cuda"))]
             {
                 Err(RingDbError::BackendUnavailable(
-                    "CUDA backend requires building ring-db with the `cuda` Cargo feature"
-                        .to_string(),
+                    "CUDA backend requires building ring-db with the `cuda` feature".to_string(),
                 ))
             }
         }
     }
 }
 
-fn validate_query_input(
-    dims: usize,
-    query: &[f32],
-    weights: Option<&[f32]>,
-    disk_index: Option<usize>,
-) -> Result<()> {
+fn validate_query_input(dims: usize, query: &[f32], weights: Option<&[f32]>) -> Result<()> {
     if query.len() != dims {
         return Err(RingDbError::DimensionMismatch {
             expected: dims,
             got: query.len(),
         });
+    }
+    if let Some((index, value)) = query
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite())
+    {
+        return Err(RingDbError::InvalidQuery(format!(
+            "query coordinate at index {index} must be finite, got {value}"
+        )));
     }
 
     let Some(weights) = weights else {
@@ -52,322 +65,324 @@ fn validate_query_input(
             got: weights.len(),
         });
     }
-    for (weight_index, &weight) in weights.iter().enumerate() {
-        if !weight.is_finite() || weight < 0.0 {
-            let location = match disk_index {
-                Some(disk_index) => {
-                    format!("disk {disk_index} weight at index {weight_index}")
-                }
-                None => format!("weight at index {weight_index}"),
-            };
-            return Err(RingDbError::InvalidQuery(format!(
-                "{location} must be finite and non-negative, got {weight}"
-            )));
-        }
+    if let Some((index, weight)) = weights
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, weight)| !weight.is_finite() || *weight < 0.0)
+    {
+        return Err(RingDbError::InvalidQuery(format!(
+            "weight at index {index} must be finite and non-negative, got {weight}"
+        )));
     }
     Ok(())
 }
 
-// ─── RingDb (builder) ────────────────────────────────────────────────────────
+fn validate_distance(value: f32, label: &str) -> Result<()> {
+    if value.is_finite() && value >= 0.0 {
+        return Ok(());
+    }
+    Err(RingDbError::InvalidQuery(format!(
+        "{label} must be finite and non-negative, got {value}"
+    )))
+}
 
-/// Builder for a ring-query vector database.
+fn candidate_view(
+    candidates: Option<&CandidateSet>,
+    n_vectors: usize,
+) -> Result<CandidateSetView<'_>> {
+    match candidates {
+        Some(candidates) => {
+            if candidates.universe_len() != n_vectors {
+                return Err(RingDbError::CandidateSetMismatch {
+                    expected: n_vectors,
+                    got: candidates.universe_len(),
+                });
+            }
+            Ok(candidates.view())
+        }
+        None => Ok(CandidateSetView::All),
+    }
+}
+
+fn prepare_persist_dir(dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+    if std::fs::read_dir(dir)?.next().transpose()?.is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("persist directory '{}' must be empty", dir.display()),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Mutable builder for an immutable exact vector database.
 ///
-/// Insert vectors with their associated payloads via
-/// [`add_vector()`](Self::add_vector), then call [`build()`](Self::build)
-/// to obtain a [`SealedRingDb`].
-///
-/// `T` must implement [`Payload`], which is derived with `#[derive(Payload)]`.
-/// Use `T = ()` when no payload is needed.
-///
-/// # Example — no payload
-///
-/// ```
-/// use ringdb::{RingDb, RingDbConfig, RingQuery};
-///
-/// let mut db = RingDb::new(RingDbConfig::new(4)).unwrap();
-/// db.add_vector(&[1.0, 0.0, 0.0, 0.0], ()).unwrap();
-/// db.add_vector(&[0.0, 1.0, 0.0, 0.0], ()).unwrap();
-///
-/// let db = db.build().unwrap();
-/// let result = db.query(&RingQuery::new(&[1.0f32, 0.0, 0.0, 0.0], 1.0, 0.1)).unwrap();
-/// println!("hits: {:?}", result.ids());
-/// ```
-pub struct RingDb<T: Payload = ()> {
+/// `T` is a fixed-size Pod record stored verbatim next to each vector. Metadata
+/// used for filtering is supplied explicitly as integer tags; query backends
+/// never interpret the payload layout.
+pub struct RingDb<T: Pod + Send + Sync = ()> {
     config: RingDbConfig,
     backend: Box<dyn RingComputeBackend>,
     n_vectors: usize,
-
-    /// Staging buffer: f32 vectors, row-major, `n_vectors × dims`.
     vectors: Vec<f32>,
-
-    /// Staging buffer: per-vector squared L2 norm.
-    norms_sq: Vec<f32>,
-
-    /// Concrete builder — `SerdeStoreBuilder<T>` or `PodStoreBuilder<T>`,
-    /// determined at construction time by `T::make_builder()`.
-    /// No heap indirection; lives directly in the struct.
-    payload_builder: T::Builder,
+    payloads: Vec<T>,
+    metadata_builder: MetadataIndexBuilder,
 }
 
-impl<T: Payload> RingDb<T> {
-    /// Create a new empty `RingDb`.
-    ///
-    /// The storage strategy (Serde or Pod) is determined entirely by `T`'s
-    /// `#[derive(Payload)]` — no second constructor needed.
-    ///
-    /// # Example — with Serde payload
-    ///
-    /// ```
-    /// use ringdb::{RingDb, RingDbConfig, RingQuery, Payload};
-    /// use serde::{Serialize, Deserialize};
-    ///
-    /// #[derive(Serialize, Deserialize, Payload)]
-    /// struct Meta { label: String }
-    ///
-    /// let mut db: RingDb<Meta> = RingDb::new(RingDbConfig::new(2)).unwrap();
-    /// db.add_vector(&[1.0, 0.0], Meta { label: "dog".into() }).unwrap();
-    /// db.add_vector(&[0.0, 1.0], Meta { label: "cat".into() }).unwrap();
-    ///
-    /// let db = db.build().unwrap();
-    /// let result = db.query(&RingQuery::new(&[1.0f32, 0.0], 1.0, 0.1)).unwrap();
-    /// let payloads = db.fetch_payloads(&result.ids()).unwrap();
-    /// ```
+impl<T: Pod + Send + Sync> RingDb<T> {
+    /// Create an empty database using `config`.
     pub fn new(config: RingDbConfig) -> Result<Self> {
-        let backend = make_backend(config.backend_preference)?;
+        if config.dims == 0 {
+            return Err(RingDbError::InvalidQuery(
+                "database dimensions must be greater than zero".to_string(),
+            ));
+        }
         Ok(Self {
+            backend: make_backend(config.backend_preference)?,
             config,
-            backend,
             n_vectors: 0,
             vectors: Vec::new(),
-            norms_sq: Vec::new(),
-            payload_builder: T::make_builder()?,
+            payloads: Vec::new(),
+            metadata_builder: MetadataIndexBuilder::new(),
         })
     }
 
-    /// Insert a single vector and its associated payload.
-    ///
-    /// Vectors are assigned sequential IDs starting from 0.
-    /// The slice length must equal `dims`.
+    /// Insert a vector and payload without metadata tags.
     pub fn add_vector(&mut self, vector: &[f32], payload: T) -> Result<()> {
-        let dims = self.config.dims;
-        if vector.len() != dims {
+        self.add_vector_with_metadata(vector, payload, &[])
+    }
+
+    /// Insert a vector, its Pod payload, and equality-filterable metadata tags.
+    pub fn add_vector_with_metadata(
+        &mut self,
+        vector: &[f32],
+        payload: T,
+        tags: &[MetadataTag],
+    ) -> Result<()> {
+        if vector.len() != self.config.dims {
             return Err(RingDbError::DimensionMismatch {
-                expected: dims,
+                expected: self.config.dims,
                 got: vector.len(),
             });
         }
-        let norm_sq: f32 = vector.iter().map(|x| x * x).sum();
-        self.norms_sq.push(norm_sq);
+        if self.n_vectors >= u32::MAX as usize {
+            return Err(RingDbError::InvalidQuery(
+                "ring-db supports at most u32::MAX vectors".to_string(),
+            ));
+        }
+        if let Some((index, value)) = vector
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite())
+        {
+            return Err(RingDbError::InvalidQuery(format!(
+                "vector coordinate at index {index} must be finite, got {value}"
+            )));
+        }
+
+        self.payloads.push(payload);
+        self.metadata_builder.push_vector(tags);
         self.vectors.extend_from_slice(vector);
-        self.payload_builder.push(payload)?;
         self.n_vectors += 1;
         Ok(())
     }
 
-    /// Seal the database.
-    ///
-    /// Transfers vectors to the compute backend and flushes the payload builder
-    /// to its mmap. If [`RingDbConfig::persist_dir`] is set, all data is also
-    /// written to disk (reload with [`RingDb::load`]).
+    /// Seal the database and upload its vectors to the selected backend.
     pub fn build(self) -> Result<SealedRingDb<T>> {
-        let RingDb {
+        let Self {
             config,
             mut backend,
-            vectors,
-            norms_sq,
-            payload_builder,
             n_vectors,
+            vectors,
+            payloads,
+            metadata_builder,
         } = self;
-        let dims = config.dims;
+        let metadata_index = metadata_builder.finish();
 
-        if let Some(dir) = config.persist_dir.clone() {
-            std::fs::create_dir_all(&dir)?;
-            write_meta(&dir.join("meta.bin"), dims, n_vectors)?;
+        let persist_meta = if let Some(dir) = &config.persist_dir {
+            prepare_persist_dir(dir)?;
             write_f32_file(&dir.join("vectors.bin"), &vectors)?;
-            write_f32_file(&dir.join("norms_sq.bin"), &norms_sq)?;
-            let payload_store = payload_builder
-                .finish_persisted(&dir.join("payloads.bin"), &dir.join("offsets.bin"))?;
-            backend.upload_f32_dataset(dims, vectors, norms_sq)?;
-            return Ok(SealedRingDb {
-                config,
-                backend,
-                n_vectors,
-                payload_store,
-            });
-        }
+            metadata_index.persist(&dir.join("metadata.bin"))?;
+            write_pod_file(&dir.join("payloads.bin"), &payloads)?;
+            Some((
+                dir.join("meta.bin"),
+                DatabaseMeta {
+                    dims: config.dims,
+                    n_vectors,
+                    payload_size: size_of::<T>(),
+                    payload_align: align_of::<T>(),
+                },
+            ))
+        } else {
+            None
+        };
 
-        backend.upload_f32_dataset(dims, vectors, norms_sq)?;
-        let payload_store = payload_builder.finish()?;
+        backend.upload_f32_dataset(config.dims, vectors)?;
+        if let Some((path, meta)) = persist_meta {
+            write_meta(&path, meta)?;
+        }
         Ok(SealedRingDb {
             config,
             backend,
             n_vectors,
-            payload_store,
+            payloads: payloads.into_boxed_slice(),
+            metadata_index,
         })
     }
 
-    /// Reconstruct a [`SealedRingDb`] from a directory previously written by
-    /// [`build()`](Self::build) with a persist dir configured.
-    ///
-    /// The correct store variant is selected automatically based on `T`'s
-    /// `Payload` impl — no separate `load_pod` method needed.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use ringdb::{RingDb, RingDbConfig, BackendPreference};
-    /// use std::path::Path;
-    ///
-    /// // --- save ---
-    /// let mut db = RingDb::<()>::new(RingDbConfig::new(4).with_persist_dir("/tmp/mydb")).unwrap();
-    /// db.add_vector(&[1.0, 0.0, 0.0, 0.0], ()).unwrap();
-    /// let _sealed = db.build().unwrap();
-    ///
-    /// // --- load ---
-    /// let loaded = RingDb::<()>::load(Path::new("/tmp/mydb"), BackendPreference::Cpu).unwrap();
-    /// ```
-    pub fn load(
-        dir: &Path,
-        backend_preference: crate::config::BackendPreference,
-    ) -> Result<SealedRingDb<T>> {
-        let (dims, n_vectors) = read_meta(&dir.join("meta.bin"))?;
-        let vectors = read_f32_file(&dir.join("vectors.bin"))?;
-        let norms_sq = read_f32_file(&dir.join("norms_sq.bin"))?;
-
-        let expected = n_vectors * dims;
-        if vectors.len() != expected {
+    /// Load a database written by ring-db's current persistence format.
+    pub fn load(dir: &Path, backend_preference: BackendPreference) -> Result<SealedRingDb<T>> {
+        let meta = read_meta(&dir.join("meta.bin"))?;
+        if meta.payload_size != size_of::<T>() || meta.payload_align != align_of::<T>() {
             return Err(RingDbError::Corrupt(format!(
-                "vectors.bin has {} f32 values, expected {}",
-                vectors.len(),
-                expected,
-            )));
-        }
-        if norms_sq.len() != n_vectors {
-            return Err(RingDbError::Corrupt(format!(
-                "norms_sq.bin has {} f32 values, expected {}",
-                norms_sq.len(),
-                n_vectors,
+                "payload layout mismatch: database uses size/alignment {}/{}, requested type uses {}/{}",
+                meta.payload_size,
+                meta.payload_align,
+                size_of::<T>(),
+                align_of::<T>(),
             )));
         }
 
+        let expected_values = meta.n_vectors.checked_mul(meta.dims).ok_or_else(|| {
+            RingDbError::Corrupt("vector matrix dimensions overflow usize".to_string())
+        })?;
+        let vectors = read_f32_file(&dir.join("vectors.bin"), expected_values)?;
+        if let Some((index, value)) = vectors
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite())
+        {
+            return Err(RingDbError::Corrupt(format!(
+                "vector coordinate at flat index {index} must be finite, got {value}"
+            )));
+        }
+        let payloads = read_pod_file(&dir.join("payloads.bin"), meta.n_vectors)?;
+        let metadata_index = MetadataIndex::load(&dir.join("metadata.bin"), meta.n_vectors)?;
         let mut backend = make_backend(backend_preference)?;
-        backend.upload_f32_dataset(dims, vectors, norms_sq)?;
-
-        let payload_store = T::load_store(dir)?;
+        backend.upload_f32_dataset(meta.dims, vectors)?;
 
         Ok(SealedRingDb {
-            config: RingDbConfig::new(dims)
+            config: RingDbConfig::new(meta.dims)
                 .with_persist_dir(dir)
                 .with_backend_preference(backend_preference),
             backend,
-            n_vectors,
-            payload_store,
+            n_vectors: meta.n_vectors,
+            payloads,
+            metadata_index,
         })
     }
 
-    /// Number of vectors currently staged.
     pub fn len(&self) -> usize {
         self.n_vectors
     }
 
-    /// Returns `true` if no vectors have been inserted.
     pub fn is_empty(&self) -> bool {
         self.n_vectors == 0
     }
 
-    /// Number of dimensions per vector.
     pub fn dims(&self) -> usize {
         self.config.dims
     }
 
-    /// Name of the backend currently in use.
     pub fn backend_name(&self) -> &str {
         self.backend.name()
     }
 }
 
-// ─── SealedRingDb ────────────────────────────────────────────────────────────
-
-/// Sealed (immutable) ring-query database.
-///
-/// Obtained by calling [`RingDb::build()`] or [`RingDb::load()`].
-///
-/// The hot side (vectors + norms) is owned by the compute backend.
-/// The cold side (payloads) lives in a file-backed mmap via `T::Store`.
-pub struct SealedRingDb<T: Payload = ()> {
+/// Immutable database returned by [`RingDb::build`] or [`RingDb::load`].
+pub struct SealedRingDb<T: Pod + Send + Sync = ()> {
     config: RingDbConfig,
     backend: Box<dyn RingComputeBackend>,
     n_vectors: usize,
-    payload_store: T::Store,
+    payloads: Box<[T]>,
+    metadata_index: MetadataIndex,
 }
 
-impl<T: Payload> SealedRingDb<T> {
-    // ── Query methods ─────────────────────────────────────────────────────────
-
-    /// Execute a ring query and return matching vector IDs.
-    pub fn query(&self, q: &RingQuery<'_>) -> Result<QueryResult> {
-        let dims = self.config.dims;
-        validate_query_input(dims, q.query, q.weights, None)?;
-        let t = Instant::now();
+impl<T: Pod + Send + Sync> SealedRingDb<T> {
+    pub fn query(&self, query: &RingQuery<'_>) -> Result<QueryResult> {
+        let started = Instant::now();
+        validate_query_input(self.dims(), query.query, query.weights)?;
+        validate_distance(query.d, "ring target distance")?;
+        validate_distance(query.lambda, "ring half-width")?;
+        let candidates = candidate_view(query.candidates, self.n_vectors)?;
         let hits = self.backend.ring_query_f32(
-            dims,
-            q.query,
-            q.weights,
-            (q.d - q.lambda).max(0.0),
-            q.d + q.lambda,
+            self.dims(),
+            query.query,
+            query.weights,
+            (query.d - query.lambda).max(0.0),
+            query.d + query.lambda,
+            candidates,
         )?;
-        Ok(QueryResult {
-            hits,
-            backend_used: self.backend.name(),
-            elapsed: t.elapsed(),
-        })
+        Ok(self.result(hits, started))
     }
 
-    /// Execute a range query: all vectors with distance in `[d_min, d_max]`.
-    pub fn query_range(&self, q: &RangeQuery<'_>) -> Result<QueryResult> {
-        let dims = self.config.dims;
-        validate_query_input(dims, q.query, q.weights, None)?;
-        let t = Instant::now();
-        let hits = self
-            .backend
-            .ring_query_f32(dims, q.query, q.weights, q.d_min, q.d_max)?;
-        Ok(QueryResult {
-            hits,
-            backend_used: self.backend.name(),
-            elapsed: t.elapsed(),
-        })
+    pub fn query_range(&self, query: &RangeQuery<'_>) -> Result<QueryResult> {
+        let started = Instant::now();
+        validate_query_input(self.dims(), query.query, query.weights)?;
+        validate_distance(query.d_min, "range lower bound")?;
+        validate_distance(query.d_max, "range upper bound")?;
+        if query.d_min > query.d_max {
+            return Err(RingDbError::InvalidQuery(format!(
+                "range lower bound {} exceeds upper bound {}",
+                query.d_min, query.d_max
+            )));
+        }
+        let candidates = candidate_view(query.candidates, self.n_vectors)?;
+        let hits = self.backend.ring_query_f32(
+            self.dims(),
+            query.query,
+            query.weights,
+            query.d_min,
+            query.d_max,
+            candidates,
+        )?;
+        Ok(self.result(hits, started))
     }
 
-    /// Execute a disk query: all vectors within radius `d_max`.
-    pub fn query_disk(&self, q: &DiskQuery<'_>) -> Result<QueryResult> {
-        let dims = self.config.dims;
-        validate_query_input(dims, q.query, q.weights, None)?;
-        let t = Instant::now();
-        let hits = self
-            .backend
-            .disk_query_f32(dims, q.query, q.weights, q.d_max)?;
-        Ok(QueryResult {
-            hits,
-            backend_used: self.backend.name(),
-            elapsed: t.elapsed(),
-        })
+    pub fn query_disk(&self, query: &DiskQuery<'_>) -> Result<QueryResult> {
+        let started = Instant::now();
+        validate_query_input(self.dims(), query.query, query.weights)?;
+        validate_distance(query.d_max, "disk radius")?;
+        let candidates = candidate_view(query.candidates, self.n_vectors)?;
+        let hits = self.backend.disk_query_f32(
+            self.dims(),
+            query.query,
+            query.weights,
+            query.d_max,
+            candidates,
+        )?;
+        Ok(self.result(hits, started))
     }
 
-    /// Execute a disk-intersection query: all vectors inside every disk.
-    ///
-    /// Returned hit distances are measured using the first disk's metric.
-    pub fn query_disk_intersection(&self, q: &DiskIntersectionQuery<'_>) -> Result<QueryResult> {
-        let dims = self.config.dims;
-        if q.disks.is_empty() {
+    pub fn query_disk_intersection(
+        &self,
+        query: &DiskIntersectionQuery<'_>,
+    ) -> Result<QueryResult> {
+        let started = Instant::now();
+        if query.disks.is_empty() {
             return Err(RingDbError::InvalidQuery(
                 "disk intersection requires at least one disk".to_string(),
             ));
         }
-        for (disk_index, disk) in q.disks.iter().enumerate() {
-            validate_query_input(dims, disk.query, disk.weights, Some(disk_index))?;
-        }
 
-        let disks: Vec<DiskSpec<'_>> = q
+        let mut effective_candidates = query.candidates.cloned();
+        for disk in query.disks {
+            validate_query_input(self.dims(), disk.query, disk.weights)?;
+            validate_distance(disk.d_max, "disk radius")?;
+            if let Some(candidates) = disk.candidates {
+                candidate_view(Some(candidates), self.n_vectors)?;
+                effective_candidates = Some(match effective_candidates {
+                    Some(current) => current.intersection(candidates)?,
+                    None => candidates.clone(),
+                });
+            }
+        }
+        let candidates = candidate_view(effective_candidates.as_ref(), self.n_vectors)?;
+        let disks: Vec<_> = query
             .disks
             .iter()
             .map(|disk| DiskSpec {
@@ -376,71 +391,73 @@ impl<T: Payload> SealedRingDb<T> {
                 weights: disk.weights,
             })
             .collect();
-        let t = Instant::now();
-        let hits = self.backend.disk_intersection_query_f32(dims, &disks)?;
-        Ok(QueryResult {
-            hits,
-            backend_used: self.backend.name(),
-            elapsed: t.elapsed(),
-        })
+        let hits = self
+            .backend
+            .disk_intersection_query_f32(self.dims(), &disks, candidates)?;
+        Ok(self.result(hits, started))
     }
 
-    // ── Serde payload fetch ───────────────────────────────────────────────────
-
-    /// Fetch and deserialize the payload for a single vector ID.
-    pub fn fetch_payload(&self, id: u32) -> Result<T> {
-        self.payload_store.fetch_owned(id)
+    /// Execute an exact nearest-neighbor query.
+    pub fn query_knn(&self, query: &KnnQuery<'_>) -> Result<QueryResult> {
+        let started = Instant::now();
+        validate_query_input(self.dims(), query.query, query.weights)?;
+        let candidates = candidate_view(query.candidates, self.n_vectors)?;
+        let hits = self.backend.knn_query_f32(
+            self.dims(),
+            query.query,
+            query.weights,
+            query.k,
+            candidates,
+        )?;
+        Ok(self.result(hits, started))
     }
 
-    /// Fetch and deserialize payloads for a slice of IDs, in order.
-    pub fn fetch_payloads(&self, ids: &[u32]) -> Result<Vec<T>> {
-        self.payload_store.fetch_many_owned(ids)
+    /// Return the vectors carrying exactly this metadata tag.
+    pub fn metadata_eq(&self, key: MetadataKey, value: MetadataValue) -> CandidateSet {
+        self.metadata_index.candidates_eq(key, value)
     }
 
-    // ── Accessors ─────────────────────────────────────────────────────────────
+    /// Create a validated candidate set from vector IDs.
+    pub fn candidates_from_ids(&self, ids: impl IntoIterator<Item = u32>) -> Result<CandidateSet> {
+        CandidateSet::from_ids(self.n_vectors, ids)
+    }
 
-    /// Number of vectors stored.
+    /// Fetch one Pod payload by vector ID without copying it.
+    pub fn fetch_payload(&self, id: u32) -> Result<&T> {
+        self.payloads
+            .get(id as usize)
+            .ok_or(RingDbError::InvalidVectorId {
+                id,
+                len: self.n_vectors,
+            })
+    }
+
+    /// Fetch Pod payload references in the same order as `ids`.
+    pub fn fetch_payloads(&self, ids: &[u32]) -> Result<Vec<&T>> {
+        ids.iter().map(|&id| self.fetch_payload(id)).collect()
+    }
+
     pub fn len(&self) -> usize {
         self.n_vectors
     }
 
-    /// Returns `true` if the database contains no vectors.
     pub fn is_empty(&self) -> bool {
         self.n_vectors == 0
     }
 
-    /// Number of dimensions per vector.
     pub fn dims(&self) -> usize {
         self.config.dims
     }
 
-    /// Name of the backend currently in use.
     pub fn backend_name(&self) -> &str {
         self.backend.name()
     }
-}
 
-// ── Pod fetch — only when T::Store: RefPayloadStore<T> ───────────────────────
-//
-// This impl block is only available for types whose `#[derive(Payload)]`
-// chose `storage = "pod"`. For Serde types, `T::Store = SerdeStore<T>` which
-// does NOT implement `RefPayloadStore<T>`, so these methods simply don't exist.
-// The compiler enforces this statically — no runtime error possible.
-
-impl<T: Payload> SealedRingDb<T>
-where
-    T::Store: RefPayloadStore<T>,
-{
-    /// Fetch a zero-copy reference to the payload for a single vector ID.
-    ///
-    /// Returns a `&T` pointing directly into the mmap — O(1), no allocation,
-    /// no deserialization. Only available for `#[payload(storage = "pod")]` types.
-    pub fn fetch_pod(&self, id: u32) -> &T {
-        self.payload_store.fetch_ref(id)
-    }
-
-    /// Fetch zero-copy references to payloads for a slice of IDs, in order.
-    pub fn fetch_pods<'a>(&'a self, ids: &[u32]) -> Vec<&'a T> {
-        self.payload_store.fetch_many_ref(ids)
+    fn result(&self, hits: Vec<crate::query::Hit>, started: Instant) -> QueryResult {
+        QueryResult {
+            hits,
+            backend_used: self.backend.name(),
+            elapsed: started.elapsed(),
+        }
     }
 }

@@ -12,26 +12,18 @@ echo "Updating dependencies..."
 cargo update
 
 echo "Pre-release checks..."
-cargo check
-cargo test
+cargo check --all-features
+cargo test --all-features
 cargo fmt
-cargo clippy -- -D warnings
+cargo clippy --all-targets --all-features -- -D warnings
 
 echo "Updating Cargo.toml to $VERSION"
 sed -i.bak -E "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
 rm Cargo.toml.bak
 
-echo "Updating derive/Cargo.toml to $VERSION"
-sed -i.bak -E "s/^version = \".*\"/version = \"$VERSION\"/" derive/Cargo.toml
-rm derive/Cargo.toml.bak
-
-echo "Updating ring-db-derive version reference in Cargo.toml"
-sed -i.bak -E "s/(ring-db-derive = \{ path = \"derive\", version = \")([^\"]+)(\" \})/\1$VERSION\3/" Cargo.toml
-rm Cargo.toml.bak
-
 echo "Post-version build check..."
-cargo check
-cargo test
+cargo check --all-features
+cargo test --all-features
 
 git add .
 git commit -m "Release v$VERSION"

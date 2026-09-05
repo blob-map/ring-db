@@ -27,20 +27,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Run test suite
-        run: cargo test --locked
-
-      - name: Verify publish ring-db-derive (dry-run)
-        run: cargo publish -p ring-db-derive --locked --dry-run
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_API_KEY }}
-
-      - name: Publish ring-db-derive to crates.io
-        run: cargo publish -p ring-db-derive --locked
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_API_KEY }}
-
-      - name: Wait for crates.io to index ring-db-derive
-        run: sleep 30
+        run: cargo test --all-features --locked
 
       - name: Verify publish ring-db (dry-run)
         run: cargo publish -p ring-db --locked --dry-run
@@ -69,4 +56,3 @@ jobs:
           else
             gh release create "$tag" --repo "$GH_REPO" --title "$tag" --notes ""
           fi
-

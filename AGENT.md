@@ -1,394 +1,267 @@
 # AGENT.md — ring-db
 
-> Quick-start context for AI agents. Read this before touching any code.
+Quick context for contributors and coding agents.
 
-## What is ring-db?
+## Product definition
 
-**ring-db** is a Rust library (published as `ringdb` on crates.io) for **ring queries** in high-dimensional vector spaces. Unlike nearest-neighbor databases, it retrieves all vectors whose ordinary or per-dimension weighted L2 distance to a query falls within a specified distance interval `[d_min, d_max]`.
+ring-db is a Rust 2024 exact vector database. It supports:
 
-Use cases: anomaly detection, content deduplication, recommendation diversity, spatial shells (GPS bands), audio fingerprinting, security threat detection.
+- ring, range, disk, and disk-intersection searches;
+- exact K-nearest-neighbor search;
+- ordinary L2 and per-query diagonal weighted L2;
+- explicit integer metadata tags compiled into candidate sets;
+- fixed-size Pod payload records with zero-copy reads;
+- CPU and optional CUDA backends;
+- versioned persistence.
 
-- Rust Edition: 2024
-- License: MIT OR Apache-2.0
-- Repo: https://github.com/mathias-vandaele/ring-db
+The project intentionally avoids general document-database behavior. Payload records are
+opaque to the search engine. Metadata filtering is equality-based and independent of the
+payload layout.
 
----
+## Engineering priorities
 
-## Directory Structure
+1. Prefer the simplest complete design.
+2. Remove abstractions that no longer serve more than one real implementation.
+3. Keep cyclomatic complexity low with small preparation and execution helpers.
+4. Keep validation outside hot coordinate loops.
+5. Preserve branch-free unfiltered paths.
+6. Do not make CPU or CUDA kernels interpret user payload layouts.
+7. Add functionality only for a demonstrated use case.
 
+## Repository map
+
+```text
+src/
+├── lib.rs             public exports
+├── config.rs          RingDbConfig and BackendPreference
+├── engine.rs          RingDb builder and immutable SealedRingDb
+├── error.rs           RingDbError
+├── metadata.rs        tags, adaptive CandidateSet, metadata persistence
+├── payload.rs         fixed-size Pod persistence helpers
+├── persist.rs         database header and vector-file I/O
+├── query.rs           query types, Hit, and QueryResult
+└── backend/
+    ├── mod.rs         RingComputeBackend contract and DiskSpec
+    ├── cpu.rs         Rayon-parallel exact reference backend
+    └── cuda.rs        optional CUDA driver backend and embedded PTX
+
+tests/
+├── correctness.rs
+├── metadata_knn.rs
+├── random.rs
+└── weighted.rs
+
+examples/cli.rs        filtered weighted-KNN example
+benches/query_backends.rs
 ```
-ring-db/
-├── src/
-│   ├── lib.rs             # Public API root, re-exports, #[doc(hidden)] __private
-│   ├── engine.rs          # RingDb (builder) and SealedRingDb (immutable DB)
-│   ├── query.rs           # RingQuery, RangeQuery, DiskQuery, DiskIntersectionQuery, results
-│   ├── config.rs          # RingDbConfig and BackendPreference
-│   ├── error.rs           # RingDbError enum and Result alias
-│   ├── persist.rs         # read/write helpers for binary files
-│   └── backend/
-│       ├── mod.rs         # RingComputeBackend trait
-│       ├── cpu.rs         # CpuBackend: brute-force, Rayon-parallel, SIMD-friendly
-│       └── cuda.rs        # CudaBackend: optional CUDA driver backend (`cuda` feature)
-│   └── payload/
-│       ├── mod.rs         # Payload trait, OwnedPayloadStore, RefPayloadStore
-│       ├── traits.rs      # PayloadBuilderOps trait + open_mmap helper
-│       ├── serde.rs       # SerdeStoreBuilder + SerdeStore (bincode, variable-size)
-│       └── pod.rs         # PodStoreBuilder + PodStore (raw bytes, zero-copy &T)
-├── derive/
-│   ├── Cargo.toml         # ring-db-derive proc-macro crate
-│   └── src/lib.rs         # #[derive(Payload)] — dispatches to serde or pod storage
-├── examples/
-│   └── cli.rs             # Standalone CLI: random dataset + ring query demo
-├── benches/
-│   └── query_backends.rs  # Criterion.rs benchmarks (30M vector scale)
-├── tests/
-│   ├── correctness.rs     # Hand-crafted vectors, analytically verified
-│   ├── random.rs          # Randomized sanity tests
-│   └── weighted.rs        # Weighted analytical, validation, property, persistence tests
-├── .github/workflows/
-│   ├── rust.yml           # CI: build + test on push/PR to master
-│   └── publish.yml        # Publish ring-db-derive then ring-db on v*.*.* tags
-├── release_tag.sh         # Release automation (bump both Cargo.tomls, fmt, clippy, tag, push)
-└── Cargo.toml             # Workspace root + ring-db package
-```
 
----
+## Public data model
 
-## Key Source Files
-
-### [src/engine.rs](src/engine.rs)
-
-Two main public types:
-
-**`RingDb<T: Payload>`** — mutable builder (generic over payload type `T`, default `()`)
-- Holds staging buffers: `vectors` (f32 flat row-major), `norms_sq` (precomputed)
-- Holds `payload_builder: T::Builder` as a **concrete field** (no Box<dyn>)
-- Methods: `new()`, `add_vector()`, `build()`, `load()`, `len()`, `is_empty()`, `dims()`, `backend_name()`
-
-**`SealedRingDb<T: Payload>`** — immutable, `Send + Sync`
-- Owns the backend's hot data (vectors + norms) via `Box<dyn RingComputeBackend>`
-- Owns `payload_store: T::Store` as a **concrete field**
-- Methods: `query()`, `query_range()`, `query_disk()`, `query_disk_intersection()`, `fetch_payload()`, `fetch_payloads()`
-- Additional impl block (gated on `T::Store: RefPayloadStore<T>`): `fetch_pod()`, `fetch_pods()`
-
-### [src/payload/mod.rs](src/payload/mod.rs)
-
-**`Payload` trait** — the core abstraction tying a user type to its storage:
+`RingDb<T>` and `SealedRingDb<T>` require `T: bytemuck::Pod + Send + Sync` and
+default to `T = ()`.
 
 ```rust
-pub trait Payload: Sized {
-    type Store: OwnedPayloadStore<Self>;
-    type Builder: PayloadBuilderOps<Self, Store = Self::Store>;
-    fn make_builder() -> Result<Self::Builder>;
-    fn load_store(dir: &Path) -> Result<Self::Store>;
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct Record {
+    category_id: u32,
+    score: f32,
 }
 ```
 
-**`OwnedPayloadStore<T>`** — implemented by both `SerdeStore<T>` and `PodStore<T>`:
-- `fetch_owned(id) -> T` — deserializes one payload (bincode for Serde; byte-copy for Pod)
-- `fetch_many_owned(ids) -> Vec<T>`
+Payload records are raw fixed-size result data. They cannot contain pointers or
+heap-backed fields. Use integer interning or bounded byte arrays for strings.
 
-**`RefPayloadStore<T>`** — implemented **only** by `PodStore<T>`:
-- `fetch_ref(id) -> &T` — zero-copy reference into the mmap
-- `fetch_many_ref(ids) -> Vec<&T>`
-
-`impl Payload for ()` is provided so `RingDb::new()` works without a payload type.
-
-### [src/payload/serde.rs](src/payload/serde.rs)
-
-Variable-size bincode storage.
-- **Build**: serializes each payload with bincode, streams to temp file, maintains `Vec<u64>` offset table
-- **Read**: mmaps the payload file; `fetch_owned` slices by offset and runs `bincode::deserialize`
-- Persist: writes `payloads.bin` + `offsets.bin`
-
-### [src/payload/pod.rs](src/payload/pod.rs)
-
-Zero-copy raw-bytes storage for `T: bytemuck::Pod`.
-- **Build**: writes `bytemuck::bytes_of(&payload)` back-to-back, **no offset table**
-- **Read**: `fetch_ref(id)` computes `offset = id * size_of::<T>()`, returns `bytemuck::from_bytes(&mmap[offset..offset+size])`
-- No heap allocation, no deserialization — just a pointer into the mmap
-- Persist: writes `payloads.bin` only (no `offsets.bin`)
-
-### [derive/src/lib.rs](derive/src/lib.rs)
-
-Proc-macro crate (`ring-db-derive`), re-exported as `ringdb::Payload`.
-
-`#[derive(Payload)]` generates a `Payload` impl. Storage strategy is selected by:
-```
-#[payload(storage = "serde")]  // default — SerdeStore/SerdeStoreBuilder
-#[payload(storage = "pod")]    // PodStore/PodStoreBuilder
-```
-
-Generated code references `::ringdb::__private::*`, which is a `#[doc(hidden)]`
-module re-exporting the concrete store types.
-
-### [src/query.rs](src/query.rs)
-
-The primitive query types are constructed with `new` and take a borrowed
-`query: &[f32]`. Calling `.with_weights(weights)` selects per-dimension
-weighted L2 for that query; otherwise ordinary L2 is used.
-
-| Type | Semantics |
-|------|-----------|
-| `RingQuery` | Symmetric band `[d − λ, d + λ]` |
-| `RangeQuery` | Explicit `[d_min, d_max]` interval |
-| `DiskQuery` | Full ball `[0, d_max]` |
-| `DiskIntersectionQuery` | Intersection of independently weighted/unweighted disks |
-
-Ring and range queries delegate to `backend.ring_query_f32()`. Disk and disk
-intersection queries have dedicated backend entry points. Weight vectors are
-query-only data and are never persisted or cached with the database.
-
-`QueryResult` — `hits: Vec<Hit>`, `backend_used: &'static str`, `elapsed: Duration`
-
-### [src/backend/cpu.rs](src/backend/cpu.rs)
-
-Always-available reference backend. Key optimizations:
-1. **Four-accumulator dot product** — breaks dependency chains so LLVM emits `fmla.4s` / `vfmadd231ps`; ~4× FP throughput
-2. **Precomputed `‖x‖²`** — inserted at index time, only dot product computed at query time
-3. **Squared bounds** — `d_min²` and `d_max²` computed once before the loop (no `sqrt`)
-4. **Rayon `par_chunks_exact(dims)`** — parallelizes the scan across all logical cores
-5. **Dedicated weighted kernel** — directly accumulates `wᵢ(xᵢ-qᵢ)²` with
-   independent accumulators; it does not use or create cached weighted norms
-6. **Outer dispatch** — ordinary queries retain the original norm-plus-dot hot
-   path; there is no weights branch inside the coordinate loop
-
-### [src/backend/cuda.rs](src/backend/cuda.rs)
-
-Optional backend behind the `cuda` Cargo feature. It dynamically loads the
-NVIDIA CUDA driver at runtime, creates a context on device 0, uploads vectors
-and norms to VRAM once, and launches one thread per vector for ring/range/disk
-queries. It does not add link-time CUDA requirements to CPU-only builds.
-
-Weighted ring and disk queries use dedicated PTX kernels. Mixed disk
-intersections pack each disk's optional weights with an offset/sentinel, branch
-once per disk, and retain per-candidate early rejection. All-unweighted queries
-continue to use the original kernels, including the specialized three-disk
-intersection kernel.
-
-`DiskIntersectionQuery` has a dedicated CUDA kernel: a single scan over the
-resident dataset where each thread evaluates every disk for one vector and exits
-early as soon as any disk fails.
-
-Ordinary distance formula: `dist_sq = norm_sq_i + norm_sq_q − 2·dot(row, query)`
-
-Weighted distance formula: `dist_sq = Σᵢ weights[i]·(row[i] − query[i])²`
-
-### [src/error.rs](src/error.rs)
+Insertion has two forms:
 
 ```rust
-pub enum RingDbError {
-    DimensionMismatch { expected: usize, got: usize },
-    Payload(String),        // bincode error
-    Io(std::io::Error),     // temp file / persist I/O
-    Corrupt(String),        // inconsistent persist files on load
-    InvalidQuery(String),   // malformed weight values or invalid query semantics
-    BackendUnavailable(String),
-    Backend(String),
-    StorageMismatch,
-}
+db.add_vector(&vector, record)?;
+db.add_vector_with_metadata(&vector, record, &tags)?;
 ```
 
----
+IDs are sequential `u32` values in insertion order. `add_vector_with_metadata` rejects a
+new row once the ID space is exhausted.
 
-## Architecture Decisions
+After sealing, payload access is always zero-copy and bounds checked:
 
-| Decision | Reason |
-|----------|--------|
-| Two-phase builder (`RingDb` → `SealedRingDb`) | Upload once, query many; type-safe separation of concerns |
-| `Payload` trait + `#[derive(Payload)]` | User types select their storage at compile time; zero runtime dispatch on the payload path |
-| `T::Builder` / `T::Store` as concrete struct fields | Avoids `Box<dyn>` on every payload push/fetch; monomorphized by the compiler |
-| `fetch_pod` gated on `T::Store: RefPayloadStore<T>` | Misuse is a compile error, not a runtime panic |
-| Pod storage: no offset table | `size_of::<T>()` is a compile-time constant; position arithmetic beats an array lookup |
-| Cold payload storage via mmap | Scales beyond available RAM; OS pages out under pressure |
-| No `sqrt` in distance computation | Preserves ordering; avoids expensive operation; better SIMD scheduling |
-| Weights live only in query state | One stored vector supports arbitrary weighted queries without rebuilds or persisted weighted norms |
-| Independent disk weights | Mixed metrics remain exact in one intersection scan; `Hit::dist_sq` uses the first disk's metric |
-| Backend trait abstraction | Add GPU/CUDA/AVX-512 backends without changing public API |
-| Payload streamed to disk immediately | O(1) peak memory during build regardless of `T` size |
+```rust
+let record: &Record = db.fetch_payload(id)?;
+let records: Vec<&Record> = db.fetch_payloads(&ids)?;
+```
 
----
+## Metadata
 
-## Performance Summary
+The public primitives are:
 
-30 M vectors · 64 dimensions · ring `[6.529, 6.535]` · ~164 K hits.
+```rust
+MetadataKey::new(u32)
+MetadataValue::new(u64)
+MetadataTag::new(key, value)
+```
 
-| Operation | Time | Notes |
-|-----------|-----:|-------|
-| Ring query (CPU) | ~68 ms | ~440 M vectors/sec |
-| Payload fetch — Serde | ~26.6 ms | bincode deserialize per hit |
-| Payload fetch — Pod | ~92 µs | zero-copy `&T` from mmap |
+`MetadataIndexBuilder` accumulates posting IDs while vectors are inserted.
+`MetadataIndex::candidates_eq` produces a database-sized `CandidateSet`. Missing tags
+produce an empty set, not an error. Duplicate tags on one vector do not duplicate IDs.
 
-Pod fetch is **~288× faster** than Serde fetch for fixed-size payloads.
-Use `#[payload(storage = "pod")]` when retrieval latency is the bottleneck.
+Candidate sets support:
 
----
+- `intersection(&other) -> Result<CandidateSet>`;
+- `union(&other) -> Result<CandidateSet>`;
+- `complement() -> CandidateSet`;
+- validated construction through `SealedRingDb::candidates_from_ids`;
+- `len`, `is_empty`, `universe_len`, and checked membership.
 
-## Build and Test Commands
+Intersection and union require equal universe lengths. Queries also reject candidate sets
+whose universe length differs from the database row count.
+
+The representation is selected internally:
+
+- `All` and `Empty` are allocation-free special cases;
+- `Sparse` is a sorted, unique `u32` ID list;
+- `Dense` is a bitset.
+
+Keep this representation private. Backends consume the borrowed `CandidateSetView`.
+
+## Query semantics
+
+| Type | Meaning |
+|---|---|
+| `RingQuery` | inclusive `[max(0, d - lambda), d + lambda]` |
+| `RangeQuery` | inclusive `[d_min, d_max]` |
+| `DiskQuery` | inclusive `[0, d_max]` |
+| `DiskIntersectionQuery` | vector must satisfy every disk |
+| `KnnQuery` | exact best `k`, ordered by `(dist_sq, id)` |
+
+All query builders accept `.with_candidates(&set)`. Ring, range, disk, and KNN queries
+also accept `.with_weights(&weights)` directly. Each `DiskQuery` owns its optional weights
+and candidate set. The engine intersects candidate sets attached to individual disks with
+the outer intersection query's candidate set before backend dispatch.
+
+`k = 0` returns no hits. If fewer than `k` candidates exist, KNN returns all of them.
+Ties are deterministic by vector ID.
+
+The metrics are:
+
+```text
+ordinary distance: dist_sq = sum((vector[i] - query[i])^2)
+ordinary KNN:    dist_sq = sum((vector[i] - query[i])^2)
+weighted:        dist_sq = sum(weights[i] * (vector[i] - query[i])^2)
+```
+
+Weights are query-only final coefficients. They must match `dims`, be finite, and be
+non-negative. They are never persisted.
+
+## Engine lifecycle
+
+`RingDb<T>` stages row-major vectors, Pod records, and metadata postings.
+`build()` finishes immutable stores and uploads vector data once. `SealedRingDb<T>` owns:
+
+- `Box<dyn RingComputeBackend>` for hot vector data;
+- one private, aligned `Box<[T]>` for payloads;
+- `MetadataIndex` for candidate construction.
+
+The sealed database is immutable and intended for repeated queries.
+
+## CPU backend
+
+The CPU backend is the correctness reference.
+
+- Ordinary searches use direct coordinate deltas with four independent accumulators.
+- Unweighted KNN accumulates coordinate deltas directly to avoid cancellation.
+- Weighted distance has its own four-accumulator loop.
+- Rayon partitions vector or candidate work.
+- `All` retains the existing scan with no candidate branch per row.
+- `Sparse` iterates IDs directly.
+- `Dense` tests its bit before distance calculation.
+- KNN keeps a bounded max-heap per Rayon fold and deterministically merges/sorts the
+  finalists.
+
+Do not replace the specialized unfiltered paths with a universal per-row predicate.
+
+## CUDA backend
+
+CUDA is behind the `cuda` feature. The implementation dynamically loads the NVIDIA
+driver, creates a context on device 0, uploads vectors in transposed layout, and keeps
+query execution behind a launch mutex. CPU-only builds have no link-time CUDA dependency.
+
+CUDA implements the same range-query, candidate-filtering, diagonal-weight, and exact-KNN
+semantics as CPU. KNN must return ascending `(dist_sq, id)` results.
+
+Keep CUDA behavior equivalent to CPU within documented floating-point tolerances. Avoid
+host transfers proportional to the full dataset for small KNN results. Do not describe a
+specific CUDA top-K strategy in public documentation unless it is part of the stable
+contract.
+
+## Persistence format
+
+The current database format version is 1. A persisted database contains:
+
+```text
+meta.bin       magic, version, endian marker, dims, rows, Pod size/alignment
+vectors.bin    row-major little-endian f32 values
+payloads.bin   consecutive native-layout Pod records
+metadata.bin   versioned equality-tag posting sets
+```
+
+`metadata.bin` also has format version 1. There is no offset file because every payload
+has `size_of::<T>()` bytes.
+
+Build requires an absent or empty persistence directory. It writes data files first and
+`meta.bin` last, so a build that returns an error is not loadable as a complete generation.
+This is not a power-loss durability guarantee.
+
+Load validates file lengths, finite vectors, geometry, row-count limits, endianness,
+metadata universe length, and payload size/alignment. The format does not encode Rust
+field names, so callers must load with the exact same Pod record layout. Older database
+layouts must be rebuilt.
+
+## Errors
+
+`RingDbError` currently includes:
+
+- `DimensionMismatch`;
+- `Io`;
+- `Corrupt`;
+- `InvalidQuery`;
+- `InvalidVectorId`;
+- `CandidateSetMismatch`;
+- `BackendUnavailable`;
+- `Backend`.
+
+Keep malformed caller input distinct from corrupt persisted data and backend failures.
+
+## Commands
 
 ```bash
-# Build
-cargo build
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-features
+
 cargo build --release
 cargo build --release --features cuda
-RUSTFLAGS="-C target-cpu=native" cargo build --release  # native SIMD
-
-# Test
-cargo test
 cargo test --features cuda
-RINGDB_CUDA_TEST=1 cargo test --features cuda test_cuda_backend_matches_cpu_when_requested
-cargo test --test correctness
-cargo test --test random
-cargo test --test weighted
-cargo test -- --nocapture
 
-# Benchmark (recommended with native CPU features)
-RUSTFLAGS="-C target-cpu=native" cargo bench
-cargo bench --bench query_backends cpu_f32
-cargo bench --bench query_backends cpu_disk_f32
-cargo bench --bench query_backends cpu_disk_intersection_f32
-cargo bench --bench query_backends cpu_weighted_intersection_scaling_f32
-cargo bench --features cuda --bench query_backends cuda_f32
-RINGDB_CUDA_BENCH_N=5000000 cargo bench --features cuda --bench query_backends cuda_f32
-cargo bench --bench query_backends payload_fetch
+RUSTFLAGS="-C target-cpu=native" cargo bench --bench query_backends
+RINGDB_BENCH_N=100000 cargo bench --bench query_backends cpu_knn_f32
+RINGDB_BENCH_N=100000 cargo bench --bench query_backends metadata
 
-# Example CLI
-cargo run --release --example cli -- --n 100000 --dims 64 --d 5.0 --lambda 0.2
-cargo run --example cli -- --help
-
-# Docs
-cargo doc --open
-
-# Release (automated — bumps both Cargo.tomls, tags, pushes)
-./release_tag.sh <version>
+cargo run --release --example cli -- --n 100000 --dims 64 --k 10 --category 3
 ```
 
----
+CUDA tests that need a device may be gated by `RINGDB_CUDA_TEST=1`. CUDA benchmarks
+should skip cleanly when the driver or device is unavailable.
 
-## Dependencies
+## Dependency roles
 
-| Crate | Purpose |
-|-------|---------|
-| `rayon` | Data parallelism (work-stealing) |
-| `thiserror` | Error derive macro |
-| `memmap2` | Memory-mapped file I/O |
-| `bincode` | Binary serialization for Serde payloads |
-| `serde` | Serialization framework |
-| `bytemuck` | Pod cast for zero-copy payload storage |
-| `ring-db-derive` | `#[derive(Payload)]` proc-macro |
-| CUDA driver | Runtime-loaded only when the `cuda` feature and `BackendPreference::Cuda` are used |
-| `criterion` (dev) | Statistical benchmarking |
-| `rand` (dev) | Deterministic random generation |
-| `clap` (dev) | CLI argument parsing (example only) |
+| Dependency | Role |
+|---|---|
+| `rayon` | CPU data parallelism |
+| `thiserror` | error definitions |
+| `bytemuck` | Pod validation and byte casts |
+| `criterion` | benchmarks |
+| `rand` | deterministic benchmark/test data |
+| `clap` | example CLI parsing |
+| `tempfile` | isolated persistence tests |
 
----
-
-## Data Flow Cheatsheet
-
-### Insert
-```
-add_vector(&[f32], T)
-  → [dim check]
-  → [compute norm_sq]
-  → [extend vectors staging buffer]
-  → T::Builder::push(payload)
-      Serde: serialize T → bincode → append to temp file
-      Pod:   bytemuck::bytes_of(&payload) → append to temp file
-```
-
-### Build
-```
-db.build()
-  → backend.upload_f32_dataset(dims, vectors, norms_sq)
-  → T::Builder::finish() → T::Store (mmap)
-      Serde: flush + mmap payloads.bin + offsets.bin
-      Pod:   flush + mmap payloads.bin (no offsets file)
-  → SealedRingDb { backend, payload_store: T::Store }
-```
-
-### Query
-```
-let query = RingQuery::new(query, d, lambda);
-let query = query.with_weights(weights); // optional
-db.query(&query)
-  → normalize to (d_min, d_max)
-  → validate query and optional weights once
-  → backend.ring_query_f32(dims, query, weights, d_min, d_max)
-      → dispatch once to ordinary or weighted scan
-      → ordinary: compute norm_sq_q
-      → square bounds: lower_sq, upper_sq
-      → par_chunks_exact(dims):
-          ordinary: dist_sq = norm_sq_i + norm_sq_q - 2·dot(row_i, query)
-          weighted: dist_sq = Σ weights[i]·(row_i[i] - query[i])²
-          if lower_sq ≤ dist_sq ≤ upper_sq → include id i
-  → QueryResult { hits, backend_used, elapsed }
-```
-
-### Payload fetch — Serde
-```
-db.fetch_payloads(&[id])
-  → for each id: offsets[id]..offsets[id+1] → mmap slice → bincode::deserialize
-  → Vec<T>
-```
-
-### Payload fetch — Pod
-```
-db.fetch_pods(&[id])
-  → for each id: offset = id * size_of::<T>()
-                 bytemuck::from_bytes(&mmap[offset..offset+size]) → &T
-  → Vec<&T>  (zero-copy, borrows mmap)
-```
-
----
-
-## Public API Quick Reference
-
-```rust
-use ringdb::{RingDb, RingDbConfig, RingQuery, RangeQuery, DiskQuery, Payload};
-
-// --- Payload type (serde strategy, default) ---
-#[derive(serde::Serialize, serde::Deserialize, Payload)]
-struct MyDoc { title: String }
-
-// --- Payload type (pod strategy — zero-copy fetch) ---
-#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable, Payload)]
-#[repr(C)]
-#[payload(storage = "pod")]
-struct MyRecord { x: f32, y: f32 }
-
-// Build
-let mut db: RingDb<MyDoc> = RingDb::new(RingDbConfig::new(dims))?;
-db.add_vector(&vec_f32, my_doc)?;
-let db = db.build()?;  // → SealedRingDb<MyDoc>
-
-// Query variants
-let weights = vec![1.0f32; dims];
-let r = db.query(&RingQuery::new(&q, 5.0, 0.5))?;
-let r = db.query_range(&RangeQuery::new(&q, 4.5, 5.5).with_weights(&weights))?;
-let r = db.query_disk(&DiskQuery::new(&q, 5.5))?;
-
-// Fetch payloads (serde or pod — owned T)
-let payloads: Vec<MyDoc> = db.fetch_payloads(&r.ids())?;
-
-// Fetch payloads (pod only — zero-copy &T)
-let mut db2: RingDb<MyRecord> = RingDb::new(RingDbConfig::new(dims))?;
-// ... add_vector calls ...
-let db2 = db2.build()?;
-let refs: Vec<&MyRecord> = db2.fetch_pods(&r.ids());  // no payload copies
-```
-
-`T` defaults to `()` (no payload). Any `T: Payload` works; use `#[derive(Payload)]`.
-
----
-
-## CI/CD
-
-- **Push/PR to `master`** → `rust.yml`: `cargo build` + `cargo test`
-- **Tag `v*.*.*`** → `publish.yml`:
-  1. Full test suite
-  2. Dry-run + publish `ring-db-derive` (proc-macro, no deps on ring-db)
-  3. Sleep 30 s (crates.io indexing)
-  4. Dry-run + publish `ring-db`
-  5. Create GitHub release
-
----
+The release publishes one crate. Keep release scripts and CI aligned with the package
+version and the optional `cuda` feature.

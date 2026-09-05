@@ -2,15 +2,20 @@
 ///
 /// These tests use hand-crafted vectors at known distances from a query so
 /// the expected result sets are computed analytically, not by another code path.
+use bytemuck::{Pod, Zeroable};
 use ringdb::{
-    BackendPreference, DiskIntersectionQuery, DiskQuery, Payload, RangeQuery, RingDb, RingDbConfig,
-    RingDbError, RingQuery,
+    BackendPreference, DiskIntersectionQuery, DiskQuery, KnnQuery, RangeQuery, RingDb,
+    RingDbConfig, RingDbError, RingQuery,
 };
 #[cfg(feature = "cuda")]
-use ringdb::{Hit, QueryResult};
+use ringdb::{Hit, MetadataKey, MetadataTag, MetadataValue, QueryResult};
 
 fn cpu_db(dims: usize) -> RingDb {
     RingDb::new(RingDbConfig::new(dims)).unwrap()
+}
+
+fn assert_invalid_query<T>(result: Result<T, RingDbError>) {
+    assert!(matches!(result, Err(RingDbError::InvalidQuery(_))));
 }
 
 // ---- 2-D helpers ----
@@ -191,9 +196,19 @@ fn test_cuda_backend_matches_cpu_when_requested() {
     let mut cuda =
         RingDb::new(RingDbConfig::new(dims).with_backend_preference(BackendPreference::Cuda))
             .unwrap();
-    for vector in vectors {
-        cpu.add_vector(&vector, ()).unwrap();
-        cuda.add_vector(&vector, ()).unwrap();
+    let category = MetadataKey::new(1);
+    let common = MetadataTag::new(category, MetadataValue::new(10));
+    let rare = MetadataTag::new(category, MetadataValue::new(20));
+    for (index, vector) in vectors.into_iter().enumerate() {
+        let tags = if index == 4 {
+            vec![common, rare]
+        } else if index.is_multiple_of(2) {
+            vec![common]
+        } else {
+            Vec::new()
+        };
+        cpu.add_vector_with_metadata(&vector, (), &tags).unwrap();
+        cuda.add_vector_with_metadata(&vector, (), &tags).unwrap();
     }
     let cpu = cpu.build().unwrap();
     let cuda = cuda.build().unwrap();
@@ -343,6 +358,84 @@ fn test_cuda_backend_matches_cpu_when_requested() {
         .find(|hit| hit.id == 3)
         .expect("mixed unweighted-first intersection should contain vector 3");
     assert!((unweighted_first.dist_sq - 4.0).abs() <= 1.0e-5);
+
+    let cpu_common = cpu.metadata_eq(category, common.value);
+    let cuda_common = cuda.metadata_eq(category, common.value);
+    let cpu_knn = cpu
+        .query_knn(&KnnQuery::new(&origin, 3).with_candidates(&cpu_common))
+        .unwrap();
+    let cuda_knn = cuda
+        .query_knn(&KnnQuery::new(&origin, 3).with_candidates(&cuda_common))
+        .unwrap();
+    assert_hit_slices_close("dense-filtered KNN", &cpu_knn.hits, &cuda_knn.hits);
+
+    let cpu_rare = cpu.metadata_eq(category, rare.value);
+    let cuda_rare = cuda.metadata_eq(category, rare.value);
+    let cpu_weighted_knn = cpu
+        .query_knn(
+            &KnnQuery::new(&origin, 2)
+                .with_weights(&weights_a)
+                .with_candidates(&cpu_rare),
+        )
+        .unwrap();
+    let cuda_weighted_knn = cuda
+        .query_knn(
+            &KnnQuery::new(&origin, 2)
+                .with_weights(&weights_a)
+                .with_candidates(&cuda_rare),
+        )
+        .unwrap();
+    assert_hit_slices_close(
+        "sparse-filtered weighted KNN",
+        &cpu_weighted_knn.hits,
+        &cuda_weighted_knn.hits,
+    );
+
+    // More than 64 work items with k=1 exercises the device argmin path. The
+    // large common offset also guards the direct-delta distance calculation.
+    let mut cpu_large = RingDb::new(RingDbConfig::new(1)).unwrap();
+    let mut cuda_large =
+        RingDb::new(RingDbConfig::new(1).with_backend_preference(BackendPreference::Cuda)).unwrap();
+    for id in 0..130 {
+        let value = match id {
+            0 => 10_000_001.0,
+            1 => 9_999_999.0,
+            _ => 10_001_000.0 + id as f32,
+        };
+        cpu_large.add_vector(&[value], ()).unwrap();
+        cuda_large.add_vector(&[value], ()).unwrap();
+    }
+    let cpu_large = cpu_large.build().unwrap();
+    let cuda_large = cuda_large.build().unwrap();
+    let large_query = [10_000_000.0];
+    let cpu_device_knn = cpu_large
+        .query_knn(&KnnQuery::new(&large_query, 1))
+        .unwrap();
+    let cuda_device_knn = cuda_large
+        .query_knn(&KnnQuery::new(&large_query, 1))
+        .unwrap();
+    assert_hit_slices_close(
+        "device-reduced direct-delta KNN",
+        &cpu_device_knn.hits,
+        &cuda_device_knn.hits,
+    );
+
+    let mut cpu_extreme = RingDb::new(RingDbConfig::new(1)).unwrap();
+    let mut cuda_extreme =
+        RingDb::new(RingDbConfig::new(1).with_backend_preference(BackendPreference::Cuda)).unwrap();
+    for vector in [[f32::MAX], [-f32::MAX]] {
+        cpu_extreme.add_vector(&vector, ()).unwrap();
+        cuda_extreme.add_vector(&vector, ()).unwrap();
+    }
+    let cpu_extreme = cpu_extreme.build().unwrap();
+    let cuda_extreme = cuda_extreme.build().unwrap();
+    let extreme_query = [f32::MAX];
+    let exact_match = DiskQuery::new(&extreme_query, 0.0);
+    assert_cpu_cuda_results(
+        "extreme-coordinate direct-delta disk",
+        cpu_extreme.query_disk(&exact_match).unwrap(),
+        cuda_extreme.query_disk(&exact_match).unwrap(),
+    );
 }
 
 #[test]
@@ -399,11 +492,10 @@ fn test_higher_dims() {
 
 #[test]
 fn test_payload_roundtrip() {
-    use serde::{Deserialize, Serialize};
-
-    #[derive(Serialize, Deserialize, Payload, Debug, PartialEq)]
+    #[repr(C)]
+    #[derive(Copy, Clone, Pod, Zeroable, Debug, PartialEq)]
     struct Meta {
-        label: String,
+        label: [u8; 8],
         score: f64,
     }
 
@@ -411,7 +503,7 @@ fn test_payload_roundtrip() {
     db.add_vector(
         &[1.0, 0.0],
         Meta {
-            label: "dog".into(),
+            label: *b"dog\0\0\0\0\0",
             score: 0.9,
         },
     )
@@ -419,7 +511,7 @@ fn test_payload_roundtrip() {
     db.add_vector(
         &[0.0, 1.0],
         Meta {
-            label: "cat".into(),
+            label: *b"cat\0\0\0\0\0",
             score: 0.7,
         },
     )
@@ -427,7 +519,7 @@ fn test_payload_roundtrip() {
     db.add_vector(
         &[5.0, 0.0],
         Meta {
-            label: "bird".into(),
+            label: *b"bird\0\0\0\0",
             score: 0.5,
         },
     )
@@ -445,11 +537,11 @@ fn test_payload_roundtrip() {
     assert_eq!(payloads.len(), 2);
 
     let p0 = db.fetch_payload(0).unwrap();
-    assert_eq!(p0.label, "dog");
+    assert_eq!(&p0.label[..3], b"dog");
     assert_eq!(p0.score, 0.9);
 
     let p1 = db.fetch_payload(1).unwrap();
-    assert_eq!(p1.label, "cat");
+    assert_eq!(&p1.label[..3], b"cat");
 }
 
 // ---- RangeQuery tests ----
@@ -742,6 +834,60 @@ fn test_disk_intersection_query_dimension_mismatch() {
     ));
 }
 
+#[test]
+fn test_non_finite_coordinates_and_invalid_bounds_are_rejected() {
+    assert_invalid_query(RingDb::<()>::new(RingDbConfig::new(0)));
+
+    let mut builder = cpu_db(2);
+    assert_invalid_query(builder.add_vector(&[f32::NAN, 0.0], ()));
+    builder.add_vector(&[1.0, 0.0], ()).unwrap();
+    let db = builder.build().unwrap();
+    let origin = [0.0, 0.0];
+
+    assert_invalid_query(db.query(&RingQuery::new(&origin, -1.0, 0.5)));
+    assert_invalid_query(db.query(&RingQuery::new(&origin, 1.0, f32::NAN)));
+    assert_invalid_query(db.query_range(&RangeQuery::new(&origin, 2.0, 1.0)));
+    assert_invalid_query(db.query_range(&RangeQuery::new(&origin, 0.0, f32::INFINITY)));
+    assert_invalid_query(db.query_disk(&DiskQuery::new(&origin, -1.0)));
+    assert_invalid_query(db.query_knn(&KnnQuery::new(&[f32::INFINITY, 0.0], 1)));
+
+    let disks = [DiskQuery::new(&origin, -1.0)];
+    assert_invalid_query(db.query_disk_intersection(&DiskIntersectionQuery::new(&disks)));
+}
+
+#[test]
+fn test_unweighted_queries_use_stable_direct_differences() {
+    let mut builder = cpu_db(1);
+    builder.add_vector(&[f32::MAX], ()).unwrap();
+    builder.add_vector(&[-f32::MAX], ()).unwrap();
+    let db = builder.build().unwrap();
+    let query = [f32::MAX];
+    let first = db.candidates_from_ids([0]).unwrap();
+
+    assert_eq!(
+        db.query(&RingQuery::new(&query, 0.0, 0.0)).unwrap().ids(),
+        [0]
+    );
+    assert_eq!(
+        db.query_range(&RangeQuery::new(&query, 0.0, 0.0).with_candidates(&first))
+            .unwrap()
+            .ids(),
+        [0]
+    );
+    assert_eq!(
+        db.query_disk(&DiskQuery::new(&query, 0.0)).unwrap().ids(),
+        [0]
+    );
+
+    let disks = [DiskQuery::new(&query, 0.0)];
+    assert_eq!(
+        db.query_disk_intersection(&DiskIntersectionQuery::new(&disks).with_candidates(&first))
+            .unwrap()
+            .ids(),
+        [0]
+    );
+}
+
 // ── Persistence tests ─────────────────────────────────────────────────────────
 
 /// Build a database with `persist_dir`, drop it, reload it, and verify queries
@@ -772,6 +918,11 @@ fn test_persist_and_load_unit_payload() {
     let loaded = RingDb::<()>::load(&dir, BackendPreference::Cpu).unwrap();
     assert_eq!(loaded.len(), 3);
     assert_eq!(loaded.dims(), 2);
+    assert_eq!(*loaded.fetch_payload(0).unwrap(), ());
+    assert!(matches!(
+        loaded.fetch_payload(3),
+        Err(RingDbError::InvalidVectorId { id: 3, len: 3 })
+    ));
 
     let loaded_result = loaded
         .query(&RingQuery::new(&[0.0f32, 0.0], 5.0, 0.1))
@@ -786,12 +937,63 @@ fn test_persist_and_load_unit_payload() {
 }
 
 #[test]
-fn test_persist_and_load_struct_payload() {
-    use serde::{Deserialize, Serialize};
+fn test_persistence_refuses_to_overwrite_a_nonempty_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("keep-me");
+    std::fs::write(&marker, b"user data").unwrap();
 
-    #[derive(Debug, Serialize, Deserialize, Payload, PartialEq)]
+    let mut db = RingDb::new(RingDbConfig::new(1).with_persist_dir(dir.path())).unwrap();
+    db.add_vector(&[0.0], ()).unwrap();
+    let error = match db.build() {
+        Ok(_) => panic!("a nonempty persistence directory should be rejected"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        RingDbError::Io(ref error) if error.kind() == std::io::ErrorKind::AlreadyExists
+    ));
+    assert_eq!(std::fs::read(marker).unwrap(), b"user data");
+}
+
+#[test]
+fn test_load_rejects_non_finite_persisted_vectors() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = RingDb::new(RingDbConfig::new(1).with_persist_dir(dir.path())).unwrap();
+    db.add_vector(&[1.0], ()).unwrap();
+    db.build().unwrap();
+
+    std::fs::write(dir.path().join("vectors.bin"), f32::NAN.to_le_bytes()).unwrap();
+    assert!(matches!(
+        RingDb::<()>::load(dir.path(), BackendPreference::Cpu),
+        Err(RingDbError::Corrupt(_))
+    ));
+}
+
+#[test]
+fn test_load_rejects_row_counts_above_the_u32_id_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    RingDb::<()>::new(RingDbConfig::new(1).with_persist_dir(dir.path()))
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let meta_path = dir.path().join("meta.bin");
+    let mut meta = std::fs::read(&meta_path).unwrap();
+    meta[24..32].copy_from_slice(&(u64::from(u32::MAX) + 1).to_le_bytes());
+    std::fs::write(meta_path, meta).unwrap();
+
+    assert!(matches!(
+        RingDb::<()>::load(dir.path(), BackendPreference::Cpu),
+        Err(RingDbError::Corrupt(_))
+    ));
+}
+
+#[test]
+fn test_persist_and_load_struct_payload() {
+    #[repr(C)]
+    #[derive(Debug, Copy, Clone, Pod, Zeroable, PartialEq)]
     struct Meta {
-        label: String,
+        label: [u8; 8],
         value: i32,
     }
 
@@ -804,7 +1006,7 @@ fn test_persist_and_load_struct_payload() {
     db.add_vector(
         &[1.0f32, 0.0],
         Meta {
-            label: "dog".into(),
+            label: *b"dog\0\0\0\0\0",
             value: 1,
         },
     )
@@ -812,7 +1014,7 @@ fn test_persist_and_load_struct_payload() {
     db.add_vector(
         &[0.0, 1.0],
         Meta {
-            label: "cat".into(),
+            label: *b"cat\0\0\0\0\0",
             value: 2,
         },
     )
@@ -837,9 +1039,15 @@ fn test_persist_and_load_struct_payload() {
     assert_eq!(result2.hits.len(), 2); // both [1,0] and [0,1] are at distance 1 from origin
 
     let payloads = loaded.fetch_payloads(&result2.ids()).unwrap();
-    let labels: Vec<&str> = payloads.iter().map(|m| m.label.as_str()).collect();
-    assert!(labels.contains(&"dog"), "dog payload missing after load");
-    assert!(labels.contains(&"cat"), "cat payload missing after load");
+    let labels: Vec<&[u8]> = payloads.iter().map(|m| &m.label[..3]).collect();
+    assert!(
+        labels.contains(&b"dog".as_slice()),
+        "dog payload missing after load"
+    );
+    assert!(
+        labels.contains(&b"cat".as_slice()),
+        "cat payload missing after load"
+    );
 
     // Verify values too.
     for p in &payloads {
@@ -854,12 +1062,9 @@ fn test_persist_and_load_struct_payload() {
 
 #[test]
 fn test_pod_payload_roundtrip() {
-    use bytemuck::{Pod, Zeroable};
-
     /// A simple fixed-size payload — no heap allocation, no Serde needed.
-    #[derive(Copy, Clone, Pod, Zeroable, Payload, Debug, PartialEq)]
     #[repr(C)]
-    #[payload(storage = "pod")]
+    #[derive(Copy, Clone, Pod, Zeroable, Debug, PartialEq)]
     struct GeoPoint {
         lat: f32,
         lon: f32,
@@ -903,32 +1108,27 @@ fn test_pod_payload_roundtrip() {
     ids.sort_unstable();
     assert_eq!(ids, vec![0, 1], "only vectors at distance ≈ 1 should match");
 
-    // fetch_pod returns &GeoPoint — zero-copy, O(1), no Result.
-    let p0 = db.fetch_pod(0);
+    // Payload fetches return zero-copy references into the Pod store.
+    let p0 = db.fetch_payload(0).unwrap();
     assert!((p0.lat - 48.8566).abs() < 1e-3, "lat mismatch for ID 0");
     assert!((p0.lon - 2.3522).abs() < 1e-3, "lon mismatch for ID 0");
 
-    let p1 = db.fetch_pod(1);
+    let p1 = db.fetch_payload(1).unwrap();
     assert!((p1.lat - 51.5074).abs() < 1e-3, "lat mismatch for ID 1");
 
-    // fetch_pods returns Vec<&GeoPoint>.
-    let refs = db.fetch_pods(&result.ids());
+    let refs = db.fetch_payloads(&result.ids()).unwrap();
     assert_eq!(refs.len(), 2);
 }
 
 #[test]
-fn test_pod_storage_mismatch_error() {
-    use bytemuck::{Pod, Zeroable};
-
-    #[derive(Copy, Clone, Pod, Zeroable, Payload)]
+fn test_pod_newtype_payload() {
     #[repr(C)]
-    #[payload(storage = "pod")]
+    #[derive(Copy, Clone, Pod, Zeroable)]
     struct Tag(u64);
 
     let mut pod_db: RingDb<Tag> = RingDb::new(RingDbConfig::new(2)).unwrap();
     pod_db.add_vector(&[1.0, 0.0], Tag(42)).unwrap();
     let pod_db = pod_db.build().unwrap();
 
-    // fetch_pod returns &Tag directly — no Result.
-    assert_eq!(pod_db.fetch_pod(0).0, 42);
+    assert_eq!(pod_db.fetch_payload(0).unwrap().0, 42);
 }

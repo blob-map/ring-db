@@ -2,27 +2,25 @@ use bytemuck::{Pod, Zeroable};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use rand::{RngExt, SeedableRng};
 use ringdb::{
-    BackendPreference, DiskIntersectionQuery, DiskQuery, Payload, RingDb, RingDbConfig,
-    RingDbError, RingQuery, SealedRingDb,
+    BackendPreference, DiskIntersectionQuery, DiskQuery, KnnQuery, MetadataKey, MetadataTag,
+    MetadataValue, RingDb, RingDbConfig, RingDbError, RingQuery, SealedRingDb,
 };
-use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 const N: usize = 30_000_000;
 const SEED: u64 = 42;
 const QUERY_DIMS: &[usize] = &[16, 32, 64, 128];
 
-#[derive(Serialize, Deserialize, Payload)]
-struct DynamicPayload {
-    label: String,
-}
-
-#[derive(Clone, Copy, Pod, Zeroable, Payload)]
+#[derive(Clone, Copy, Pod, Zeroable)]
 #[repr(C)]
-#[payload(storage = "pod")]
 struct StaticPayload {
     score: f32,
 }
+
+const SELECTIVITY: MetadataKey = MetadataKey::new(1);
+const TEN_PERCENT: MetadataValue = MetadataValue::new(10);
+const ONE_PERCENT: MetadataValue = MetadataValue::new(100);
+const ONE_PER_MILLE: MetadataValue = MetadataValue::new(1_000);
 
 fn bench_filter_allows(group_name: &str) -> bool {
     let filters: Vec<String> = std::env::args()
@@ -40,6 +38,8 @@ fn bench_filter_allows(group_name: &str) -> bool {
                 "mixed",
                 "scaling",
                 "payload",
+                "knn",
+                "metadata",
                 "f32",
             ]
             .iter()
@@ -103,6 +103,39 @@ fn build_unit_db(
             *x = rng.random_range(-1.0f32..1.0);
         }
         db.add_vector(&buf, ())?;
+    }
+
+    db.build()
+}
+
+fn build_tagged_unit_db(
+    dims: usize,
+    n_vectors: usize,
+) -> std::result::Result<SealedRingDb<()>, RingDbError> {
+    let mut rng = rand::rngs::SmallRng::seed_from_u64(SEED);
+    let mut vector = vec![0.0f32; dims];
+    let mut db = RingDb::new(RingDbConfig::new(dims))?;
+
+    for id in 0..n_vectors {
+        for value in &mut vector {
+            *value = rng.random_range(-1.0f32..1.0);
+        }
+
+        let mut tags = [MetadataTag::new(SELECTIVITY, TEN_PERCENT); 3];
+        let mut tag_count = 0;
+        if id % 10 == 0 {
+            tags[tag_count] = MetadataTag::new(SELECTIVITY, TEN_PERCENT);
+            tag_count += 1;
+        }
+        if id % 100 == 0 {
+            tags[tag_count] = MetadataTag::new(SELECTIVITY, ONE_PERCENT);
+            tag_count += 1;
+        }
+        if id % 1_000 == 0 {
+            tags[tag_count] = MetadataTag::new(SELECTIVITY, ONE_PER_MILLE);
+            tag_count += 1;
+        }
+        db.add_vector_with_metadata(&vector, (), &tags[..tag_count])?;
     }
 
     db.build()
@@ -487,69 +520,75 @@ fn bench_cpu_weighted_intersection_scaling(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_payload_fetch_dynamic(c: &mut Criterion) {
-    let bench_name = "payload_fetch_dynamic";
+fn bench_cpu_knn_f32(c: &mut Criterion) {
+    let bench_name = "cpu_knn_f32";
     if !bench_filter_allows(bench_name) {
         return;
     }
 
+    const DIMS: usize = 64;
     let n_vectors = cpu_bench_n();
+    let db = build_unit_db(DIMS, n_vectors, BackendPreference::Cpu).unwrap();
+    let query = random_query(DIMS);
+    let weights = mean_one_weights(DIMS, 0);
     let mut group = c.benchmark_group(bench_name);
     group.warm_up_time(Duration::from_secs(1));
     group.measurement_time(Duration::from_secs(5));
-    group.sample_size(50);
+    group.sample_size(20);
+    group.throughput(Throughput::Elements(n_vectors as u64));
 
-    let label: String = "x".repeat(92);
-
-    for &dims in &[64usize, 128usize] {
-        let expected_dist = expected_distance(dims);
-        let d = expected_dist;
-        let lambda = expected_dist * 0.0005;
-
-        let mut rng = rand::rngs::SmallRng::seed_from_u64(SEED);
-        let mut buf = vec![0.0f32; dims];
-
-        let mut db: RingDb<DynamicPayload> = RingDb::new(RingDbConfig::new(dims)).unwrap();
-        for _ in 0..n_vectors {
-            for x in buf.iter_mut() {
-                *x = rng.random_range(-1.0f32..1.0);
-            }
-            db.add_vector(
-                &buf,
-                DynamicPayload {
-                    label: label.clone(),
-                },
-            )
-            .unwrap();
-        }
-        let db = db.build().unwrap();
-
-        let query = random_query(dims);
-
-        let result = db.query(&RingQuery::new(&query, d, lambda)).unwrap();
-        let ids = result.ids();
-        let n_hits = ids.len();
-
-        println!(
-            "dims={dims} ring=[{:.3}, {:.3}] hits={n_hits} ({:.2}%)",
-            d - lambda,
-            d + lambda,
-            100.0 * n_hits as f32 / n_vectors.max(1) as f32
-        );
-
-        group.throughput(Throughput::Elements(n_hits as u64));
-        group.bench_with_input(
-            BenchmarkId::new("100B_string_payload", dims),
-            &n_hits,
-            |b, _| b.iter(|| db.fetch_payloads(&ids).unwrap()),
-        );
+    for k in [1usize, 10, 100] {
+        let ordinary = KnnQuery::new(&query, k);
+        let weighted = KnnQuery::new(&query, k).with_weights(&weights);
+        group.bench_with_input(BenchmarkId::new("ordinary", k), &k, |b, _| {
+            b.iter(|| db.query_knn(&ordinary).unwrap());
+        });
+        group.bench_with_input(BenchmarkId::new("weighted", k), &k, |b, _| {
+            b.iter(|| db.query_knn(&weighted).unwrap());
+        });
     }
 
     group.finish();
 }
 
-fn bench_payload_fetch_static(c: &mut Criterion) {
-    let bench_name = "payload_fetch_static";
+fn bench_cpu_metadata_selectivity(c: &mut Criterion) {
+    let bench_name = "cpu_knn_metadata_selectivity";
+    if !bench_filter_allows(bench_name) {
+        return;
+    }
+
+    const DIMS: usize = 64;
+    const K: usize = 10;
+    let n_vectors = cpu_bench_n();
+    let db = build_tagged_unit_db(DIMS, n_vectors).unwrap();
+    let query = random_query(DIMS);
+    let candidates = [
+        ("10_percent", db.metadata_eq(SELECTIVITY, TEN_PERCENT)),
+        ("1_percent", db.metadata_eq(SELECTIVITY, ONE_PERCENT)),
+        ("0.1_percent", db.metadata_eq(SELECTIVITY, ONE_PER_MILLE)),
+    ];
+
+    let mut group = c.benchmark_group(bench_name);
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(5));
+    group.sample_size(20);
+
+    group.bench_function("unfiltered", |b| {
+        b.iter(|| db.query_knn(&KnnQuery::new(&query, K)).unwrap());
+    });
+
+    for (label, candidates) in &candidates {
+        let filtered = KnnQuery::new(&query, K).with_candidates(candidates);
+        group.bench_function(*label, |b| {
+            b.iter(|| db.query_knn(&filtered).unwrap());
+        });
+    }
+
+    group.finish();
+}
+
+fn bench_payload_fetch(c: &mut Criterion) {
+    let bench_name = "payload_fetch";
     if !bench_filter_allows(bench_name) {
         return;
     }
@@ -592,11 +631,9 @@ fn bench_payload_fetch_static(c: &mut Criterion) {
         );
 
         group.throughput(Throughput::Elements(n_hits as u64));
-        group.bench_with_input(
-            BenchmarkId::new("100B_string_payload", dims),
-            &n_hits,
-            |b, _| b.iter(|| db.fetch_pods(&ids)),
-        );
+        group.bench_with_input(BenchmarkId::new("pod_record", dims), &n_hits, |b, _| {
+            b.iter(|| db.fetch_payloads(&ids).unwrap())
+        });
     }
 
     group.finish();
@@ -608,10 +645,11 @@ criterion_group!(
     bench_cpu_disk_f32,
     bench_cpu_disk_intersection_f32,
     bench_cpu_weighted_intersection_scaling,
+    bench_cpu_knn_f32,
+    bench_cpu_metadata_selectivity,
     bench_cuda_f32,
     bench_cuda_disk_f32,
     bench_cuda_disk_intersection_f32,
-    bench_payload_fetch_dynamic,
-    bench_payload_fetch_static
+    bench_payload_fetch
 );
 criterion_main!(benches);
