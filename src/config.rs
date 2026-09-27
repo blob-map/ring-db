@@ -2,23 +2,21 @@ use std::path::PathBuf;
 
 /// Which compute backend to use for vector queries.
 ///
-/// CPU is always available. CUDA support is opt-in via the `cuda` Cargo
-/// feature and requires a CUDA-capable NVIDIA driver at runtime.
+/// Both backends are included in every build; selection happens at runtime.
+/// CPU needs no GPU runtime. Vulkan requires a compatible loader, driver, and device.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum BackendPreference {
     /// CPU brute-force (always available).
     #[default]
     Cpu,
 
-    /// CUDA brute-force on the first NVIDIA device.
+    /// Vulkan compute, preferring a discrete GPU, then an integrated GPU.
     ///
-    /// This variant is always part of the public API, but constructing a
-    /// CUDA-backed database returns [`RingDbError::BackendUnavailable`] when
-    /// the crate was not built with the `cuda` feature or no CUDA driver/device
-    /// is available.
-    ///
-    /// [`RingDbError::BackendUnavailable`]: crate::RingDbError::BackendUnavailable
-    Cuda,
+    /// Loads Vulkan only when selected. Requires a Vulkan loader and a compatible
+    /// driver and compute device. Otherwise construction returns
+    /// [`RingDbError::BackendUnavailable`](crate::RingDbError::BackendUnavailable).
+    /// No Cargo feature, Vulkan SDK, or shader compiler is needed.
+    Vulkan,
 }
 
 /// Configuration for a `RingDb` instance.

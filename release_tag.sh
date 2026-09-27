@@ -4,7 +4,7 @@ set -e
 VERSION=$1
 
 if [ -z "$VERSION" ]; then
-  echo "Usage: ./release.sh <version>"
+  echo "Usage: ./release_tag.sh <version>"
   exit 1
 fi
 
@@ -12,18 +12,18 @@ echo "Updating dependencies..."
 cargo update
 
 echo "Pre-release checks..."
-cargo check --all-features
-cargo test --all-features
+cargo check
+cargo test
 cargo fmt
-cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --all-targets -- -D warnings
 
 echo "Updating Cargo.toml to $VERSION"
 sed -i.bak -E "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
 rm Cargo.toml.bak
 
 echo "Post-version build check..."
-cargo check --all-features
-cargo test --all-features
+cargo check
+cargo test
 
 git add .
 git commit -m "Release v$VERSION"

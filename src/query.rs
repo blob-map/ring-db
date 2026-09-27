@@ -4,7 +4,7 @@ use crate::metadata::CandidateSet;
 
 /// A single match returned by a query.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Hit {
     /// Insertion-order ID of the matching vector (first inserted = 0).
     pub id: u32,
@@ -342,7 +342,7 @@ impl<'a> KnnQuery<'a> {
 pub struct QueryResult {
     /// All matching vectors together with their squared distances.
     pub hits: Vec<Hit>,
-    /// Name of the backend that executed the query (e.g. `"cpu"` or `"cuda"`).
+    /// Name of the backend that executed the query (`"cpu"` or `"vulkan"`).
     pub backend_used: &'static str,
     /// Wall-clock time for the query (excluding dataset upload).
     pub elapsed: Duration,

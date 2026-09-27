@@ -7,6 +7,11 @@
 //! search. Queries use ordinary L2 by default and can optionally provide final
 //! per-dimension coefficients for diagonal weighted L2.
 //!
+//! CPU and Vulkan backends are included without Cargo feature flags. CPU is the
+//! default and needs no GPU runtime. Select [`BackendPreference::Vulkan`] to load
+//! Vulkan at runtime; only a compatible loader, driver, and compute device are needed.
+//! Shaders are embedded, so no Vulkan SDK or shader compiler is required.
+//!
 //! ## Quick start
 //!
 //! ```
@@ -28,6 +33,11 @@ mod metadata;
 mod payload;
 mod persist;
 mod query;
+
+// Compile README examples with the public API as part of `cargo test`.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+mod readme {}
 
 pub use config::{BackendPreference, RingDbConfig};
 pub use engine::{RingDb, SealedRingDb};

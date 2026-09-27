@@ -17,6 +17,36 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     - name: Build
-      run: cargo build --all-features --locked --verbose
+      run: cargo build --locked --verbose
     - name: Run tests
-      run: cargo test --all-features --locked --verbose
+      run: cargo test --locked --verbose
+
+  vulkan:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install software Vulkan and shader tools
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y mesa-vulkan-drivers libvulkan1 spirv-tools vulkan-validationlayers ripgrep
+        icd_files=(/usr/share/vulkan/icd.d/lvp_icd*.json)
+        test -f "${icd_files[0]}"
+        echo "VK_DRIVER_FILES=${icd_files[0]}" >> "$GITHUB_ENV"
+    - name: Validate shaders
+      run: |
+        cd src/backend/vulkan/shaders
+        sha256sum --check SHA256SUMS
+        for shader in *.spv; do
+          spirv-val --target-env vulkan1.0 "$shader"
+        done
+    - name: Compare Vulkan with CPU using validation layers
+      shell: bash
+      env:
+        RINGDB_VULKAN_TEST: "1"
+        VK_INSTANCE_LAYERS: VK_LAYER_KHRONOS_validation
+        VK_LAYER_VALIDATE_SYNC: "1"
+      run: |
+        cargo test --locked --test vulkan -- --nocapture 2>&1 | tee vulkan-tests.log
+        if rg 'Validation Error|VUID-|SYNC-HAZARD' vulkan-tests.log; then
+          exit 1
+        fi

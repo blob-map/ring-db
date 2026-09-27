@@ -1,0 +1,38 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+shared uint best_slots[128];
+
+uint better(uint a, uint b) {
+    if (a == INVALID) return b;
+    if (b == INVALID) return a;
+    uint a_id = scratch[2u * a];
+    uint b_id = scratch[2u * b];
+    if (a_id == INVALID) return b;
+    if (b_id == INVALID) return a;
+    // Non-negative f32 distances have the same ordering as their u32 bits,
+    // including +infinity. ID breaks distance ties deterministically.
+    uint a_dist = scratch[2u * a + 1u];
+    uint b_dist = scratch[2u * b + 1u];
+    return a_dist < b_dist || (a_dist == b_dist && a_id < b_id) ? a : b;
+}
+
+void main() {
+    uint group = group_index();
+    if (group >= (p.reduce_count + 127u) / 128u) return;
+    uint lane = gl_LocalInvocationID.x;
+    uint index = group * 128u + lane;
+    uint slot = INVALID;
+    if (index < p.reduce_count) {
+        slot = p.reduce_src == INVALID ? index : scratch[p.reduce_src + index];
+        if (slot != INVALID && scratch[2u * slot] == INVALID) slot = INVALID;
+    }
+    best_slots[lane] = slot;
+    barrier();
+    for (uint stride = 64u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) best_slots[lane] = better(best_slots[lane], best_slots[lane + stride]);
+        barrier();
+    }
+    if (lane == 0u) scratch[p.reduce_dst + group] = best_slots[0];
+}

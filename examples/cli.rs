@@ -61,14 +61,14 @@ struct Cli {
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum CliBackend {
     Cpu,
-    Cuda,
+    Vulkan,
 }
 
 impl From<CliBackend> for BackendPreference {
     fn from(value: CliBackend) -> Self {
         match value {
             CliBackend::Cpu => Self::Cpu,
-            CliBackend::Cuda => Self::Cuda,
+            CliBackend::Vulkan => Self::Vulkan,
         }
     }
 }

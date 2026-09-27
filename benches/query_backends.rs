@@ -30,7 +30,7 @@ fn bench_filter_allows(group_name: &str) -> bool {
             let lower = arg.to_ascii_lowercase();
             [
                 "cpu",
-                "cuda",
+                "vulkan",
                 "ring",
                 "disk",
                 "intersection",
@@ -73,17 +73,20 @@ fn cpu_bench_n() -> usize {
     env_bench_n("RINGDB_BENCH_N")
 }
 
-#[cfg(feature = "cuda")]
-fn cuda_bench_n() -> usize {
-    env_bench_n("RINGDB_CUDA_BENCH_N")
+fn vulkan_bench_n() -> usize {
+    if std::env::var_os("RINGDB_VULKAN_BENCH_N").is_some() {
+        env_bench_n("RINGDB_VULKAN_BENCH_N")
+    } else {
+        cpu_bench_n()
+    }
 }
 
-#[cfg(feature = "cuda")]
-fn cuda_is_available(bench_name: &str) -> bool {
-    match RingDb::<()>::new(RingDbConfig::new(1).with_backend_preference(BackendPreference::Cuda)) {
+fn vulkan_is_available(bench_name: &str) -> bool {
+    match RingDb::<()>::new(RingDbConfig::new(1).with_backend_preference(BackendPreference::Vulkan))
+    {
         Ok(_) => true,
         Err(err) => {
-            eprintln!("skipping {bench_name}: CUDA backend unavailable: {err}");
+            eprintln!("skipping {bench_name}: Vulkan backend unavailable: {err}");
             false
         }
     }
@@ -202,17 +205,16 @@ fn bench_cpu_f32(c: &mut Criterion) {
     group.finish();
 }
 
-#[cfg(feature = "cuda")]
-fn bench_cuda_f32(c: &mut Criterion) {
-    let bench_name = "cuda_f32";
+fn bench_vulkan_f32(c: &mut Criterion) {
+    let bench_name = "vulkan_f32";
     if !bench_filter_allows(bench_name) {
         return;
     }
-    if !cuda_is_available(bench_name) {
+    if !vulkan_is_available(bench_name) {
         return;
     }
 
-    let n_vectors = cuda_bench_n();
+    let n_vectors = vulkan_bench_n();
     let mut group = c.benchmark_group(bench_name);
     group.warm_up_time(Duration::from_secs(1));
     group.measurement_time(Duration::from_secs(5));
@@ -221,10 +223,10 @@ fn bench_cuda_f32(c: &mut Criterion) {
     group.throughput(Throughput::Elements(n_vectors as u64));
 
     for &dims in QUERY_DIMS {
-        let db = match build_unit_db(dims, n_vectors, BackendPreference::Cuda) {
+        let db = match build_unit_db(dims, n_vectors, BackendPreference::Vulkan) {
             Ok(db) => db,
             Err(err) => {
-                eprintln!("skipping {bench_name}/{dims}: failed to build CUDA db: {err}");
+                eprintln!("skipping {bench_name}/{dims}: failed to build Vulkan db: {err}");
                 continue;
             }
         };
@@ -249,9 +251,6 @@ fn bench_cuda_f32(c: &mut Criterion) {
     }
     group.finish();
 }
-
-#[cfg(not(feature = "cuda"))]
-fn bench_cuda_f32(_: &mut Criterion) {}
 
 fn bench_cpu_disk_f32(c: &mut Criterion) {
     let bench_name = "cpu_disk_f32";
@@ -284,17 +283,16 @@ fn bench_cpu_disk_f32(c: &mut Criterion) {
     group.finish();
 }
 
-#[cfg(feature = "cuda")]
-fn bench_cuda_disk_f32(c: &mut Criterion) {
-    let bench_name = "cuda_disk_f32";
+fn bench_vulkan_disk_f32(c: &mut Criterion) {
+    let bench_name = "vulkan_disk_f32";
     if !bench_filter_allows(bench_name) {
         return;
     }
-    if !cuda_is_available(bench_name) {
+    if !vulkan_is_available(bench_name) {
         return;
     }
 
-    let n_vectors = cuda_bench_n();
+    let n_vectors = vulkan_bench_n();
     let mut group = c.benchmark_group(bench_name);
     group.warm_up_time(Duration::from_secs(1));
     group.measurement_time(Duration::from_secs(5));
@@ -302,10 +300,10 @@ fn bench_cuda_disk_f32(c: &mut Criterion) {
     group.throughput(Throughput::Elements(n_vectors as u64));
 
     for &dims in QUERY_DIMS {
-        let db = match build_unit_db(dims, n_vectors, BackendPreference::Cuda) {
+        let db = match build_unit_db(dims, n_vectors, BackendPreference::Vulkan) {
             Ok(db) => db,
             Err(err) => {
-                eprintln!("skipping {bench_name}/{dims}: failed to build CUDA db: {err}");
+                eprintln!("skipping {bench_name}/{dims}: failed to build Vulkan db: {err}");
                 continue;
             }
         };
@@ -329,9 +327,6 @@ fn bench_cuda_disk_f32(c: &mut Criterion) {
     }
     group.finish();
 }
-
-#[cfg(not(feature = "cuda"))]
-fn bench_cuda_disk_f32(_: &mut Criterion) {}
 
 fn bench_cpu_disk_intersection_f32(c: &mut Criterion) {
     let bench_name = "cpu_disk_intersection_f32";
@@ -387,17 +382,16 @@ fn bench_cpu_disk_intersection_f32(c: &mut Criterion) {
     group.finish();
 }
 
-#[cfg(feature = "cuda")]
-fn bench_cuda_disk_intersection_f32(c: &mut Criterion) {
-    let bench_name = "cuda_disk_intersection_f32";
+fn bench_vulkan_disk_intersection_f32(c: &mut Criterion) {
+    let bench_name = "vulkan_disk_intersection_f32";
     if !bench_filter_allows(bench_name) {
         return;
     }
-    if !cuda_is_available(bench_name) {
+    if !vulkan_is_available(bench_name) {
         return;
     }
 
-    let n_vectors = cuda_bench_n();
+    let n_vectors = vulkan_bench_n();
     let mut group = c.benchmark_group(bench_name);
     group.warm_up_time(Duration::from_secs(1));
     group.measurement_time(Duration::from_secs(5));
@@ -406,10 +400,10 @@ fn bench_cuda_disk_intersection_f32(c: &mut Criterion) {
     group.throughput(Throughput::Elements(n_vectors as u64));
 
     for &dims in QUERY_DIMS {
-        let db = match build_unit_db(dims, n_vectors, BackendPreference::Cuda) {
+        let db = match build_unit_db(dims, n_vectors, BackendPreference::Vulkan) {
             Ok(db) => db,
             Err(err) => {
-                eprintln!("skipping {bench_name}/{dims}: failed to build CUDA db: {err}");
+                eprintln!("skipping {bench_name}/{dims}: failed to build Vulkan db: {err}");
                 continue;
             }
         };
@@ -457,9 +451,6 @@ fn bench_cuda_disk_intersection_f32(c: &mut Criterion) {
     }
     group.finish();
 }
-
-#[cfg(not(feature = "cuda"))]
-fn bench_cuda_disk_intersection_f32(_: &mut Criterion) {}
 
 fn bench_cpu_weighted_intersection_scaling(c: &mut Criterion) {
     let bench_name = "cpu_weighted_intersection_scaling_f32";
@@ -647,9 +638,9 @@ criterion_group!(
     bench_cpu_weighted_intersection_scaling,
     bench_cpu_knn_f32,
     bench_cpu_metadata_selectivity,
-    bench_cuda_f32,
-    bench_cuda_disk_f32,
-    bench_cuda_disk_intersection_f32,
+    bench_vulkan_f32,
+    bench_vulkan_disk_f32,
+    bench_vulkan_disk_intersection_f32,
     bench_payload_fetch
 );
 criterion_main!(benches);

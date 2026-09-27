@@ -3,12 +3,10 @@ use crate::metadata::CandidateSetView;
 use crate::query::Hit;
 
 pub mod cpu;
-#[cfg(feature = "cuda")]
-pub mod cuda;
+pub mod vulkan;
 
 pub use cpu::CpuBackend;
-#[cfg(feature = "cuda")]
-pub use cuda::CudaBackend;
+pub use vulkan::VulkanBackend;
 
 /// One disk passed from the public query layer to a compute backend.
 #[derive(Clone, Copy)]

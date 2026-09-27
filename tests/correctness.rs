@@ -7,8 +7,6 @@ use ringdb::{
     BackendPreference, DiskIntersectionQuery, DiskQuery, KnnQuery, RangeQuery, RingDb,
     RingDbConfig, RingDbError, RingQuery,
 };
-#[cfg(feature = "cuda")]
-use ringdb::{Hit, MetadataKey, MetadataTag, MetadataValue, QueryResult};
 
 fn cpu_db(dims: usize) -> RingDb {
     RingDb::new(RingDbConfig::new(dims)).unwrap()
@@ -23,35 +21,6 @@ fn assert_invalid_query<T>(result: Result<T, RingDbError>) {
 /// Distance between two 2-D points.
 fn dist2(a: (f32, f32), b: (f32, f32)) -> f32 {
     ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt()
-}
-
-#[cfg(feature = "cuda")]
-fn assert_hit_slices_close(label: &str, expected: &[Hit], actual: &[Hit]) {
-    let expected_ids: Vec<u32> = expected.iter().map(|hit| hit.id).collect();
-    let actual_ids: Vec<u32> = actual.iter().map(|hit| hit.id).collect();
-    assert_eq!(expected_ids, actual_ids, "{label}: ID mismatch");
-
-    for (expected_hit, actual_hit) in expected.iter().zip(actual) {
-        let tolerance = 2.0e-4 * expected_hit.dist_sq.abs().max(1.0);
-        assert!(
-            (expected_hit.dist_sq - actual_hit.dist_sq).abs() <= tolerance,
-            "{label}: distance mismatch for ID {}: expected={}, actual={}, tolerance={tolerance}",
-            expected_hit.id,
-            expected_hit.dist_sq,
-            actual_hit.dist_sq,
-        );
-    }
-}
-
-#[cfg(feature = "cuda")]
-fn assert_cpu_cuda_results(label: &str, cpu: QueryResult, cuda: QueryResult) -> Vec<Hit> {
-    let mut cpu_hits = cpu.hits;
-    let mut cuda_hits = cuda.hits;
-    cpu_hits.sort_by_key(|hit| hit.id);
-    cuda_hits.sort_by_key(|hit| hit.id);
-
-    assert_hit_slices_close(label, &cpu_hits, &cuda_hits);
-    cpu_hits
 }
 
 #[test]
@@ -161,281 +130,6 @@ fn test_d_less_than_lambda() {
 fn test_backend_name() {
     let db = cpu_db(4);
     assert_eq!(db.backend_name(), "cpu");
-}
-
-#[cfg(not(feature = "cuda"))]
-#[test]
-fn test_cuda_backend_requires_feature() {
-    let err = match RingDb::<()>::new(
-        RingDbConfig::new(4).with_backend_preference(BackendPreference::Cuda),
-    ) {
-        Ok(_) => panic!("CUDA backend should require the `cuda` Cargo feature"),
-        Err(err) => err,
-    };
-    assert!(matches!(err, RingDbError::BackendUnavailable(_)));
-}
-
-#[cfg(feature = "cuda")]
-#[test]
-fn test_cuda_backend_matches_cpu_when_requested() {
-    if std::env::var_os("RINGDB_CUDA_TEST").is_none() {
-        return;
-    }
-
-    let dims = 4;
-    let vectors = [
-        [1.0f32, 0.0, 0.0, 0.0],
-        [0.0, 2.0, 0.0, 0.0],
-        [3.0, 4.0, 0.0, 0.0],
-        [1.0, 1.0, 1.0, 1.0],
-        [10.0, 0.0, 0.0, 0.0],
-        [0.0, 100.0, 0.0, 0.0],
-    ];
-
-    let mut cpu = RingDb::new(RingDbConfig::new(dims)).unwrap();
-    let mut cuda =
-        RingDb::new(RingDbConfig::new(dims).with_backend_preference(BackendPreference::Cuda))
-            .unwrap();
-    let category = MetadataKey::new(1);
-    let common = MetadataTag::new(category, MetadataValue::new(10));
-    let rare = MetadataTag::new(category, MetadataValue::new(20));
-    for (index, vector) in vectors.into_iter().enumerate() {
-        let tags = if index == 4 {
-            vec![common, rare]
-        } else if index.is_multiple_of(2) {
-            vec![common]
-        } else {
-            Vec::new()
-        };
-        cpu.add_vector_with_metadata(&vector, (), &tags).unwrap();
-        cuda.add_vector_with_metadata(&vector, (), &tags).unwrap();
-    }
-    let cpu = cpu.build().unwrap();
-    let cuda = cuda.build().unwrap();
-    assert_eq!(cuda.backend_name(), "cuda");
-
-    let origin = [0.0f32; 4];
-    let shifted = [1.0f32, 0.0, 0.0, 0.0];
-    let shifted_back = [-1.0f32, 0.0, 0.0, 0.0];
-    let weights_a = [4.0f32, 1.0, 0.5, 2.0];
-    let weights_b = [0.25f32, 3.0, 1.0, 0.5];
-    let ones = [1.0f32; 4];
-    let zero_dimensions = [1.0f32, 0.0, 1.0, 0.0];
-    let zeros = [0.0f32; 4];
-
-    let ring = RingQuery::new(&origin, 2.0, 0.5);
-    assert_cpu_cuda_results(
-        "ordinary ring",
-        cpu.query(&ring).unwrap(),
-        cuda.query(&ring).unwrap(),
-    );
-
-    let range = RangeQuery::new(&origin, 1.5, 5.1);
-    assert_cpu_cuda_results(
-        "ordinary range",
-        cpu.query_range(&range).unwrap(),
-        cuda.query_range(&range).unwrap(),
-    );
-
-    let disk = DiskQuery::new(&origin, 5.1);
-    assert_cpu_cuda_results(
-        "ordinary disk",
-        cpu.query_disk(&disk).unwrap(),
-        cuda.query_disk(&disk).unwrap(),
-    );
-
-    let weighted_ring = RingQuery::new(&origin, 2.0, 0.2).with_weights(&weights_a);
-    assert_cpu_cuda_results(
-        "weighted ring",
-        cpu.query(&weighted_ring).unwrap(),
-        cuda.query(&weighted_ring).unwrap(),
-    );
-
-    let weighted_range = RangeQuery::new(&origin, 1.9, 2.8).with_weights(&weights_a);
-    assert_cpu_cuda_results(
-        "weighted range",
-        cpu.query_range(&weighted_range).unwrap(),
-        cuda.query_range(&weighted_range).unwrap(),
-    );
-
-    let weighted_disk = DiskQuery::new(&origin, 3.0).with_weights(&weights_a);
-    assert_cpu_cuda_results(
-        "weighted disk",
-        cpu.query_disk(&weighted_disk).unwrap(),
-        cuda.query_disk(&weighted_disk).unwrap(),
-    );
-
-    let all_one_disk = DiskQuery::new(&origin, 5.1).with_weights(&ones);
-    let ordinary_hits = assert_cpu_cuda_results(
-        "ordinary disk for all-one comparison",
-        cpu.query_disk(&disk).unwrap(),
-        cuda.query_disk(&disk).unwrap(),
-    );
-    let all_one_hits = assert_cpu_cuda_results(
-        "all-one weighted disk",
-        cpu.query_disk(&all_one_disk).unwrap(),
-        cuda.query_disk(&all_one_disk).unwrap(),
-    );
-    assert_hit_slices_close("ordinary/all-one disk", &ordinary_hits, &all_one_hits);
-
-    let zero_weight_disk = DiskQuery::new(&origin, 1.1).with_weights(&zero_dimensions);
-    assert_cpu_cuda_results(
-        "zero-weight dimensions",
-        cpu.query_disk(&zero_weight_disk).unwrap(),
-        cuda.query_disk(&zero_weight_disk).unwrap(),
-    );
-
-    let all_zero_disk = DiskQuery::new(&origin, 0.0).with_weights(&zeros);
-    let all_zero_hits = assert_cpu_cuda_results(
-        "all-zero weights",
-        cpu.query_disk(&all_zero_disk).unwrap(),
-        cuda.query_disk(&all_zero_disk).unwrap(),
-    );
-    assert_eq!(all_zero_hits.len(), vectors.len());
-    assert!(all_zero_hits.iter().all(|hit| hit.dist_sq == 0.0));
-
-    let ordinary_disks = [
-        DiskQuery::new(&origin, 6.0),
-        DiskQuery::new(&shifted, 5.0),
-        DiskQuery::new(&shifted_back, 8.0),
-    ];
-    let ordinary_intersection = DiskIntersectionQuery::new(&ordinary_disks);
-    assert_cpu_cuda_results(
-        "ordinary three-disk intersection",
-        cpu.query_disk_intersection(&ordinary_intersection).unwrap(),
-        cuda.query_disk_intersection(&ordinary_intersection)
-            .unwrap(),
-    );
-
-    let all_weighted_disks = [
-        DiskQuery::new(&origin, 6.0).with_weights(&weights_a),
-        DiskQuery::new(&shifted, 10.0).with_weights(&weights_b),
-        DiskQuery::new(&shifted_back, 8.0).with_weights(&ones),
-    ];
-    let all_weighted_intersection = DiskIntersectionQuery::new(&all_weighted_disks);
-    assert_cpu_cuda_results(
-        "all-weighted intersection",
-        cpu.query_disk_intersection(&all_weighted_intersection)
-            .unwrap(),
-        cuda.query_disk_intersection(&all_weighted_intersection)
-            .unwrap(),
-    );
-
-    let weighted_first_disks = [
-        DiskQuery::new(&origin, 6.0).with_weights(&weights_a),
-        DiskQuery::new(&shifted, 6.0),
-        DiskQuery::new(&shifted_back, 10.0).with_weights(&weights_b),
-    ];
-    let weighted_first_intersection = DiskIntersectionQuery::new(&weighted_first_disks);
-    let weighted_first_hits = assert_cpu_cuda_results(
-        "mixed intersection with weighted first disk",
-        cpu.query_disk_intersection(&weighted_first_intersection)
-            .unwrap(),
-        cuda.query_disk_intersection(&weighted_first_intersection)
-            .unwrap(),
-    );
-    let weighted_first = weighted_first_hits
-        .iter()
-        .find(|hit| hit.id == 3)
-        .expect("mixed weighted-first intersection should contain vector 3");
-    assert!((weighted_first.dist_sq - 7.5).abs() <= 1.0e-5);
-
-    let unweighted_first_disks = [
-        DiskQuery::new(&origin, 6.0),
-        DiskQuery::new(&shifted, 10.0).with_weights(&weights_a),
-        DiskQuery::new(&shifted_back, 10.0).with_weights(&weights_b),
-    ];
-    let unweighted_first_intersection = DiskIntersectionQuery::new(&unweighted_first_disks);
-    let unweighted_first_hits = assert_cpu_cuda_results(
-        "mixed intersection with unweighted first disk",
-        cpu.query_disk_intersection(&unweighted_first_intersection)
-            .unwrap(),
-        cuda.query_disk_intersection(&unweighted_first_intersection)
-            .unwrap(),
-    );
-    let unweighted_first = unweighted_first_hits
-        .iter()
-        .find(|hit| hit.id == 3)
-        .expect("mixed unweighted-first intersection should contain vector 3");
-    assert!((unweighted_first.dist_sq - 4.0).abs() <= 1.0e-5);
-
-    let cpu_common = cpu.metadata_eq(category, common.value);
-    let cuda_common = cuda.metadata_eq(category, common.value);
-    let cpu_knn = cpu
-        .query_knn(&KnnQuery::new(&origin, 3).with_candidates(&cpu_common))
-        .unwrap();
-    let cuda_knn = cuda
-        .query_knn(&KnnQuery::new(&origin, 3).with_candidates(&cuda_common))
-        .unwrap();
-    assert_hit_slices_close("dense-filtered KNN", &cpu_knn.hits, &cuda_knn.hits);
-
-    let cpu_rare = cpu.metadata_eq(category, rare.value);
-    let cuda_rare = cuda.metadata_eq(category, rare.value);
-    let cpu_weighted_knn = cpu
-        .query_knn(
-            &KnnQuery::new(&origin, 2)
-                .with_weights(&weights_a)
-                .with_candidates(&cpu_rare),
-        )
-        .unwrap();
-    let cuda_weighted_knn = cuda
-        .query_knn(
-            &KnnQuery::new(&origin, 2)
-                .with_weights(&weights_a)
-                .with_candidates(&cuda_rare),
-        )
-        .unwrap();
-    assert_hit_slices_close(
-        "sparse-filtered weighted KNN",
-        &cpu_weighted_knn.hits,
-        &cuda_weighted_knn.hits,
-    );
-
-    // More than 64 work items with k=1 exercises the device argmin path. The
-    // large common offset also guards the direct-delta distance calculation.
-    let mut cpu_large = RingDb::new(RingDbConfig::new(1)).unwrap();
-    let mut cuda_large =
-        RingDb::new(RingDbConfig::new(1).with_backend_preference(BackendPreference::Cuda)).unwrap();
-    for id in 0..130 {
-        let value = match id {
-            0 => 10_000_001.0,
-            1 => 9_999_999.0,
-            _ => 10_001_000.0 + id as f32,
-        };
-        cpu_large.add_vector(&[value], ()).unwrap();
-        cuda_large.add_vector(&[value], ()).unwrap();
-    }
-    let cpu_large = cpu_large.build().unwrap();
-    let cuda_large = cuda_large.build().unwrap();
-    let large_query = [10_000_000.0];
-    let cpu_device_knn = cpu_large
-        .query_knn(&KnnQuery::new(&large_query, 1))
-        .unwrap();
-    let cuda_device_knn = cuda_large
-        .query_knn(&KnnQuery::new(&large_query, 1))
-        .unwrap();
-    assert_hit_slices_close(
-        "device-reduced direct-delta KNN",
-        &cpu_device_knn.hits,
-        &cuda_device_knn.hits,
-    );
-
-    let mut cpu_extreme = RingDb::new(RingDbConfig::new(1)).unwrap();
-    let mut cuda_extreme =
-        RingDb::new(RingDbConfig::new(1).with_backend_preference(BackendPreference::Cuda)).unwrap();
-    for vector in [[f32::MAX], [-f32::MAX]] {
-        cpu_extreme.add_vector(&vector, ()).unwrap();
-        cuda_extreme.add_vector(&vector, ()).unwrap();
-    }
-    let cpu_extreme = cpu_extreme.build().unwrap();
-    let cuda_extreme = cuda_extreme.build().unwrap();
-    let extreme_query = [f32::MAX];
-    let exact_match = DiskQuery::new(&extreme_query, 0.0);
-    assert_cpu_cuda_results(
-        "extreme-coordinate direct-delta disk",
-        cpu_extreme.query_disk(&exact_match).unwrap(),
-        cuda_extreme.query_disk(&exact_match).unwrap(),
-    );
 }
 
 #[test]
@@ -1030,9 +724,10 @@ fn test_persist_and_load_struct_payload() {
         .query(&RingQuery::new(&[1.0f32, 0.0], 1.0, 0.1))
         .unwrap();
 
-    // Vector 0 ([1,0]) is exactly at distance 1.0 from [1,0] = 0; should NOT match.
-    // Vector 1 ([0,1]) is at distance sqrt(2) ≈ 1.414 from [1,0]; should NOT match.
-    // Adjust: query from origin, expecting [1,0] at d=1.
+    // The distances are 0 and sqrt(2), outside the ring [0.9, 1.1].
+    assert!(result.hits.is_empty());
+
+    // Both vectors are at distance 1 from the origin.
     let result2 = loaded
         .query(&RingQuery::new(&[0.0f32, 0.0], 1.0, 0.1))
         .unwrap();
@@ -1055,14 +750,13 @@ fn test_persist_and_load_struct_payload() {
     }
 
     let _ = std::fs::remove_dir_all(&dir);
-    drop(result); // silence unused warning
 }
 
 // ── Pod payload tests ─────────────────────────────────────────────────────────
 
 #[test]
 fn test_pod_payload_roundtrip() {
-    /// A simple fixed-size payload — no heap allocation, no Serde needed.
+    /// A fixed-size payload with no heap allocation.
     #[repr(C)]
     #[derive(Copy, Clone, Pod, Zeroable, Debug, PartialEq)]
     struct GeoPoint {

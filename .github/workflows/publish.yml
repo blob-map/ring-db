@@ -27,7 +27,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Run test suite
-        run: cargo test --all-features --locked
+        run: cargo test --locked
 
       - name: Verify publish ring-db (dry-run)
         run: cargo publish -p ring-db --locked --dry-run

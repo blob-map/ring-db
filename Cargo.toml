@@ -1,8 +1,8 @@
 [package]
 name = "ring-db"
-version = "0.8.1"
+version = "0.9.0"
 edition = "2024"
-description = "Exact CPU and CUDA vector search with ring queries, weighted KNN, and metadata filtering."
+description = "Exact CPU and Vulkan vector search with ring queries, weighted KNN, and metadata filtering."
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/mathias-vandaele/ring-db"
@@ -11,10 +11,6 @@ documentation = "https://docs.rs/ring-db"
 [lib]
 name = "ringdb"
 path = "src/lib.rs"
-
-[features]
-default = []
-cuda = []
 
 [[example]]
 name = "cli"
@@ -25,10 +21,16 @@ name = "query_backends"
 path = "benches/query_backends.rs"
 harness = false
 
+[[bench]]
+name = "backend_compare"
+path = "benches/backend_compare.rs"
+harness = false
+
 [dependencies]
 rayon = "1.11.0"
 thiserror = "2"
 bytemuck = { version = "1", features = ["derive"] }
+ash = { version = "0.38", default-features = false, features = ["loaded", "std"] }
 
 [dev-dependencies]
 criterion = { version = "0.8.2", features = ["html_reports"] }

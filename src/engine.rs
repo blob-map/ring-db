@@ -5,9 +5,7 @@ use std::time::Instant;
 use bytemuck::Pod;
 
 use crate::BackendPreference;
-#[cfg(feature = "cuda")]
-use crate::backend::CudaBackend;
-use crate::backend::{CpuBackend, DiskSpec, RingComputeBackend};
+use crate::backend::{CpuBackend, DiskSpec, RingComputeBackend, VulkanBackend};
 use crate::config::RingDbConfig;
 use crate::error::{Result, RingDbError};
 use crate::metadata::{
@@ -23,18 +21,7 @@ use crate::query::{
 fn make_backend(preference: BackendPreference) -> Result<Box<dyn RingComputeBackend>> {
     match preference {
         BackendPreference::Cpu => Ok(Box::new(CpuBackend::new())),
-        BackendPreference::Cuda => {
-            #[cfg(feature = "cuda")]
-            {
-                Ok(Box::new(CudaBackend::new()?))
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                Err(RingDbError::BackendUnavailable(
-                    "CUDA backend requires building ring-db with the `cuda` feature".to_string(),
-                ))
-            }
-        }
+        BackendPreference::Vulkan => Ok(Box::new(VulkanBackend::new()?)),
     }
 }
 

@@ -11,7 +11,7 @@ ring-db is a Rust 2024 exact vector database. It supports:
 - ordinary L2 and per-query diagonal weighted L2;
 - explicit integer metadata tags compiled into candidate sets;
 - fixed-size Pod payload records with zero-copy reads;
-- CPU and optional CUDA backends;
+- CPU and Vulkan backends selected at runtime;
 - versioned persistence.
 
 The project intentionally avoids general document-database behavior. Payload records are
@@ -25,8 +25,29 @@ payload layout.
 3. Keep cyclomatic complexity low with small preparation and execution helpers.
 4. Keep validation outside hot coordinate loops.
 5. Preserve branch-free unfiltered paths.
-6. Do not make CPU or CUDA kernels interpret user payload layouts.
+6. Do not make compute kernels interpret user payload layouts.
 7. Add functionality only for a demonstrated use case.
+
+## Documentation standard
+
+Always write `README.md` in [ASD-STE100 Simplified Technical English](https://www.asd-ste100.org/).
+Use [Issue 9](https://www.asd-ste100.org/assets/files/ASD-STE100_ISSUE9.pdf), including its dictionary.
+Use approved meanings and parts of speech. Keep instructions active and imperative.
+Limit instruction sentences to 20 words and descriptions to 25 words.
+Give each paragraph one topic and no more than six sentences.
+Use one instruction per sentence, consistent terms, and American English spelling.
+Review meanings as well as sentence length; automated checks cannot establish compliance.
+
+Project technical nouns include backend, candidate set, Cargo, database, dimension,
+driver, filter, GPU, ID, KNN, loader, metadata, payload, Pod, query, shader, and vector.
+Computer-operation verbs include allocate, build, compile, deserialize, execute,
+filter, insert, load, query, return, serialize, sort, update, and upload.
+Keep code identifiers and commands exact. Explain new technical terms at first use.
+Keep the README focused on current usage. Do not add migration files unless requested.
+
+README Rust examples are doctests. `cargo test` compiles all examples and executes
+those without `no_run`. Use complete examples without hidden rustdoc-only lines.
+Keep release versions and commands consistent with `Cargo.toml` and the CLI.
 
 ## Repository map
 
@@ -43,16 +64,18 @@ src/
 └── backend/
     ├── mod.rs         RingComputeBackend contract and DiskSpec
     ├── cpu.rs         Rayon-parallel exact reference backend
-    └── cuda.rs        optional CUDA driver backend and embedded PTX
+    └── vulkan/        Vulkan backend, runtime, and embedded SPIR-V shaders
 
 tests/
 ├── correctness.rs
 ├── metadata_knn.rs
 ├── random.rs
-└── weighted.rs
+├── weighted.rs
+└── vulkan.rs
 
 examples/cli.rs        filtered weighted-KNN example
 benches/query_backends.rs
+benches/backend_compare.rs sequential CPU/Vulkan comparison with raw timing output
 ```
 
 ## Public data model
@@ -133,7 +156,7 @@ Keep this representation private. Backends consume the borrowed `CandidateSetVie
 | `KnnQuery` | exact best `k`, ordered by `(dist_sq, id)` |
 
 All query builders accept `.with_candidates(&set)`. Ring, range, disk, and KNN queries
-also accept `.with_weights(&weights)` directly. Each `DiskQuery` owns its optional weights
+also accept `.with_weights(&weights)` directly. Each `DiskQuery` borrows its optional weights
 and candidate set. The engine intersects candidate sets attached to individual disks with
 the outer intersection query's candidate set before backend dispatch.
 
@@ -144,7 +167,6 @@ The metrics are:
 
 ```text
 ordinary distance: dist_sq = sum((vector[i] - query[i])^2)
-ordinary KNN:    dist_sq = sum((vector[i] - query[i])^2)
 weighted:        dist_sq = sum(weights[i] * (vector[i] - query[i])^2)
 ```
 
@@ -178,19 +200,46 @@ The CPU backend is the correctness reference.
 
 Do not replace the specialized unfiltered paths with a universal per-row predicate.
 
-## CUDA backend
+## Vulkan backend
 
-CUDA is behind the `cuda` feature. The implementation dynamically loads the NVIDIA
-driver, creates a context on device 0, uploads vectors in transposed layout, and keeps
-query execution behind a launch mutex. CPU-only builds have no link-time CUDA dependency.
+CPU and Vulkan are compiled unconditionally. There are no crate features. Select
+`BackendPreference::Cpu` (the default) or `BackendPreference::Vulkan` at runtime.
+Vulkan uses `ash` with a dynamically loaded loader, opened only when Vulkan is
+selected. CPU must work without a Vulkan loader or GPU driver. Explicit Vulkan
+selection returns `BackendUnavailable` if no compatible runtime/device is found.
+No Vulkan SDK or shader compiler is needed by consumers.
 
-CUDA implements the same range-query, candidate-filtering, diagonal-weight, and exact-KNN
-semantics as CPU. KNN must return ascending `(dist_sq, id)` results.
+`src/backend/vulkan/mod.rs` implements the existing backend trait. `runtime.rs`
+owns Vulkan resources and synchronous submissions; its execution mutex serializes
+the queue, command pool, descriptor set, and reusable query buffers shared by
+geometric and KNN queries.
+Geometric queries copy the count in the scan submission and read hits directly
+into an owned Pod `Vec<Hit>`. Buffer capacities grow on demand and remain allocated
+until the backend is dropped; never expose references to this reusable storage.
+Large host copies use up to four workers, including the caller, with scoped
+helper threads. Do not use the caller's Rayon pool while holding the execution
+mutex: work stealing could re-enter the backend. Join all helpers before unmapping
+or reusing readback memory, including when spawning a helper fails.
+Vectors are uploaded transposed once.
+The three scan pipelines specialize All/Sparse/Dense candidate handling. Small-K
+selection uses GPU reductions without 64-bit atomics or subgroup requirements.
+Large-K queries may select on the host. Preserve deterministic `(dist_sq, id)` order
+and zero-weight handling before coordinate subtraction.
 
-Keep CUDA behavior equivalent to CPU within documented floating-point tolerances. Avoid
-host transfers proportional to the full dataset for small KNN results. Do not describe a
-specific CUDA top-K strategy in public documentation unless it is part of the stable
-contract.
+`RINGDB_VULKAN_TIMINGS=1` enables optional GPU timestamps around each submission.
+These measure the GPU command-buffer span, not full query latency. Keep profiling
+disabled for ordinary benchmarks and check compute-queue timestamp support when
+opting in. Do not assume a shader specialization improves performance: compare it
+against the generic path across dimensions, weights, candidates, and selectivity.
+
+Shader sources and precompiled SPIR-V live together in `shaders/`. Regenerate them
+with `sh src/backend/vulkan/shaders/compile.sh` after every source change. This
+development command requires `glslc` and `spirv-val`; Cargo embeds the binaries.
+Buffers must fit `maxStorageBufferRange`; the backend does not chunk datasets.
+
+Run device tests with `RINGDB_VULKAN_TEST=1 cargo test --test vulkan`.
+An explicitly requested device test must fail if Vulkan is unavailable. CI uses
+Mesa software Vulkan so shader execution is covered without a physical GPU.
 
 ## Persistence format
 
@@ -234,22 +283,23 @@ Keep malformed caller input distinct from corrupt persisted data and backend fai
 
 ```bash
 cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-features
+cargo clippy --all-targets -- -D warnings
+cargo test
 
 cargo build --release
-cargo build --release --features cuda
-cargo test --features cuda
 
 RUSTFLAGS="-C target-cpu=native" cargo bench --bench query_backends
 RINGDB_BENCH_N=100000 cargo bench --bench query_backends cpu_knn_f32
 RINGDB_BENCH_N=100000 cargo bench --bench query_backends metadata
+cargo bench --bench backend_compare -- --n 10000000 --dims 64
 
 cargo run --release --example cli -- --n 100000 --dims 64 --k 10 --category 3
 ```
 
-CUDA tests that need a device may be gated by `RINGDB_CUDA_TEST=1`. CUDA benchmarks
-should skip cleanly when the driver or device is unavailable.
+Vulkan tests that need a device are gated by `RINGDB_VULKAN_TEST=1`; the missing-driver
+regression always runs and also verifies CPU queries. Vulkan Criterion benchmarks
+should skip cleanly when the runtime or device is unavailable. `RINGDB_BENCH_N` sets
+both backends’ dataset size; `RINGDB_VULKAN_BENCH_N` overrides Vulkan only.
 
 ## Dependency roles
 
@@ -258,10 +308,11 @@ should skip cleanly when the driver or device is unavailable.
 | `rayon` | CPU data parallelism |
 | `thiserror` | error definitions |
 | `bytemuck` | Pod validation and byte casts |
+| `ash` | Vulkan bindings and runtime loader |
 | `criterion` | benchmarks |
 | `rand` | deterministic benchmark/test data |
 | `clap` | example CLI parsing |
 | `tempfile` | isolated persistence tests |
 
 The release publishes one crate. Keep release scripts and CI aligned with the package
-version and the optional `cuda` feature.
+version. Query semantics and persistence format version 1 do not depend on the backend.

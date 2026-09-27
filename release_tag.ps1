@@ -64,7 +64,7 @@ if ([string]::IsNullOrWhiteSpace($Version)) {
 }
 
 if ($Version.StartsWith("v")) {
-    throw "Pass the Cargo version without a leading 'v' (for example: 0.7.0)."
+    throw "Pass the Cargo version without a leading 'v' (for example: 0.9.0)."
 }
 
 foreach ($tool in @("cargo", "git")) {
@@ -79,17 +79,17 @@ try {
     Invoke-Checked "cargo" @("update")
 
     Write-Host "Pre-release checks..."
-    Invoke-Checked "cargo" @("check", "--all-features")
-    Invoke-Checked "cargo" @("test", "--all-features")
+    Invoke-Checked "cargo" @("check")
+    Invoke-Checked "cargo" @("test")
     Invoke-Checked "cargo" @("fmt")
-    Invoke-Checked "cargo" @("clippy", "--all-targets", "--all-features", "--", "-D", "warnings")
+    Invoke-Checked "cargo" @("clippy", "--all-targets", "--", "-D", "warnings")
 
     Write-Host "Updating Cargo.toml to $Version"
     Update-PackageVersion "Cargo.toml" $Version
 
     Write-Host "Post-version build check..."
-    Invoke-Checked "cargo" @("check", "--all-features")
-    Invoke-Checked "cargo" @("test", "--all-features")
+    Invoke-Checked "cargo" @("check")
+    Invoke-Checked "cargo" @("test")
 
     Invoke-Checked "git" @("add", ".")
     Invoke-Checked "git" @("commit", "-m", "Release v$Version")
