@@ -18,10 +18,17 @@ const RANGE: u32 = 0;
 const INTERSECTION: u32 = 1;
 const KNN: u32 = 2;
 
-// Must match shaders/common.glsl. All fields have scalar 32-bit alignment.
+// Must match shaders/common.glsl. Addresses and reduction offsets come first
+// for 8-byte alignment; reserved makes the final padding explicit for Pod.
 #[repr(C)]
 #[derive(Clone, Copy, Default, Pod, Zeroable)]
 struct Params {
+    vectors: u64,
+    inputs: u64,
+    scratch: u64,
+    output_address: u64,
+    reduce_src: u64,
+    reduce_dst: u64,
     dims: u32,
     rows: u32,
     work_count: u32,
@@ -31,9 +38,15 @@ struct Params {
     lower_sq: f32,
     upper_sq: f32,
     reduce_count: u32,
-    reduce_src: u32,
-    reduce_dst: u32,
     output_index: u32,
+    row_offset: u32,
+    reserved: u32,
+}
+
+struct VectorChunk {
+    buffer: Buffer,
+    offset: usize,
+    rows: usize,
 }
 
 struct PreparedQuery {
@@ -85,10 +98,9 @@ impl ExecutionState {
 pub struct VulkanBackend {
     execution: Mutex<ExecutionState>,
     pipelines: Pipelines,
-    vectors: Option<Buffer>,
+    vectors: Vec<VectorChunk>,
     context: Arc<Context>,
     dims: usize,
-    rows: usize,
 }
 
 impl VulkanBackend {
@@ -96,16 +108,15 @@ impl VulkanBackend {
         let context = Context::new()?;
         let pipelines = Pipelines::new(&context, size_of::<Params>() as u32)?;
         let execution = Mutex::new(ExecutionState {
-            execution: Execution::new(&context, pipelines.descriptors)?,
+            execution: Execution::new(&context)?,
             buffers: None,
         });
         Ok(Self {
             execution,
             pipelines,
-            vectors: None,
+            vectors: Vec::new(),
             context,
             dims: 0,
-            rows: 0,
         })
     }
 
@@ -117,6 +128,7 @@ impl VulkanBackend {
 
     fn prepare(
         &self,
+        chunk: &VectorChunk,
         dims: usize,
         disks: &[DiskSpec<'_>],
         candidates: CandidateSetView<'_>,
@@ -132,30 +144,38 @@ impl VulkanBackend {
             .and_then(|n| n.checked_add(2))
             .and_then(|n| n.checked_mul(disks.len()))
             .ok_or_else(size_error)?;
+        let end = chunk.offset + chunk.rows;
+        let candidates = match candidates {
+            CandidateSetView::Sparse(ids) => {
+                let start = ids.partition_point(|&id| (id as usize) < chunk.offset);
+                let stop = ids.partition_point(|&id| (id as usize) < end);
+                CandidateSetView::Sparse(&ids[start..stop])
+            }
+            other => other,
+        };
+        let first_word = chunk.offset / 32;
+        let candidate_end = end.div_ceil(32);
         let (candidate_mode, work_count, eligible, candidate_words) = match candidates {
-            CandidateSetView::All => (0, self.rows, self.rows, 0),
+            CandidateSetView::All => (0, chunk.rows, chunk.rows, 0),
             CandidateSetView::Empty => (0, 0, 0, 0),
             CandidateSetView::Sparse(ids) => (1, ids.len(), ids.len(), ids.len()),
             CandidateSetView::Dense(words) => {
-                let eligible = words
-                    .iter()
-                    .enumerate()
-                    .map(|(i, word)| {
-                        let remaining = self.rows.saturating_sub(i * 64);
-                        let mask = if remaining >= 64 {
-                            u64::MAX
-                        } else {
-                            (1u64 << remaining) - 1
-                        };
-                        (word & mask).count_ones() as usize
+                let eligible = (first_word..candidate_end)
+                    .map(|i| {
+                        let low = chunk.offset.saturating_sub(i * 32);
+                        let high = (end - i * 32).min(32);
+                        let mask = (u32::MAX >> (32 - high)) & (u32::MAX << low);
+                        (dense_word(words, i) & mask).count_ones() as usize
                     })
                     .sum();
-                (2, self.rows, eligible, self.rows.div_ceil(32))
+                (2, chunk.rows, eligible, candidate_end - first_word)
             }
         };
         let total_words = disk_words
             .checked_add(candidate_words)
             .ok_or_else(size_error)?;
+        // Shader query/candidate indices are u32; byte addresses are u64.
+        u32::try_from(total_words).map_err(|_| size_error())?;
         let input_bytes = word_bytes(total_words)?;
         self.context.check_buffer_size(input_bytes)?;
         let mut data = Vec::with_capacity(total_words);
@@ -179,19 +199,16 @@ impl VulkanBackend {
             CandidateSetView::Dense(words) => {
                 // Explicitly split into low/high u32 words: shaderInt64 is not
                 // required and behavior does not depend on host endianness.
-                data.extend(
-                    words
-                        .iter()
-                        .flat_map(|word| [*word as u32, (word >> 32) as u32])
-                        .take(candidate_words),
-                );
+                data.extend((first_word..candidate_end).map(|i| dense_word(words, i)));
             }
             _ => {}
         }
         Ok(PreparedQuery {
             params: Params {
                 dims: dims as u32,
-                rows: self.rows as u32,
+                rows: chunk.rows as u32,
+                row_offset: chunk.offset as u32,
+                vectors: chunk.buffer.address,
                 work_count: work_count as u32,
                 candidate_offset: disk_words as u32,
                 disk_count: disks.len() as u32,
@@ -203,42 +220,19 @@ impl VulkanBackend {
         })
     }
 
-    fn bind(
-        &self,
-        execution: &mut Execution,
-        inputs: &Buffer,
-        scratch: &Buffer,
-        output: &Buffer,
-    ) -> Result<()> {
-        let vectors = self.vectors.as_ref().ok_or_else(|| {
-            RingDbError::Backend("Vulkan dataset has not been uploaded".to_string())
-        })?;
-        execution.bind_buffers([vectors, inputs, scratch, output]);
-        Ok(())
-    }
-
     fn dispatch(
         &self,
         cmd: vk::CommandBuffer,
-        set: vk::DescriptorSet,
         pipeline: vk::Pipeline,
         params: &Params,
         count: u32,
     ) {
-        // SAFETY: the execution mutex protects the live set and command buffer;
-        // all bound resources outlive the synchronous submission.
+        // SAFETY: the mutex protects the command buffer. All buffers referenced
+        // by the pushed addresses outlive the synchronous submission.
         unsafe {
             self.context
                 .device
                 .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
-            self.context.device.cmd_bind_descriptor_sets(
-                cmd,
-                vk::PipelineBindPoint::COMPUTE,
-                self.pipelines.layout,
-                0,
-                &[set],
-                &[],
-            );
             self.context.device.cmd_push_constants(
                 cmd,
                 self.pipelines.layout,
@@ -273,9 +267,10 @@ impl VulkanBackend {
         mode: u32,
         lower: f32,
         upper: f32,
-    ) -> Result<Vec<Hit>> {
+        hits: &mut Vec<Hit>,
+    ) -> Result<()> {
         if query.eligible == 0 {
-            return Ok(Vec::new());
+            return Ok(());
         }
         query.params.mode = mode;
         query.params.lower_sq = lower * lower;
@@ -290,13 +285,9 @@ impl VulkanBackend {
         buffers.inputs.grow(word_bytes(query.inputs.len())?)?;
         buffers.inputs.write(bytemuck::cast_slice(&query.inputs))?;
         buffers.output.grow(word_bytes(output_words)?)?;
-        self.bind(
-            execution,
-            &buffers.inputs,
-            &buffers.scratch,
-            &buffers.output,
-        )?;
-        let set = execution.set;
+        query.params.inputs = buffers.inputs.address;
+        query.params.scratch = buffers.scratch.address;
+        query.params.output_address = buffers.output.address;
         execution.run(
             if mode == INTERSECTION {
                 "intersection"
@@ -319,7 +310,6 @@ impl VulkanBackend {
                 );
                 self.dispatch(
                     cmd,
-                    set,
                     self.pipelines.scan[query.candidate_mode],
                     &query.params,
                     query.params.work_count,
@@ -350,7 +340,13 @@ impl VulkanBackend {
                 "Vulkan returned an invalid hit count".to_string(),
             ));
         }
-        self.readback(execution, &buffers.output, &mut buffers.readback, 4, count)
+        if count != 0 {
+            let bytes = count.checked_mul(size_of::<Hit>()).ok_or_else(size_error)?;
+            buffers.readback.grow(bytes)?;
+            execution.copy(&buffers.output, 4, &buffers.readback, bytes)?;
+            buffers.readback.read_into(hits, count)?;
+        }
+        Ok(())
     }
 
     fn knn(&self, mut query: PreparedQuery, k: usize) -> Result<Vec<Hit>> {
@@ -376,17 +372,12 @@ impl VulkanBackend {
         })?;
         buffers.inputs.grow(word_bytes(query.inputs.len())?)?;
         buffers.inputs.write(bytemuck::cast_slice(&query.inputs))?;
-        self.bind(
-            execution,
-            &buffers.inputs,
-            &buffers.scratch,
-            &buffers.output,
-        )?;
-        let set = execution.set;
+        query.params.inputs = buffers.inputs.address;
+        query.params.scratch = buffers.scratch.address;
+        query.params.output_address = buffers.output.address;
         execution.run("knn", |cmd| {
             self.dispatch(
                 cmd,
-                set,
                 self.pipelines.scan[query.candidate_mode],
                 &query.params,
                 work,
@@ -398,31 +389,25 @@ impl VulkanBackend {
             for index in 0..k {
                 let mut params = query.params;
                 params.reduce_count = work;
-                params.reduce_src = INVALID;
-                params.reduce_dst = distance_words as u32;
+                params.reduce_src = u64::MAX;
+                params.reduce_dst = distance_words as u64;
                 params.output_index = index as u32;
                 loop {
-                    self.dispatch(
-                        cmd,
-                        set,
-                        self.pipelines.reduce,
-                        &params,
-                        params.reduce_count,
-                    );
+                    self.dispatch(cmd, self.pipelines.reduce, &params, params.reduce_count);
                     compute_barrier(&self.context, cmd);
                     let remaining = params.reduce_count.div_ceil(WORKGROUP_SIZE);
                     if remaining == 1 {
                         break;
                     }
                     params.reduce_src = params.reduce_dst;
-                    params.reduce_dst = if params.reduce_dst == distance_words as u32 {
-                        distance_words as u32 + groups
+                    params.reduce_dst = if params.reduce_dst == distance_words as u64 {
+                        distance_words as u64 + u64::from(groups)
                     } else {
-                        distance_words as u32
+                        distance_words as u64
                     };
                     params.reduce_count = remaining;
                 }
-                self.dispatch(cmd, set, self.pipelines.take, &params, 1);
+                self.dispatch(cmd, self.pipelines.take, &params, 1);
                 compute_barrier(&self.context, cmd);
             }
         })?;
@@ -443,11 +428,7 @@ impl VulkanBackend {
                 "Vulkan KNN returned fewer candidates than expected".to_string(),
             ));
         }
-        hits.sort_unstable_by(|a, b| {
-            a.dist_sq
-                .total_cmp(&b.dist_sq)
-                .then_with(|| a.id.cmp(&b.id))
-        });
+        hits.sort_unstable_by(hit_order);
         hits.truncate(k);
         Ok(hits)
     }
@@ -468,25 +449,54 @@ impl RingComputeBackend for VulkanBackend {
         if rows > u32::MAX as usize {
             return Err(size_error());
         }
-        let bytes = word_bytes(vectors.len())?;
-        self.context.check_buffer_size(bytes)?;
-        // Adjacent invocations process adjacent rows. Transposing once makes
-        // their coordinate reads contiguous for all subsequent queries.
-        let mut transposed = vec![0.0f32; vectors.len()];
-        for (id, row) in vectors.chunks_exact(dims).enumerate() {
-            for (dim, value) in row.iter().enumerate() {
-                transposed[dim * rows + id] = *value;
+        let limit = usize::try_from(self.context.allocation_limit).unwrap_or(usize::MAX);
+        // Optional smaller chunks exercise the same path in tests and benchmarks
+        // without requiring multi-GiB datasets. Never override device limits.
+        let vector_limit = match std::env::var("RINGDB_VULKAN_CHUNK_BYTES") {
+            Ok(value) => value
+                .parse::<usize>()
+                .ok()
+                .filter(|&n| n > 0)
+                .ok_or_else(|| {
+                    RingDbError::Backend(
+                        "RINGDB_VULKAN_CHUNK_BYTES must be a positive byte count".into(),
+                    )
+                })?
+                .min(limit),
+            Err(std::env::VarError::NotPresent) => limit,
+            Err(error) => return Err(RingDbError::Backend(error.to_string())),
+        };
+        let chunk_rows = chunk_row_limit(dims, vector_limit, limit)?;
+        let mut chunks = Vec::new();
+        for offset in (0..rows.max(1)).step_by(chunk_rows) {
+            let count = (rows - offset).min(chunk_rows);
+            let source = &vectors[offset * dims..(offset + count) * dims];
+            let bytes = word_bytes(source.len())?;
+            // Transpose each chunk independently; coordinate reads stay
+            // contiguous and temporary host storage is bounded by one chunk.
+            let mut transposed = vec![0.0f32; source.len()];
+            for (id, row) in source.chunks_exact(dims).enumerate() {
+                for (dim, value) in row.iter().enumerate() {
+                    transposed[dim * count + id] = *value;
+                }
             }
+            let mut staging = Buffer::new(&self.context, bytes, true)?;
+            staging.write(bytemuck::cast_slice(&transposed))?;
+            drop(transposed);
+            let buffer = Buffer::new(&self.context, bytes, false)?;
+            if bytes != 0 {
+                self.execution()?
+                    .execution
+                    .copy(&staging, 0, &buffer, bytes)?;
+            }
+            chunks.push(VectorChunk {
+                buffer,
+                offset,
+                rows: count,
+            });
         }
-        let mut staging = Buffer::new(&self.context, bytes, true)?;
-        staging.write(bytemuck::cast_slice(&transposed))?;
-        let device = Buffer::new(&self.context, bytes, false)?;
-        self.execution()?
-            .execution
-            .copy(&staging, 0, &device, bytes)?;
-        self.vectors = Some(device);
+        self.vectors = chunks;
         self.dims = dims;
-        self.rows = rows;
         Ok(())
     }
 
@@ -504,12 +514,17 @@ impl RingComputeBackend for VulkanBackend {
             weights,
             d_max,
         };
-        self.geometric(
-            self.prepare(dims, &[disk], candidates)?,
-            RANGE,
-            d_min,
-            d_max,
-        )
+        let mut hits = Vec::new();
+        for chunk in &self.vectors {
+            self.geometric(
+                self.prepare(chunk, dims, &[disk], candidates)?,
+                RANGE,
+                d_min,
+                d_max,
+                &mut hits,
+            )?;
+        }
+        Ok(hits)
     }
 
     fn disk_query_f32(
@@ -534,12 +549,17 @@ impl RingComputeBackend for VulkanBackend {
                 "disk intersection requires at least one disk".to_string(),
             ));
         }
-        self.geometric(
-            self.prepare(dims, disks, candidates)?,
-            INTERSECTION,
-            0.0,
-            0.0,
-        )
+        let mut hits = Vec::new();
+        for chunk in &self.vectors {
+            self.geometric(
+                self.prepare(chunk, dims, disks, candidates)?,
+                INTERSECTION,
+                0.0,
+                0.0,
+                &mut hits,
+            )?;
+        }
+        Ok(hits)
     }
 
     fn knn_query_f32(
@@ -555,7 +575,23 @@ impl RingComputeBackend for VulkanBackend {
             weights,
             d_max: 0.0,
         };
-        self.knn(self.prepare(dims, &[disk], candidates)?, k)
+        let mut hits = Vec::new();
+        for chunk in &self.vectors {
+            let mut next = self.knn(self.prepare(chunk, dims, &[disk], candidates)?, k)?;
+            if hits.is_empty() {
+                hits = next;
+            } else {
+                hits.append(&mut next);
+                if hits.len() > k {
+                    hits.select_nth_unstable_by(k, hit_order);
+                    hits.truncate(k);
+                }
+            }
+        }
+        if self.vectors.len() > 1 {
+            hits.sort_unstable_by(hit_order);
+        }
+        Ok(hits)
     }
 }
 
@@ -565,4 +601,67 @@ fn size_error() -> RingDbError {
 
 fn word_bytes(words: usize) -> Result<usize> {
     words.checked_mul(4).ok_or_else(size_error)
+}
+
+fn dense_word(words: &[u64], index: usize) -> u32 {
+    (words[index / 2] >> ((index % 2) * 32)) as u32
+}
+
+fn hit_order(a: &Hit, b: &Hit) -> std::cmp::Ordering {
+    a.dist_sq
+        .total_cmp(&b.dist_sq)
+        .then_with(|| a.id.cmp(&b.id))
+}
+
+fn chunk_row_limit(dims: usize, vector_bytes: usize, buffer_bytes: usize) -> Result<usize> {
+    let row_bytes = word_bytes(dims)?;
+    let words = buffer_bytes / 4;
+    // Geometry needs a count plus two words per hit. KNN needs two words
+    // per distance plus two workgroup-reduction regions. Bound both, even
+    // for low dimensions where vector storage would permit more rows.
+    let mut rows = (vector_bytes / row_bytes)
+        .min(words.saturating_sub(1) / 2)
+        .min(u32::MAX as usize);
+    let groups = rows.div_ceil(WORKGROUP_SIZE as usize);
+    rows = rows.min(words.saturating_sub(2 * groups) / 2);
+    if rows == 0 {
+        return Err(RingDbError::Backend(
+            "Vulkan buffer limit cannot fit one vector and its query workspace".into(),
+        ));
+    }
+    Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chunk_limits_cover_vectors_results_and_reductions() {
+        for limit in [16, 1024, 128 * 1024 * 1024, u32::MAX as usize] {
+            for dims in [1, 2, 3, 64, 129, 4096] {
+                if let Ok(rows) = chunk_row_limit(dims, limit, limit) {
+                    assert!(rows * dims * 4 <= limit);
+                    assert!((1 + 2 * rows) * 4 <= limit);
+                    assert!((2 * rows + 2 * rows.div_ceil(128)) * 4 <= limit);
+                } else {
+                    assert!(dims * 4 > limit || limit < 16);
+                }
+            }
+        }
+        let rows = chunk_row_limit(64, u32::MAX as usize, u32::MAX as usize).unwrap();
+        assert_eq!(rows, 16_777_215);
+        assert_eq!(32_124_552usize.div_ceil(rows), 2);
+        assert!(chunk_row_limit(64, 255, u32::MAX as usize).is_err());
+        #[cfg(target_pointer_width = "64")]
+        {
+            // Device addresses remove the storage-binding range limit. A
+            // sufficiently large allocation fits France in one chunk.
+            let rows = chunk_row_limit(64, usize::MAX, usize::MAX).unwrap();
+            assert_eq!(rows, u32::MAX as usize);
+            assert_eq!(32_124_552usize.div_ceil(rows), 1);
+            // Low-dimensional scratch/output also uses 64-bit addresses.
+            assert_eq!(chunk_row_limit(1, usize::MAX, usize::MAX).unwrap(), rows);
+        }
+    }
 }

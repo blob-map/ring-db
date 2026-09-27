@@ -6,16 +6,16 @@
 layout(constant_id = 0) const uint CANDIDATE_MODE = 0;
 
 float weighted_step(uint id, uint coord, uint query_offset, float sum) {
-    float weight = uintBitsToFloat(inputs[query_offset + p.dims + coord]);
+    float weight = uintBitsToFloat(input_word(query_offset + p.dims + coord));
     if (weight == 0.0) return sum;
-    float delta = vectors[coord * p.rows + id]
-        - uintBitsToFloat(inputs[query_offset + coord]);
+    float delta = vector_value(id, coord)
+        - uintBitsToFloat(input_word(query_offset + coord));
     return fma(weight, delta * delta, sum);
 }
 
 float ordinary_step(uint id, uint coord, uint query_offset, float sum) {
-    float delta = vectors[coord * p.rows + id]
-        - uintBitsToFloat(inputs[query_offset + coord]);
+    float delta = vector_value(id, coord)
+        - uintBitsToFloat(input_word(query_offset + coord));
     return fma(delta, delta, sum);
 }
 
@@ -25,7 +25,7 @@ float distance_sq(uint id, uint disk) {
     precise vec4 sums = vec4(0.0);
     uint aligned_dims = p.dims & ~3u;
     uint i = 0u;
-    if (inputs[offset] != 0u) {
+    if (input_word(offset) != 0u) {
         for (; i < aligned_dims; i += 4u) {
             sums.x = weighted_step(id, i, query_offset, sums.x);
             sums.y = weighted_step(id, i + 1u, query_offset, sums.y);
@@ -48,34 +48,37 @@ float distance_sq(uint id, uint disk) {
 }
 
 void main() {
-    uint slot = group_index() * 128u + gl_LocalInvocationID.x;
+    uint group = group_index();
+    if (group >= group_count(p.work_count)) return;
+    uint slot = group * 128u + gl_LocalInvocationID.x;
     if (slot >= p.work_count) return;
     if (p.mode == 2u) {
-        scratch[2u * slot] = INVALID;
-        scratch[2u * slot + 1u] = 0x7f800000u;
+        scratch_word(2ul * slot).value = INVALID;
+        scratch_word(2ul * slot + 1u).value = 0x7f800000u;
     }
     uint id = slot;
-    if (CANDIDATE_MODE == 1u) id = inputs[p.candidate_offset + slot];
+    if (CANDIDATE_MODE == 1u) id = input_word(p.candidate_offset + slot) - p.row_offset;
     if (CANDIDATE_MODE == 2u) {
-        uint bits = inputs[p.candidate_offset + id / 32u];
-        if ((bits & (1u << (id % 32u))) == 0u) return;
+        uint bit_id = id + p.row_offset % 32u;
+        uint bits = input_word(p.candidate_offset + bit_id / 32u);
+        if ((bits & (1u << (bit_id % 32u))) == 0u) return;
     }
     float first = distance_sq(id, 0u);
     if (p.mode == 2u) {
-        scratch[2u * slot] = id;
-        scratch[2u * slot + 1u] = floatBitsToUint(first);
+        scratch_word(2ul * slot).value = id + p.row_offset;
+        scratch_word(2ul * slot + 1u).value = floatBitsToUint(first);
         return;
     }
     if (p.mode == 0u) {
         if (!(first >= p.lower_sq && first <= p.upper_sq)) return;
     } else {
-        if (first > uintBitsToFloat(inputs[1])) return;
+        if (first > uintBitsToFloat(input_word(1))) return;
         for (uint disk = 1u; disk < p.disk_count; ++disk) {
-            float upper_sq = uintBitsToFloat(inputs[disk * (2u + 2u * p.dims) + 1u]);
+            float upper_sq = uintBitsToFloat(input_word(disk * (2u + 2u * p.dims) + 1u));
             if (distance_sq(id, disk) > upper_sq) return;
         }
     }
-    uint dst = atomicAdd(output_words[0], 1u);
-    output_words[1u + 2u * dst] = id;
-    output_words[2u + 2u * dst] = floatBitsToUint(first);
+    uint dst = atomicAdd(output_word(0).value, 1u);
+    output_word(1u + 2ul * dst).value = id + p.row_offset;
+    output_word(2u + 2ul * dst).value = floatBitsToUint(first);
 }

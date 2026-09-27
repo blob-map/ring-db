@@ -351,7 +351,7 @@ fn report(samples: &[f64]) -> String {
 fn vulkan_devices() -> BenchResult<()> {
     // This read-only probe creates no device or buffers.
     let entry = unsafe { Entry::load()? };
-    let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_0);
+    let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_2);
     let instance = unsafe {
         entry.create_instance(
             &vk::InstanceCreateInfo::default().application_info(&app),
@@ -363,11 +363,31 @@ fn vulkan_devices() -> BenchResult<()> {
             let props = unsafe { instance.get_physical_device_properties(physical) };
             let name = unsafe { std::ffi::CStr::from_ptr(props.device_name.as_ptr()) };
             println!(
-                "Vulkan device: {} (vendor={:#x}, device={:#x}, maxStorageBufferRange={} bytes)",
+                "Vulkan device: {} (vendor={:#x}, device={:#x}, API={}.{}.{})",
                 name.to_string_lossy(),
                 props.vendor_id,
                 props.device_id,
-                props.limits.max_storage_buffer_range
+                vk::api_version_major(props.api_version),
+                vk::api_version_minor(props.api_version),
+                vk::api_version_patch(props.api_version),
+            );
+            if props.api_version < vk::API_VERSION_1_2 {
+                println!("Unsupported: Vulkan 1.2 or newer is required.");
+                continue;
+            }
+            let mut address = vk::PhysicalDeviceBufferDeviceAddressFeatures::default();
+            let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut address);
+            unsafe { instance.get_physical_device_features2(physical, &mut features) };
+            let int64 = features.features.shader_int64;
+            let mut allocation = vk::PhysicalDeviceMaintenance3Properties::default();
+            let mut properties =
+                vk::PhysicalDeviceProperties2::default().push_next(&mut allocation);
+            unsafe { instance.get_physical_device_properties2(physical, &mut properties) };
+            println!(
+                "bufferDeviceAddress={}, shaderInt64={}, maxMemoryAllocationSize={} bytes",
+                address.buffer_device_address == vk::TRUE,
+                int64 == vk::TRUE,
+                allocation.max_memory_allocation_size
             );
         }
         Ok(())
@@ -430,6 +450,9 @@ fn main() -> BenchResult<()> {
         "Geometric radius scale={}; intersection shift={}",
         args.radius_scale, args.intersection_shift
     );
+    if let Ok(bytes) = std::env::var("RINGDB_VULKAN_CHUNK_BYTES") {
+        println!("Vulkan vector-buffer byte cap: {bytes}");
+    }
     if args.backend != Backend::Both {
         println!("Single-backend run: cross-backend correctness checks are disabled.");
     }

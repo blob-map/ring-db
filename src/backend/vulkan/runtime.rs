@@ -1,5 +1,5 @@
 //! Vulkan ownership and synchronous submissions. A backend's execution mutex
-//! serializes queue, descriptor-set, and command-pool access. Every submission
+//! serializes queue and command-pool access. Every submission
 //! completes before its buffers can be freed or mapped by the host.
 use std::io::Cursor;
 use std::mem::MaybeUninit;
@@ -79,6 +79,7 @@ pub(super) struct Context {
     queue: vk::Queue,
     queue_family: u32,
     pub limits: vk::PhysicalDeviceLimits,
+    pub allocation_limit: u64,
     memory: vk::PhysicalDeviceMemoryProperties,
     timestamp_bits: u32,
     _instance: Instance,
@@ -88,9 +89,15 @@ impl Context {
     pub fn new() -> Result<Arc<Self>> {
         // SAFETY: Entry owns the loader and outlives all derived handles.
         let entry = unsafe { Entry::load() }.map_err(unavailable)?;
+        let version = unsafe { entry.try_enumerate_instance_version() }
+            .map_err(unavailable)?
+            .unwrap_or(vk::API_VERSION_1_0);
+        if version < vk::API_VERSION_1_2 {
+            return Err(unavailable("Vulkan 1.2 or newer is required"));
+        }
         let app = vk::ApplicationInfo::default()
             .application_name(c"ring-db")
-            .api_version(vk::API_VERSION_1_0);
+            .api_version(vk::API_VERSION_1_2);
         let info = vk::InstanceCreateInfo::default().application_info(&app);
         // SAFETY: all pointers in info refer to live values for this call.
         let raw = unsafe { entry.create_instance(&info, None) }.map_err(unavailable)?;
@@ -101,6 +108,29 @@ impl Context {
         for physical in devices {
             // SAFETY: physical was enumerated from this instance.
             let props = unsafe { instance.raw.get_physical_device_properties(physical) };
+            if props.api_version < vk::API_VERSION_1_2 {
+                continue;
+            }
+            let mut address_features = vk::PhysicalDeviceBufferDeviceAddressFeatures::default();
+            let mut features =
+                vk::PhysicalDeviceFeatures2::default().push_next(&mut address_features);
+            unsafe {
+                instance
+                    .raw
+                    .get_physical_device_features2(physical, &mut features)
+            };
+            let int64 = features.features.shader_int64;
+            if address_features.buffer_device_address != vk::TRUE || int64 != vk::TRUE {
+                continue;
+            }
+            let mut memory_limits = vk::PhysicalDeviceMaintenance3Properties::default();
+            let mut properties =
+                vk::PhysicalDeviceProperties2::default().push_next(&mut memory_limits);
+            unsafe {
+                instance
+                    .raw
+                    .get_physical_device_properties2(physical, &mut properties)
+            };
             let families = unsafe {
                 instance
                     .raw
@@ -108,8 +138,6 @@ impl Context {
             };
             if props.limits.max_compute_work_group_invocations < WORKGROUP_SIZE
                 || props.limits.max_compute_work_group_size[0] < WORKGROUP_SIZE
-                || props.limits.max_per_stage_descriptor_storage_buffers < 4
-                || props.limits.max_descriptor_set_storage_buffers < 4
             {
                 continue;
             }
@@ -129,19 +157,28 @@ impl Context {
                     family as u32,
                     props.limits,
                     families[family].timestamp_valid_bits,
+                    memory_limits.max_memory_allocation_size,
                 ));
             }
         }
         choices.sort_by_key(|choice| choice.0);
-        let mut failure = "no compatible compute device".to_string();
-        for (_, physical, queue_family, limits, timestamp_bits) in choices {
+        let mut failure =
+            "requires a Vulkan 1.2 compute device with bufferDeviceAddress and shaderInt64"
+                .to_string();
+        for (_, physical, queue_family, limits, timestamp_bits, allocation_limit) in choices {
             let priorities = [1.0];
             let queues = [vk::DeviceQueueCreateInfo::default()
                 .queue_family_index(queue_family)
                 .queue_priorities(&priorities)];
-            let info = vk::DeviceCreateInfo::default().queue_create_infos(&queues);
-            // SAFETY: queue family and counts were checked; no optional features
-            // or extensions are used by the embedded Vulkan 1.0 shaders.
+            let features = vk::PhysicalDeviceFeatures::default().shader_int64(true);
+            let mut address_features = vk::PhysicalDeviceBufferDeviceAddressFeatures::default()
+                .buffer_device_address(true);
+            let info = vk::DeviceCreateInfo::default()
+                .queue_create_infos(&queues)
+                .enabled_features(&features)
+                .push_next(&mut address_features);
+            // SAFETY: Vulkan 1.2, the queue family, and both requested features
+            // were checked above. No device extensions are required.
             let device = match unsafe { instance.raw.create_device(physical, &info, None) } {
                 Ok(device) => device,
                 Err(error) => {
@@ -156,6 +193,7 @@ impl Context {
                 queue,
                 queue_family,
                 limits,
+                allocation_limit,
                 memory,
                 timestamp_bits,
                 _instance: instance,
@@ -165,10 +203,10 @@ impl Context {
     }
 
     pub fn check_buffer_size(&self, size: usize) -> Result<()> {
-        if size as u64 > u64::from(self.limits.max_storage_buffer_range) {
+        if size as u64 > self.allocation_limit {
             return Err(backend_error(format!(
-                "buffer requires {size} bytes, device storage-buffer limit is {} bytes",
-                self.limits.max_storage_buffer_range,
+                "buffer requires {size} bytes, device allocation limit is {} bytes",
+                self.allocation_limit,
             )));
         }
         Ok(())
@@ -215,8 +253,8 @@ impl Context {
         let groups = count.div_ceil(WORKGROUP_SIZE);
         let x = groups.min(self.limits.max_compute_work_group_count[0]);
         let y = groups.div_ceil(x);
-        // Buffer limits bound count to far below the Vulkan minimum 2D dispatch
-        // capacity. Shaders flatten group coordinates and discard padded groups.
+        // A u32 row count fits the Vulkan minimum 2D dispatch capacity. Shaders
+        // discard padded groups before multiplying the group index by 128.
         debug_assert!(y <= self.limits.max_compute_work_group_count[1]);
         unsafe { self.device.cmd_dispatch(cmd, x, y, 1) };
     }
@@ -235,6 +273,7 @@ pub(super) struct Buffer {
     pub raw: vk::Buffer,
     memory: vk::DeviceMemory,
     pub size: usize,
+    pub address: vk::DeviceAddress,
     host: bool,
     coherent: bool,
 }
@@ -248,13 +287,14 @@ impl Buffer {
             raw: vk::Buffer::null(),
             memory: vk::DeviceMemory::null(),
             size,
+            address: 0,
             host,
             coherent: false,
         };
         let info = vk::BufferCreateInfo::default()
             .size(size as u64)
             .usage(
-                vk::BufferUsageFlags::STORAGE_BUFFER
+                vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
                     | vk::BufferUsageFlags::TRANSFER_SRC
                     | vk::BufferUsageFlags::TRANSFER_DST,
             )
@@ -267,12 +307,20 @@ impl Buffer {
                 .create_buffer(&info, None)
                 .map_err(backend_error)?;
             let requirements = context.device.get_buffer_memory_requirements(buffer.raw);
+            if requirements.size > context.allocation_limit {
+                return Err(backend_error(
+                    "aligned buffer allocation exceeds device limit",
+                ));
+            }
             let (memory_type, coherent) =
                 context.memory_type(requirements.memory_type_bits, host)?;
             buffer.coherent = coherent;
+            let mut flags = vk::MemoryAllocateFlagsInfo::default()
+                .flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
             let allocation = vk::MemoryAllocateInfo::default()
                 .allocation_size(requirements.size)
-                .memory_type_index(memory_type);
+                .memory_type_index(memory_type)
+                .push_next(&mut flags);
             buffer.memory = context
                 .device
                 .allocate_memory(&allocation, None)
@@ -281,6 +329,9 @@ impl Buffer {
                 .device
                 .bind_buffer_memory(buffer.raw, buffer.memory, 0)
                 .map_err(backend_error)?;
+            buffer.address = context.device.get_buffer_device_address(
+                &vk::BufferDeviceAddressInfo::default().buffer(buffer.raw),
+            );
         }
         Ok(buffer)
     }
@@ -322,13 +373,20 @@ impl Buffer {
     }
 
     pub fn read<T: bytemuck::Pod>(&self, count: usize) -> Result<Vec<T>> {
+        let mut values = Vec::new();
+        self.read_into(&mut values, count)?;
+        Ok(values)
+    }
+
+    pub fn read_into<T: bytemuck::Pod>(&self, values: &mut Vec<T>, count: usize) -> Result<()> {
         if !self.host || size_of::<T>() == 0 || count > self.size / size_of::<T>() {
             return Err(backend_error("invalid host buffer read"));
         }
         if count == 0 {
-            return Ok(Vec::new());
+            return Ok(());
         }
-        let mut values: Vec<T> = Vec::with_capacity(count);
+        let start = values.len();
+        values.reserve(count);
         // SAFETY: readbacks are fence-complete before mapping. Pod permits every
         // copied bit pattern. Copy directly into the final Vec's spare capacity
         // and initialize its length only after all bytes have been written.
@@ -351,23 +409,17 @@ impl Buffer {
                 let bytes = count * size_of::<T>();
                 let source = std::slice::from_raw_parts(ptr.cast::<u8>(), bytes);
                 let destination = std::slice::from_raw_parts_mut(
-                    values.as_mut_ptr().cast::<MaybeUninit<u8>>(),
+                    values.as_mut_ptr().add(start).cast::<MaybeUninit<u8>>(),
                     bytes,
                 );
                 copy_readback(source, destination)?;
-                values.set_len(count);
+                values.set_len(start + count);
                 Ok(())
             })();
             self.context.device.unmap_memory(self.memory);
             result?;
         }
-        Ok(values)
-    }
-
-    fn descriptor(&self) -> vk::DescriptorBufferInfo {
-        vk::DescriptorBufferInfo::default()
-            .buffer(self.raw)
-            .range(self.size as u64)
+        Ok(())
     }
 }
 
@@ -384,7 +436,6 @@ impl Drop for Buffer {
 
 pub(super) struct Pipelines {
     context: Arc<Context>,
-    pub descriptors: vk::DescriptorSetLayout,
     pub layout: vk::PipelineLayout,
     pub scan: [vk::Pipeline; 3],
     pub reduce: vk::Pipeline,
@@ -395,36 +446,18 @@ impl Pipelines {
     pub fn new(context: &Arc<Context>, push_size: u32) -> Result<Self> {
         let mut pipelines = Self {
             context: context.clone(),
-            descriptors: vk::DescriptorSetLayout::null(),
             layout: vk::PipelineLayout::null(),
             scan: [vk::Pipeline::null(); 3],
             reduce: vk::Pipeline::null(),
             take: vk::Pipeline::null(),
         };
-        let bindings: Vec<_> = (0..4)
-            .map(|binding| {
-                vk::DescriptorSetLayoutBinding::default()
-                    .binding(binding)
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .descriptor_count(1)
-                    .stage_flags(vk::ShaderStageFlags::COMPUTE)
-            })
-            .collect();
-        let info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
-        // SAFETY: layouts describe the four storage buffers and the shared
-        // Params ABI used by all three checked-in shaders.
+        // SAFETY: the push constants match the shared Params ABI. Buffer
+        // device addresses are passed directly; there are no descriptor sets.
         unsafe {
-            pipelines.descriptors = context
-                .device
-                .create_descriptor_set_layout(&info, None)
-                .map_err(backend_error)?;
-            let layouts = [pipelines.descriptors];
             let push = [vk::PushConstantRange::default()
                 .stage_flags(vk::ShaderStageFlags::COMPUTE)
                 .size(push_size)];
-            let info = vk::PipelineLayoutCreateInfo::default()
-                .set_layouts(&layouts)
-                .push_constant_ranges(&push);
+            let info = vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&push);
             pipelines.layout = context
                 .device
                 .create_pipeline_layout(&info, None)
@@ -442,7 +475,7 @@ impl Pipelines {
     fn create(&self, bytes: &[u8], candidate_mode: Option<u32>) -> Result<vk::Pipeline> {
         let code = ash::util::read_spv(&mut Cursor::new(bytes)).map_err(backend_error)?;
         let info = vk::ShaderModuleCreateInfo::default().code(&code);
-        // SAFETY: SPIR-V is compiled and validated for Vulkan 1.0. The module is
+        // SAFETY: SPIR-V is compiled and validated for Vulkan 1.2. The module is
         // destroyed after pipeline creation on both success and failure paths.
         unsafe {
             let shader = self
@@ -496,9 +529,6 @@ impl Drop for Pipelines {
             self.context
                 .device
                 .destroy_pipeline_layout(self.layout, None);
-            self.context
-                .device
-                .destroy_descriptor_set_layout(self.descriptors, None);
         }
     }
 }
@@ -508,20 +538,16 @@ pub(super) struct Execution {
     pool: vk::CommandPool,
     command: vk::CommandBuffer,
     fence: vk::Fence,
-    descriptors: vk::DescriptorPool,
-    pub set: vk::DescriptorSet,
     timestamps: vk::QueryPool,
 }
 
 impl Execution {
-    pub fn new(context: &Arc<Context>, layout: vk::DescriptorSetLayout) -> Result<Self> {
+    pub fn new(context: &Arc<Context>) -> Result<Self> {
         let mut execution = Self {
             context: context.clone(),
             pool: vk::CommandPool::null(),
             command: vk::CommandBuffer::null(),
             fence: vk::Fence::null(),
-            descriptors: vk::DescriptorPool::null(),
-            set: vk::DescriptorSet::null(),
             timestamps: vk::QueryPool::null(),
         };
         unsafe {
@@ -543,24 +569,6 @@ impl Execution {
                 .device
                 .create_fence(&vk::FenceCreateInfo::default(), None)
                 .map_err(backend_error)?;
-            let sizes = [vk::DescriptorPoolSize::default()
-                .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(4)];
-            let info = vk::DescriptorPoolCreateInfo::default()
-                .max_sets(1)
-                .pool_sizes(&sizes);
-            execution.descriptors = context
-                .device
-                .create_descriptor_pool(&info, None)
-                .map_err(backend_error)?;
-            let layouts = [layout];
-            let info = vk::DescriptorSetAllocateInfo::default()
-                .descriptor_pool(execution.descriptors)
-                .set_layouts(&layouts);
-            execution.set = context
-                .device
-                .allocate_descriptor_sets(&info)
-                .map_err(backend_error)?[0];
             if std::env::var_os("RINGDB_VULKAN_TIMINGS").is_some() {
                 if context.timestamp_bits == 0 || context.limits.timestamp_period <= 0.0 {
                     return Err(backend_error(
@@ -579,23 +587,6 @@ impl Execution {
             }
         }
         Ok(execution)
-    }
-
-    pub fn bind_buffers(&mut self, buffers: [&Buffer; 4]) {
-        let infos = buffers.map(|buffer| [buffer.descriptor()]);
-        let writes: Vec<_> = infos
-            .iter()
-            .enumerate()
-            .map(|(binding, info)| {
-                vk::WriteDescriptorSet::default()
-                    .dst_set(self.set)
-                    .dst_binding(binding as u32)
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .buffer_info(info)
-            })
-            .collect();
-        // SAFETY: the execution mutex is held and previous submissions finished.
-        unsafe { self.context.device.update_descriptor_sets(&writes, &[]) };
     }
 
     pub fn run(&mut self, label: &str, record: impl FnOnce(vk::CommandBuffer)) -> Result<()> {
@@ -699,9 +690,6 @@ impl Drop for Execution {
             self.context
                 .device
                 .destroy_query_pool(self.timestamps, None);
-            self.context
-                .device
-                .destroy_descriptor_pool(self.descriptors, None);
             self.context.device.destroy_fence(self.fence, None);
             self.context.device.destroy_command_pool(self.pool, None);
         }

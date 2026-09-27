@@ -61,7 +61,7 @@ The backend selection occurs at runtime.
 | Backend | Selection | Runtime requirements |
 |---|---|---|
 | CPU | `BackendPreference::Cpu`, or the default | No GPU runtime |
-| Vulkan | `BackendPreference::Vulkan` | A Vulkan loader, driver, and compatible compute device |
+| Vulkan | `BackendPreference::Vulkan` | A Vulkan 1.2 loader, driver, and compatible compute device |
 
 To use Vulkan, set the backend in `RingDbConfig`:
 
@@ -86,7 +86,9 @@ A Vulkan SDK and shader compiler are not necessary to build or use the crate.
 Vulkan can use compatible NVIDIA and AMD GPUs.
 ring-db first tries discrete GPUs, then integrated GPUs, then other compute devices.
 It can also use a software Vulkan driver.
-The backend uses Vulkan 1.0 compute without subgroup extensions or 64-bit shader atomics.
+The backend requires Vulkan 1.2, Buffer Device Address, and 64-bit shader integers.
+ring-db examines device support and enables these features automatically.
+Subgroup extensions and 64-bit shader atomics are not necessary.
 
 If Vulkan is unavailable, database creation returns `BackendUnavailable`.
 ring-db does not automatically change the backend to CPU.
@@ -96,9 +98,15 @@ It executes queries on one database in sequence.
 It keeps query buffers for subsequent queries until you drop the database.
 Each result owns its hit data and stays valid after subsequent queries.
 
-Each GPU buffer must fit the device memory and the `maxStorageBufferRange` limit.
-A buffer that is too large causes a backend error.
-The backend does not divide a dataset across buffers.
+Vulkan uses 64-bit device addresses to access vector data and query buffers.
+A single vector buffer can be more than 4 GiB.
+The storage-buffer binding limit does not apply to these device addresses.
+
+If a device's allocation limit is too small, ring-db divides the dataset into groups of vectors called chunks.
+Queries combine the results from all chunks and keep the original vector IDs.
+KNN returns the closest vectors across the full dataset.
+All vectors and query buffers must fit the available device memory.
+An allocation that is too large causes a backend error.
 Floating-point rounding can cause small differences between CPU and Vulkan results, especially near distance limits.
 
 To run the example with Vulkan, use this command:
@@ -407,6 +415,15 @@ Without `RINGDB_VULKAN_TEST=1`, the device tests do not execute GPU queries.
 The test for an unavailable driver always executes.
 The continuous integration (CI) tests use Mesa software Vulkan.
 
+To test vector addresses beyond 4 GiB, use this command:
+
+```bash
+RINGDB_VULKAN_TEST=1 RINGDB_VULKAN_LARGE_TEST=1 cargo test --test vulkan vulkan_reads_vectors_past_four_gib
+```
+
+This test uses more than 4 GiB of device memory and additional host memory.
+Devices with a small allocation limit use multiple buffers during this test.
+
 The `src/backend/vulkan/shaders` directory contains shader sources and compiled SPIR-V files.
 For shader development, install `glslc` and `spirv-val`.
 After a shader source change, regenerate and validate the compiled files:
@@ -473,8 +490,20 @@ To change a benchmark run, use these command-line options:
 | `--intersection-shift` | Set the coordinate offset of the other two centers; default `0.01` |
 
 A run with only one backend does not compare results with the other backend.
-For 10 million vectors with 64 dimensions, the vector buffer uses 2.56 GB.
+For 10 million vectors with 64 dimensions, vector data uses 2.56 GB.
 Query buffers and results use more memory.
+
+To test smaller chunks, set `RINGDB_VULKAN_CHUNK_BYTES` to a positive byte count.
+This development option sets an upper limit for each vector buffer.
+It cannot increase device limits.
+Leave it unset for automatic chunk sizes.
+
+This command divides 10 million vectors into chunks of at most 5 million vectors:
+
+```bash
+RINGDB_VULKAN_CHUNK_BYTES=1280000000 cargo bench --bench backend_compare -- \
+  --n 10000000 --dims 64 --k 10 --samples 20 --rounds 2
+```
 
 For timing measurements, disable Vulkan validation layers.
 If necessary, use `VK_DRIVER_FILES` to select a Vulkan driver manifest.

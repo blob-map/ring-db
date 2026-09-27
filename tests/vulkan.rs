@@ -524,3 +524,193 @@ fn vulkan_loads_persisted_payloads_metadata_and_supports_concurrent_queries() {
     let loaded = RingDb::<u32>::load(dir.path(), BackendPreference::Cpu).unwrap();
     assert_eq!(*loaded.fetch_payload(0).unwrap(), 17);
 }
+
+#[test]
+fn vulkan_chunks_preserve_global_ids_filters_and_exact_knn() {
+    if !requested() {
+        return;
+    }
+    const CHILD: &str = "RINGDB_VULKAN_CHUNKS_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        // Run in isolation: environment changes must not race other GPU tests.
+        // Cut both u32 and u64 bitmap words. 1,023 rows also reproduces the
+        // last-bit boundary of 64D chunks at a 4-GiB-minus-one device limit.
+        for rows in [1023, 1027] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "vulkan_chunks_preserve_global_ids_filters_and_exact_knn",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("RINGDB_VULKAN_CHUNK_BYTES", (rows * 3 * 4).to_string())
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            print!("{stdout}");
+            eprint!("{stderr}");
+            assert!(output.status.success(), "{stdout}\n{stderr}");
+        }
+        return;
+    }
+    let vectors: Vec<Vec<f32>> = (0..2309)
+        .map(|id| vec![(id % 7) as f32, (id % 3) as f32, (id % 13) as f32])
+        .collect();
+    let cpu = build(&vectors, BackendPreference::Cpu);
+    let gpu = build(&vectors, BackendPreference::Vulkan);
+    let sets = [
+        gpu.candidates_from_ids([]).unwrap(),
+        gpu.candidates_from_ids(0..2309).unwrap(),
+        gpu.candidates_from_ids([
+            0, 31, 32, 63, 64, 1022, 1023, 1026, 1027, 1028, 2045, 2046, 2053, 2054, 2308,
+        ])
+        .unwrap(),
+        gpu.candidates_from_ids((0..2309).step_by(2)).unwrap(),
+        gpu.candidates_from_ids([2054, 2308]).unwrap(),
+        gpu.candidates_from_ids([0, 1026, 1027, 2053, 2054, 2308])
+            .unwrap()
+            .complement(),
+    ];
+    let retained = gpu.query_disk(&DiskQuery::new(&[0.0; 3], 100.0)).unwrap();
+    let snapshot = retained.hits.clone();
+    for filter in std::iter::once(None).chain(sets.iter().map(Some)) {
+        for weights in [None, Some([0.0, 0.25, 2.0]), Some([0.0; 3])] {
+            for k in [0, 1, 10, 1300, 3000] {
+                let mut query = KnnQuery::new(&[0.0; 3], k);
+                if let Some(filter) = filter {
+                    query = query.with_candidates(filter);
+                }
+                if let Some(weights) = &weights {
+                    query = query.with_weights(weights);
+                }
+                same_hits(
+                    cpu.query_knn(&query).unwrap(),
+                    gpu.query_knn(&query).unwrap(),
+                    true,
+                );
+            }
+            for radius in [0.0, 5.0, 100.0] {
+                let mut disk = DiskQuery::new(&[0.0; 3], radius);
+                let mut ring = RingQuery::new(&[0.0; 3], radius, 0.5);
+                if let Some(filter) = filter {
+                    disk = disk.with_candidates(filter);
+                    ring = ring.with_candidates(filter);
+                }
+                if let Some(weights) = &weights {
+                    disk = disk.with_weights(weights);
+                    ring = ring.with_weights(weights);
+                }
+                same_hits(
+                    cpu.query_disk(&disk).unwrap(),
+                    gpu.query_disk(&disk).unwrap(),
+                    false,
+                );
+                same_hits(cpu.query(&ring).unwrap(), gpu.query(&ring).unwrap(), false);
+                let disks = [
+                    disk,
+                    DiskQuery::new(&[0.5; 3], radius).with_candidates(&sets[5]),
+                    DiskQuery::new(&[-0.5; 3], radius).with_weights(&[0.25; 3]),
+                ];
+                let query = DiskIntersectionQuery::new(&disks);
+                same_hits(
+                    cpu.query_disk_intersection(&query).unwrap(),
+                    gpu.query_disk_intersection(&query).unwrap(),
+                    false,
+                );
+            }
+        }
+    }
+    assert_eq!(retained.hits, snapshot);
+    for hit in &retained.hits {
+        assert_eq!(*gpu.fetch_payload(hit.id).unwrap(), hit.id);
+    }
+
+    // Overflowed distances remain valid KNN candidates. Zero weights must
+    // bypass overflowing subtraction, including in later chunks.
+    let extremes = vec![vec![f32::MAX, 1.0, 0.0]; 2309];
+    let extreme_cpu = build(&extremes, BackendPreference::Cpu);
+    let extreme_gpu = build(&extremes, BackendPreference::Vulkan);
+    for weights in [[1.0; 3], [0.0, 1.0, 0.0]] {
+        for k in [10, 1300] {
+            let query = KnnQuery::new(&[-f32::MAX, 0.0, 0.0], k).with_weights(&weights);
+            same_hits(
+                extreme_cpu.query_knn(&query).unwrap(),
+                extreme_gpu.query_knn(&query).unwrap(),
+                true,
+            );
+        }
+    }
+
+    // Loading a persisted CPU database follows the same chunked upload path.
+    let dir = tempfile::tempdir().unwrap();
+    let mut persisted = RingDb::new(RingDbConfig::new(3).with_persist_dir(dir.path())).unwrap();
+    for (id, vector) in vectors.iter().enumerate() {
+        persisted.add_vector(vector, id as u32).unwrap();
+    }
+    let cpu = persisted.build().unwrap();
+    let gpu = RingDb::<u32>::load(dir.path(), BackendPreference::Vulkan).unwrap();
+    std::thread::scope(|scope| {
+        for center in [[0.0; 3], [2.0; 3], [6.0; 3]] {
+            let (cpu, gpu) = (&cpu, &gpu);
+            scope.spawn(move || {
+                let query = KnnQuery::new(&center, 10);
+                same_hits(
+                    cpu.query_knn(&query).unwrap(),
+                    gpu.query_knn(&query).unwrap(),
+                    true,
+                );
+                let disk = DiskQuery::new(&center, 100.0);
+                same_hits(
+                    cpu.query_disk(&disk).unwrap(),
+                    gpu.query_disk(&disk).unwrap(),
+                    false,
+                );
+            });
+        }
+    });
+}
+
+#[test]
+fn vulkan_reads_vectors_past_four_gib() {
+    // Opt in separately: this regression allocates >4 GiB of vector data.
+    if !requested() || std::env::var("RINGDB_VULKAN_LARGE_TEST").as_deref() != Ok("1") {
+        return;
+    }
+    let rows = 16_777_219u32;
+    let special = [0, rows - 300, rows - 2, rows - 1];
+    let mut db: RingDb =
+        RingDb::new(RingDbConfig::new(64).with_backend_preference(BackendPreference::Vulkan))
+            .unwrap();
+    for id in 0..rows {
+        let mut row = [100.0; 64];
+        if let Some(rank) = special.iter().position(|&candidate| candidate == id) {
+            row.fill(0.0);
+            row[63] = (3 - rank) as f32;
+        }
+        db.add_vector(&row, ()).unwrap();
+    }
+    let db = db.build().unwrap();
+    let point = [0.0; 64];
+    // The last coordinate of the last two vectors is beyond byte offset 2^32
+    // when this device can hold the vectors in one allocation.
+    let query = KnnQuery::new(&point, 4);
+    let hits = db.query_knn(&query).unwrap();
+    assert_eq!(hits.ids(), [rows - 1, rows - 2, rows - 300, 0]);
+    assert_eq!(
+        hits.hits.iter().map(|h| h.dist_sq).collect::<Vec<_>>(),
+        [0.0, 1.0, 4.0, 9.0]
+    );
+    let sparse = db.candidates_from_ids([0, rows - 1]).unwrap();
+    assert_eq!(
+        db.query_knn(&query.with_candidates(&sparse)).unwrap().ids(),
+        [rows - 1, 0]
+    );
+    let dense = db.candidates_from_ids([0]).unwrap().complement();
+    let mut disk = db
+        .query_disk(&DiskQuery::new(&point, 2.0).with_candidates(&dense))
+        .unwrap()
+        .ids();
+    disk.sort_unstable();
+    assert_eq!(disk, [rows - 300, rows - 2, rows - 1]);
+}

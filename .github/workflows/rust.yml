@@ -37,7 +37,7 @@ jobs:
         cd src/backend/vulkan/shaders
         sha256sum --check SHA256SUMS
         for shader in *.spv; do
-          spirv-val --target-env vulkan1.0 "$shader"
+          spirv-val --target-env vulkan1.2 "$shader"
         done
     - name: Compare Vulkan with CPU using validation layers
       shell: bash

@@ -7,26 +7,26 @@ shared uint best_slots[128];
 uint better(uint a, uint b) {
     if (a == INVALID) return b;
     if (b == INVALID) return a;
-    uint a_id = scratch[2u * a];
-    uint b_id = scratch[2u * b];
+    uint a_id = scratch_word(2ul * a).value;
+    uint b_id = scratch_word(2ul * b).value;
     if (a_id == INVALID) return b;
     if (b_id == INVALID) return a;
     // Non-negative f32 distances have the same ordering as their u32 bits,
     // including +infinity. ID breaks distance ties deterministically.
-    uint a_dist = scratch[2u * a + 1u];
-    uint b_dist = scratch[2u * b + 1u];
+    uint a_dist = scratch_word(2ul * a + 1u).value;
+    uint b_dist = scratch_word(2ul * b + 1u).value;
     return a_dist < b_dist || (a_dist == b_dist && a_id < b_id) ? a : b;
 }
 
 void main() {
     uint group = group_index();
-    if (group >= (p.reduce_count + 127u) / 128u) return;
+    if (group >= group_count(p.reduce_count)) return;
     uint lane = gl_LocalInvocationID.x;
     uint index = group * 128u + lane;
     uint slot = INVALID;
     if (index < p.reduce_count) {
-        slot = p.reduce_src == INVALID ? index : scratch[p.reduce_src + index];
-        if (slot != INVALID && scratch[2u * slot] == INVALID) slot = INVALID;
+        slot = p.reduce_src == ~0ul ? index : scratch_word(p.reduce_src + index).value;
+        if (slot != INVALID && scratch_word(2ul * slot).value == INVALID) slot = INVALID;
     }
     best_slots[lane] = slot;
     barrier();
@@ -34,5 +34,5 @@ void main() {
         if (lane < stride) best_slots[lane] = better(best_slots[lane], best_slots[lane + stride]);
         barrier();
     }
-    if (lane == 0u) scratch[p.reduce_dst + group] = best_slots[0];
+    if (lane == 0u) scratch_word(p.reduce_dst + group).value = best_slots[0];
 }

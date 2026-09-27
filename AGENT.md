@@ -208,10 +208,13 @@ Vulkan uses `ash` with a dynamically loaded loader, opened only when Vulkan is
 selected. CPU must work without a Vulkan loader or GPU driver. Explicit Vulkan
 selection returns `BackendUnavailable` if no compatible runtime/device is found.
 No Vulkan SDK or shader compiler is needed by consumers.
+The GPU backend requires Vulkan 1.2, `bufferDeviceAddress`, and `shaderInt64`.
+Check loader/device versions and both features before device creation; reject
+unsupported devices with `BackendUnavailable`. CPU has no Vulkan requirement.
 
 `src/backend/vulkan/mod.rs` implements the existing backend trait. `runtime.rs`
 owns Vulkan resources and synchronous submissions; its execution mutex serializes
-the queue, command pool, descriptor set, and reusable query buffers shared by
+the queue, command pool, and reusable query buffers shared by
 geometric and KNN queries.
 Geometric queries copy the count in the scan submission and read hits directly
 into an owned Pod `Vec<Hit>`. Buffer capacities grow on demand and remain allocated
@@ -220,7 +223,17 @@ Large host copies use up to four workers, including the caller, with scoped
 helper threads. Do not use the caller's Rayon pool while holding the execution
 mutex: work stealing could re-enter the backend. Join all helpers before unmapping
 or reusing readback memory, including when spawning a helper fails.
-Vectors are uploaded transposed once.
+Vectors and query buffers use Buffer Device Address, passed through push constants.
+There are no descriptor sets. Shaders calculate explicit 64-bit byte addresses,
+then dereference a scalar buffer reference. Do not replace these with large-array
+indexing: Vulkan 1.2 does not guarantee 64-bit offset arithmetic in access chains.
+No `VK_EXT_shader_64bit_indexing` extension is required by this approach.
+Vectors are uploaded once, transposed independently within each chunk. Chunk row
+counts fit the device's allocation limit for vectors, output, and KNN scratch.
+Each shader returns global IDs. Sparse candidates are sliced by global ID;
+dense candidates retain their bit offset when a chunk starts inside a word.
+Geometric readback appends directly to the final owned result. KNN merges each
+chunk's best results and preserves exact global `(dist_sq, id)` ordering.
 The three scan pipelines specialize All/Sparse/Dense candidate handling. Small-K
 selection uses GPU reductions without 64-bit atomics or subgroup requirements.
 Large-K queries may select on the host. Preserve deterministic `(dist_sq, id)` order
@@ -235,11 +248,22 @@ against the generic path across dimensions, weights, candidates, and selectivity
 Shader sources and precompiled SPIR-V live together in `shaders/`. Regenerate them
 with `sh src/backend/vulkan/shaders/compile.sh` after every source change. This
 development command requires `glslc` and `spirv-val`; Cargo embeds the binaries.
-Buffers must fit `maxStorageBufferRange`; the backend does not chunk datasets.
+Compile and validate shaders for Vulkan 1.2. A single buffer can exceed 4 GiB;
+`maxStorageBufferRange` does not apply to device-address accesses. Use the queried
+`maxMemoryAllocationSize` to split datasets only when allocation limits require it.
+All chunks stay resident, so sufficient device memory is still required.
+`RINGDB_VULKAN_CHUNK_BYTES` optionally caps vector-buffer bytes for development
+tests and benchmarks. It can only reduce chunk sizes, never raise device limits.
+Leave it unset for automatic sizing. Tests set it in a child process so environment
+changes cannot race other tests. Keep unaligned chunk boundaries covered.
 
 Run device tests with `RINGDB_VULKAN_TEST=1 cargo test --test vulkan`.
 An explicitly requested device test must fail if Vulkan is unavailable. CI uses
 Mesa software Vulkan so shader execution is covered without a physical GPU.
+Set `RINGDB_VULKAN_LARGE_TEST=1` with `RINGDB_VULKAN_TEST=1` to run the opt-in
+4-GiB boundary regression. It puts known nearest neighbors on both sides of the
+address boundary and exercises unfiltered, sparse, and dense queries. Run on a
+device whose allocation limit exceeds the dataset size to test one large buffer.
 
 ## Persistence format
 

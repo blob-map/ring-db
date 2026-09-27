@@ -1,11 +1,21 @@
-// Shared ABI with Params in mod.rs. All buffers use 32-bit words; no optional
-// integer-width, subgroup, or atomic-float features are required.
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+// Use scalar references at explicitly calculated 64-bit byte addresses. Do not
+// index a large runtime array: Vulkan 1.2 array offset math may wrap at 4 GiB.
 layout(local_size_x = 128) in;
-layout(set = 0, binding = 0, std430) readonly buffer Vectors { float vectors[]; };
-layout(set = 0, binding = 1, std430) readonly buffer Inputs { uint inputs[]; };
-layout(set = 0, binding = 2, std430) buffer Scratch { uint scratch[]; };
-layout(set = 0, binding = 3, std430) buffer Output { uint output_words[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer FloatValue { float value; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer InputValue { uint value; };
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Word { uint value; };
+
+// Shared ABI with Params in mod.rs.
 layout(push_constant) uniform Params {
+    uint64_t vectors;
+    uint64_t inputs;
+    uint64_t scratch;
+    uint64_t output_address;
+    uint64_t reduce_src; // UINT64_MAX means the initial distance slots
+    uint64_t reduce_dst;
     uint dims;
     uint rows;
     uint work_count;
@@ -15,12 +25,29 @@ layout(push_constant) uniform Params {
     float lower_sq;
     float upper_sq;
     uint reduce_count;
-    uint reduce_src; // UINT_MAX means the initial distance slots
-    uint reduce_dst;
     uint output_index;
+    uint row_offset;
+    uint reserved;
 } p;
 const uint INVALID = 0xffffffffu;
 
 uint group_index() {
     return gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+}
+
+uint input_word(uint index) {
+    return InputValue(p.inputs + uint64_t(index) * 4ul).value;
+}
+Word scratch_word(uint64_t index) {
+    return Word(p.scratch + index * 4ul);
+}
+Word output_word(uint64_t index) {
+    return Word(p.output_address + index * 4ul);
+}
+float vector_value(uint id, uint coord) {
+    uint64_t index = uint64_t(coord) * uint64_t(p.rows) + uint64_t(id);
+    return FloatValue(p.vectors + index * 4ul).value;
+}
+uint group_count(uint count) {
+    return count / 128u + uint(count % 128u != 0u);
 }

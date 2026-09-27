@@ -4,13 +4,13 @@
 
 void main() {
     if (gl_LocalInvocationID.x != 0u) return;
-    uint slot = scratch[p.reduce_dst];
+    uint slot = scratch_word(p.reduce_dst).value;
     if (slot == INVALID) {
-        output_words[2u * p.output_index] = INVALID;
-        output_words[2u * p.output_index + 1u] = 0x7f800000u;
+        output_word(2ul * p.output_index).value = INVALID;
+        output_word(2ul * p.output_index + 1u).value = 0x7f800000u;
         return;
     }
-    output_words[2u * p.output_index] = scratch[2u * slot];
-    output_words[2u * p.output_index + 1u] = scratch[2u * slot + 1u];
-    scratch[2u * slot] = INVALID;
+    output_word(2ul * p.output_index).value = scratch_word(2ul * slot).value;
+    output_word(2ul * p.output_index + 1u).value = scratch_word(2ul * slot + 1u).value;
+    scratch_word(2ul * slot).value = INVALID;
 }
