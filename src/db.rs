@@ -166,9 +166,7 @@ impl Db {
                 if segment.id >= manifest.next_segment {
                     return Err(corrupt("MANIFEST counters are behind its segments"));
                 }
-                if let Some(device) = &device {
-                    segment.upload(device)?;
-                }
+                upload(device.as_ref(), &options, &mut segment)?;
                 parts.push(Part::new(Arc::new(segment), deleted));
             }
             writer.next_key = manifest.next_key;
@@ -366,9 +364,7 @@ impl Shared {
 
     /// Upload `segment` and write its file, as configured.
     fn prepare(&self, segment: &mut Segment) -> Result<()> {
-        if let (Some(device), false) = (&self.device, segment.is_uploaded()) {
-            segment.upload(device)?;
-        }
+        upload(self.device.as_ref(), &self.options, segment)?;
         if let Some(dir) = &self.dir {
             store::write_segment(dir, segment)?;
         }
@@ -511,6 +507,24 @@ impl Shared {
         let mut current = self.current.write().unwrap_or_else(PoisonError::into_inner);
         *current = Snapshot::new(self.schema.clone(), parts);
         Ok(())
+    }
+}
+
+/// Keep the vectors of `segment` on the device, unless it is small enough that
+/// a CPU scan is faster than a dispatch.
+fn upload(
+    device: Option<&Arc<VulkanDevice>>,
+    options: &Options,
+    segment: &mut Segment,
+) -> Result<()> {
+    match device {
+        Some(device)
+            if segment.len() >= options.vulkan_min_rows_for(segment.dims)
+                && !segment.is_uploaded() =>
+        {
+            segment.upload(device)
+        }
+        _ => Ok(()),
     }
 }
 

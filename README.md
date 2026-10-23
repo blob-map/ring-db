@@ -184,6 +184,10 @@ If Vulkan is unavailable, database creation returns `BackendUnavailable`.
 ring-db does not automatically change the backend to CPU.
 
 The Vulkan backend uploads the vectors of each segment one time and keeps them in device memory.
+ring-db searches small segments on the CPU, because a CPU search of a small segment is faster than a GPU dispatch.
+By default, a segment is small if it has fewer than 16384 coordinates, for example 256 vectors with 64 dimensions.
+To change this limit, set `Options::vulkan_min_rows(rows)`.
+To search all segments on the GPU, set `vulkan_min_rows(0)`.
 It executes queries on one database in sequence.
 It keeps query buffers for subsequent queries until you drop the database.
 Each result owns its data and stays valid after subsequent queries.

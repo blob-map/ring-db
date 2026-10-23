@@ -86,6 +86,10 @@ fn dense_contains(words: &[u64], row: usize) -> bool {
     words[row / 64] & (1_u64 << (row % 64)) != 0
 }
 
+/// Coordinates per Rayon job at least. Waking idle workers costs more than
+/// scanning a small segment on one thread.
+const MIN_JOB_VALUES: usize = 64 * 1024;
+
 /// Eligible `(row, values)` pairs. The unfiltered path has no per-row branch;
 /// `Either` dispatches once per Rayon job, not per row.
 fn rows<'a>(
@@ -93,15 +97,17 @@ fn rows<'a>(
     dims: usize,
     mask: Mask<'a>,
 ) -> impl ParallelIterator<Item = (usize, &'a [f32])> + 'a {
+    let min_rows = MIN_JOB_VALUES.div_ceil(dims);
+    let all = vectors
+        .par_chunks_exact(dims)
+        .with_min_len(min_rows)
+        .enumerate();
     match mask {
-        Mask::All => Either::Left(Either::Left(vectors.par_chunks_exact(dims).enumerate())),
+        Mask::All => Either::Left(Either::Left(all)),
         Mask::Dense(words) => Either::Left(Either::Right(
-            vectors
-                .par_chunks_exact(dims)
-                .enumerate()
-                .filter(move |(row, _)| dense_contains(words, *row)),
+            all.filter(move |(row, _)| dense_contains(words, *row)),
         )),
-        Mask::Sparse(ids) => Either::Right(ids.par_iter().map(move |&id| {
+        Mask::Sparse(ids) => Either::Right(ids.par_iter().with_min_len(min_rows).map(move |&id| {
             let row = id as usize;
             (row, &vectors[row * dims..(row + 1) * dims])
         })),

@@ -195,7 +195,8 @@ The CPU backend is the correctness reference.
 - Ordinary searches use direct coordinate deltas with four independent accumulators.
 - Unweighted KNN accumulates coordinate deltas directly to avoid cancellation.
 - Weighted distance has its own four-accumulator loop.
-- Rayon partitions vector or candidate work.
+- Rayon partitions vector or candidate work, at least `MIN_JOB_VALUES` coordinates per
+  job, so a small segment scans on one thread instead of waking the pool.
 - `All` retains the existing scan with no candidate branch per row.
 - `Sparse` iterates rows directly.
 - `Dense` tests its bit before distance calculation.
@@ -220,7 +221,10 @@ unsupported devices with `BackendUnavailable`. CPU has no Vulkan requirement.
 owns Vulkan resources and synchronous submissions; its execution mutex serializes
 the queue, command pool, and reusable query buffers shared by
 region and KNN queries.
-Each segment uploads its vectors when it is built. Region scans write a count word
+Each segment uploads its vectors when it is built, unless it has fewer rows than
+`Options::vulkan_min_rows_for(dims)` (default 16384 coordinates): one dispatch and
+fence wait costs about 50 µs, and segments that stay on the host use the CPU
+kernels. Tests set `vulkan_min_rows(0)` through `common::manual`. Region scans write a count word
 followed by `[row, d0..dN-1]` records; readback appends them directly to the owned
 `RegionResult` records. Buffer capacities grow on demand and remain allocated
 until the backend is dropped; never expose references to this reusable storage.

@@ -26,6 +26,7 @@ pub struct Options {
     pub(crate) max_record_bytes: usize,
     pub(crate) commit_interval: Option<Duration>,
     pub(crate) auto_merge: bool,
+    pub(crate) vulkan_min_rows: Option<usize>,
 }
 
 impl Default for Options {
@@ -35,6 +36,7 @@ impl Default for Options {
             max_record_bytes: 64 * 1024,
             commit_interval: Some(Duration::from_secs(1)),
             auto_merge: true,
+            vulkan_min_rows: None,
         }
     }
 }
@@ -69,5 +71,19 @@ impl Options {
     pub fn auto_merge(mut self, enabled: bool) -> Self {
         self.auto_merge = enabled;
         self
+    }
+
+    /// With [`BackendPreference::Vulkan`], search segments with fewer rows on the
+    /// CPU. One GPU dispatch costs about as much as a CPU scan of 16384
+    /// coordinates, and each commit adds a small segment. The default is 16384
+    /// divided by the dimension count; 0 puts every segment on the GPU.
+    #[must_use]
+    pub fn vulkan_min_rows(mut self, rows: usize) -> Self {
+        self.vulkan_min_rows = Some(rows);
+        self
+    }
+
+    pub(crate) fn vulkan_min_rows_for(&self, dims: usize) -> usize {
+        self.vulkan_min_rows.unwrap_or(16 * 1024 / dims.max(1))
     }
 }

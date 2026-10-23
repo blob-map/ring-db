@@ -16,12 +16,14 @@ pub fn build(vectors: &[Vec<f32>], backend: BackendPreference) -> Db {
     build_dims(vectors[0].len(), vectors, backend)
 }
 
-/// Options with explicit commits and merges, so tests control segments.
+/// Options with explicit commits and merges, so tests control segments, and
+/// every segment on the selected backend.
 pub fn manual(backend: BackendPreference) -> Options {
     Options::default()
         .backend(backend)
         .commit_interval(None)
         .auto_merge(false)
+        .vulkan_min_rows(0)
 }
 
 pub fn build_dims(dims: usize, vectors: &[Vec<f32>], backend: BackendPreference) -> Db {

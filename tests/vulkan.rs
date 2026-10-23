@@ -8,7 +8,9 @@ use ringdb::{
 };
 
 fn vulkan() -> Options {
-    Options::default().backend(BackendPreference::Vulkan)
+    Options::default()
+        .backend(BackendPreference::Vulkan)
+        .vulkan_min_rows(0)
 }
 
 /// The `id` field of `key`, which the common builders set to the key.
@@ -335,8 +337,8 @@ fn vulkan_reads_large_results_from_concurrent_rayon_callers() {
 }
 
 /// The same records on `backend`, split into segments after each of `cuts`.
-fn segmented(vectors: &[Vec<f32>], cuts: &[usize], backend: BackendPreference) -> Db {
-    let db = Db::in_memory(common::schema(vectors[0].len()), common::manual(backend)).unwrap();
+fn segmented(vectors: &[Vec<f32>], cuts: &[usize], options: Options) -> Db {
+    let db = Db::in_memory(common::schema(vectors[0].len()), options).unwrap();
     for (id, vector) in vectors.iter().enumerate() {
         let record = Record::new(vector.as_slice())
             .set("group", (id % 3) as u32)
@@ -360,11 +362,18 @@ fn vulkan_searches_segments_and_supports_concurrent_queries() {
     // Segments of 1, 63, 64, and 141 rows, cut inside and at bitmap words.
     let cuts = [0, 63, 127];
     let cpu = build(&vectors, BackendPreference::Cpu);
-    let gpu = segmented(&vectors, &cuts, BackendPreference::Vulkan);
     let filter = common::group(1);
+    // All segments on the GPU, then the two small ones on the CPU.
+    for min_rows in [0, 64] {
+        let options = common::manual(BackendPreference::Vulkan).vulkan_min_rows(min_rows);
+        let gpu = segmented(&vectors, &cuts, options);
+        concurrent_parity(&cpu, &gpu, &filter);
+    }
+}
+
+fn concurrent_parity(cpu: &Db, gpu: &Db, filter: &Filter) {
     std::thread::scope(|scope| {
         for shift in 0..4 {
-            let (cpu, gpu, filter) = (&cpu, &gpu, &filter);
             scope.spawn(move || {
                 let point = [shift as f32 * 40.0, 0.0, 0.0];
                 for k in [3, 100] {
@@ -515,7 +524,11 @@ fn vulkan_chunks_preserve_global_ids_filters_and_exact_knn() {
     }
 
     // Chunked segments of different sizes keep their row offsets.
-    let gpu = segmented(&vectors, &[700, 1500], BackendPreference::Vulkan);
+    let gpu = segmented(
+        &vectors,
+        &[700, 1500],
+        common::manual(BackendPreference::Vulkan),
+    );
     std::thread::scope(|scope| {
         for center in [[0.0; 3], [2.0; 3], [6.0; 3]] {
             let (cpu, gpu) = (&cpu, &gpu);
