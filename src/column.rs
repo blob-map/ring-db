@@ -5,8 +5,11 @@
 //! columns keep a sorted per-segment dictionary and an inverted index.
 use std::collections::HashMap;
 
+use bytemuck::Pod;
 use rayon::prelude::*;
 
+use crate::codec::{Decoder, Encoder, ToLe, corrupt};
+use crate::error::Result;
 use crate::rows::RowSet;
 use crate::schema::FieldType;
 use crate::value::Value;
@@ -415,5 +418,172 @@ impl<T: Default> ScalarsBuilder<T> {
             present: self.present.finish(self.values.len()),
             values: self.values,
         }
+    }
+}
+
+fn encode_presence(e: &mut Encoder, presence: &Presence) {
+    match presence {
+        None => e.u8(0),
+        Some(words) => {
+            e.u8(1);
+            e.slice(words);
+        }
+    }
+}
+
+fn decode_presence(d: &mut Decoder<'_>, rows: usize) -> Result<Presence> {
+    match d.u8()? {
+        0 => Ok(None),
+        1 => {
+            let words = d.slice::<u64>()?;
+            if words.len() != crate::rows::word_count(rows) {
+                return Err(corrupt("presence bitmap has a wrong length"));
+            }
+            Ok(Some(words))
+        }
+        _ => Err(corrupt("unknown presence flag")),
+    }
+}
+
+/// `offsets` must start at zero, never decrease, and end at `end`.
+fn check_offsets(offsets: &[u64], count: usize, end: usize) -> Result<()> {
+    let valid = offsets.len() == count + 1
+        && offsets[0] == 0
+        && offsets.windows(2).all(|w| w[0] <= w[1])
+        && offsets[count] == end as u64;
+    if valid {
+        Ok(())
+    } else {
+        Err(corrupt("offsets are out of order or out of bounds"))
+    }
+}
+
+impl<T: Pod + ToLe> Scalars<T> {
+    fn encode(&self, e: &mut Encoder) {
+        e.slice(&self.values);
+        encode_presence(e, &self.present);
+    }
+
+    fn decode(d: &mut Decoder<'_>, rows: usize) -> Result<Self> {
+        let values = d.slice::<T>()?;
+        if values.len() != rows {
+            return Err(corrupt("column has a wrong length"));
+        }
+        Ok(Self {
+            values,
+            present: decode_presence(d, rows)?,
+        })
+    }
+}
+
+impl Strings {
+    fn encode(&self, e: &mut Encoder) {
+        e.slice(&self.offsets);
+        e.slice(&self.data);
+    }
+
+    fn decode(d: &mut Decoder<'_>, count: usize, utf8: bool) -> Result<Self> {
+        let offsets = d.slice::<u64>()?;
+        let data = d.slice::<u8>()?;
+        check_offsets(&offsets, count, data.len())?;
+        let strings = Self { offsets, data };
+        if utf8 && (0..count).any(|i| std::str::from_utf8(strings.get(i)).is_err()) {
+            return Err(corrupt("text is not UTF-8"));
+        }
+        Ok(strings)
+    }
+}
+
+impl Column {
+    pub(crate) fn encode(&self, e: &mut Encoder) {
+        match self {
+            Self::U32(c) => c.encode(e),
+            Self::U64(c) => c.encode(e),
+            Self::I64(c) => c.encode(e),
+            Self::F32(c) => c.encode(e),
+            Self::Bool(c) => {
+                let bytes: Vec<u8> = c.values.iter().map(|&v| u8::from(v)).collect();
+                e.slice(&bytes);
+                encode_presence(e, &c.present);
+            }
+            Self::Keywords(c) => {
+                e.u64(c.dict.len() as u64);
+                c.dict.encode(e);
+                e.slice(&c.row_offsets);
+                e.slice(&c.ids);
+                e.slice(&c.posting_offsets);
+                e.slice(&c.postings);
+            }
+            Self::Blobs(c) => {
+                c.items.encode(e);
+                encode_presence(e, &c.present);
+            }
+            Self::TextList(c) => {
+                e.slice(&c.row_offsets);
+                e.u64(c.items.len() as u64);
+                c.items.encode(e);
+            }
+        }
+    }
+
+    /// Decode a column of `rows` rows and check its internal references.
+    pub(crate) fn decode(d: &mut Decoder<'_>, ty: FieldType, rows: usize) -> Result<Self> {
+        Ok(match ty {
+            FieldType::U32 => Self::U32(Scalars::decode(d, rows)?),
+            FieldType::U64 => Self::U64(Scalars::decode(d, rows)?),
+            FieldType::I64 => Self::I64(Scalars::decode(d, rows)?),
+            FieldType::F32 => Self::F32(Scalars::decode(d, rows)?),
+            FieldType::Bool => {
+                let bytes = Scalars::<u8>::decode(d, rows)?;
+                if bytes.values.iter().any(|&b| b > 1) {
+                    return Err(corrupt("bool column holds a value other than 0 or 1"));
+                }
+                Self::Bool(Scalars {
+                    values: bytes.values.iter().map(|&b| b == 1).collect(),
+                    present: bytes.present,
+                })
+            }
+            FieldType::Keyword | FieldType::Keywords => {
+                let terms = usize::try_from(d.u64()?).map_err(|_| corrupt("too many terms"))?;
+                let dict = Strings::decode(d, terms, true)?;
+                if (1..terms).any(|i| dict.get(i - 1) >= dict.get(i)) {
+                    return Err(corrupt("keyword dictionary is not sorted"));
+                }
+                let row_offsets = d.slice::<u64>()?;
+                let ids = d.slice::<u32>()?;
+                let posting_offsets = d.slice::<u64>()?;
+                let postings = d.slice::<u32>()?;
+                check_offsets(&row_offsets, rows, ids.len())?;
+                check_offsets(&posting_offsets, terms, postings.len())?;
+                if ids.iter().any(|&id| id as usize >= terms)
+                    || postings.iter().any(|&row| row as usize >= rows)
+                {
+                    return Err(corrupt("keyword index refers outside the segment"));
+                }
+                Self::Keywords(Keywords {
+                    dict,
+                    row_offsets,
+                    ids,
+                    posting_offsets,
+                    postings,
+                })
+            }
+            FieldType::Text | FieldType::Bytes => {
+                let items = Strings::decode(d, rows, ty == FieldType::Text)?;
+                Self::Blobs(Blobs {
+                    items,
+                    present: decode_presence(d, rows)?,
+                })
+            }
+            FieldType::TextList => {
+                let row_offsets = d.slice::<u64>()?;
+                let count = usize::try_from(d.u64()?).map_err(|_| corrupt("too many items"))?;
+                check_offsets(&row_offsets, rows, count)?;
+                Self::TextList(Lists {
+                    row_offsets,
+                    items: Strings::decode(d, count, true)?,
+                })
+            }
+        })
     }
 }

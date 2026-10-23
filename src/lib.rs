@@ -33,6 +33,7 @@
 //! assert_eq!(db.get(near).unwrap().get("rooms").and_then(|v| v.as_u32()), Some(3));
 //! ```
 mod backend;
+mod codec;
 mod column;
 mod config;
 mod db;
@@ -42,6 +43,7 @@ mod query;
 mod rows;
 mod schema;
 mod segment;
+mod store;
 mod value;
 
 // Compile README examples with the public API as part of `cargo test`.

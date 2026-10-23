@@ -2,6 +2,8 @@
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::ops::Range;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -9,6 +11,7 @@ use std::time::Duration;
 use smallvec::SmallVec;
 
 use crate::backend::{DiskSpec, VulkanDevice};
+use crate::codec::corrupt;
 use crate::config::{BackendPreference, Options};
 use crate::error::{Result, RingDbError};
 use crate::filter::Filter;
@@ -19,7 +22,8 @@ use crate::query::{
 use crate::rows::RowSet;
 use crate::schema::Schema;
 use crate::segment::{Segment, SegmentBuilder};
-use crate::value::{Document, Record};
+use crate::store::{self, Change, Manifest, Store};
+use crate::value::{Document, Record, Row};
 
 /// A segment is rewritten when at least this fraction of its rows is deleted.
 const PURGE_FRACTION: f64 = 0.25;
@@ -40,6 +44,9 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// A background thread commits every [`Options::commit_interval`];
 /// [`flush`](Self::flush) commits at once. To change a record, delete it and
 /// add the new version, which gets a new key.
+///
+/// A database opened with [`Db::open`] is durable: each change is synced to a
+/// write-ahead log before the call returns, and survives a crash.
 pub struct Db {
     shared: Arc<Shared>,
     committer: Option<Committer>,
@@ -49,6 +56,9 @@ struct Shared {
     schema: Arc<Schema>,
     options: Options,
     device: Option<Arc<VulkanDevice>>,
+    /// The database directory, or `None` in memory.
+    dir: Option<PathBuf>,
+    next_segment: AtomicU64,
     writer: Mutex<Writer>,
     current: RwLock<Snapshot>,
     /// Held while a merge builds, so that only one merge runs at a time.
@@ -57,8 +67,9 @@ struct Shared {
 
 /// Changes since the last commit. Lock `writer` before `current`.
 struct Writer {
+    store: Option<Store>,
     next_key: u64,
-    /// Built segments that failed to upload, published once an upload works.
+    /// Built segments not yet published, because an upload or a write failed.
     unpublished: Vec<Segment>,
     pending: SegmentBuilder,
     /// Rows of `pending` that are deleted.
@@ -76,31 +87,123 @@ impl Writer {
     fn rows(&self) -> usize {
         self.unpublished.iter().map(Segment::len).sum::<usize>() + self.pending.len()
     }
+
+    fn log(&mut self, changes: &[Vec<u8>]) -> Result<()> {
+        match &mut self.store {
+            Some(store) => store.log(changes),
+            None => Ok(()),
+        }
+    }
+
+    /// Whether `key` is added and not deleted, committed or not.
+    fn is_live(&self, key: Key, visible: &Snapshot) -> bool {
+        match self.pending.row(key) {
+            Some(row) => !self.pending_deleted.contains(&row),
+            None => {
+                !self.deletes.contains(&key)
+                    && (self.unpublished.iter().any(|s| s.row(key).is_some())
+                        || visible.contains(key))
+            }
+        }
+    }
+
+    /// Record a delete of `key` and report whether it was live.
+    fn delete(&mut self, key: Key, visible: &Snapshot) -> bool {
+        if !self.is_live(key, visible) {
+            return false;
+        }
+        match self.pending.row(key) {
+            Some(row) => self.pending_deleted.insert(row),
+            None => self.deletes.insert(key),
+        }
+    }
 }
 
 impl Db {
     /// Create an empty database that is held in memory only.
     pub fn in_memory(schema: Schema, options: Options) -> Result<Self> {
         schema.validate()?;
+        Self::start(schema, options, None)
+    }
+
+    /// Open the durable database in directory `path`, or create it there.
+    ///
+    /// An existing database must have exactly `schema`; otherwise this returns
+    /// [`RingDbError::InvalidSchema`]. Only one `Db` can have a directory open:
+    /// a second open returns an [`RingDbError::Io`] error. Opening recovers the
+    /// changes that were synced but not yet committed and commits them.
+    pub fn open(path: impl AsRef<Path>, schema: Schema, options: Options) -> Result<Self> {
+        schema.validate()?;
+        let (store, recovered) = Store::open(path.as_ref(), &schema)?;
+        Self::start(schema, options, Some((store, recovered)))
+    }
+
+    fn start(
+        schema: Schema,
+        options: Options,
+        storage: Option<(Store, store::Recovered)>,
+    ) -> Result<Self> {
         let device = match options.backend {
             BackendPreference::Cpu => None,
             BackendPreference::Vulkan => Some(Arc::new(VulkanDevice::new()?)),
         };
         let schema = Arc::new(schema);
+        let mut writer = Writer {
+            store: None,
+            next_key: 0,
+            unpublished: Vec::new(),
+            pending: SegmentBuilder::new(&schema),
+            pending_deleted: BTreeSet::new(),
+            deletes: BTreeSet::new(),
+        };
+        let mut parts = Vec::new();
+        let mut next_segment = 0;
+        let mut changes = Vec::new();
+        let mut dir = None;
+        if let Some((store, recovered)) = storage {
+            let manifest = recovered.manifest;
+            for (mut segment, (_, deleted)) in recovered.segments.into_iter().zip(manifest.parts) {
+                if segment.id >= manifest.next_segment {
+                    return Err(corrupt("MANIFEST counters are behind its segments"));
+                }
+                if let Some(device) = &device {
+                    segment.upload(device)?;
+                }
+                parts.push(Part::new(Arc::new(segment), deleted));
+            }
+            writer.next_key = manifest.next_key;
+            next_segment = manifest.next_segment;
+            changes = recovered.changes;
+            dir = Some(store.dir().to_path_buf());
+            writer.store = Some(store);
+        }
+        let current = Snapshot::new(schema.clone(), parts);
+        for change in changes {
+            match change {
+                Change::Add(key, row) => {
+                    if key.0 < writer.next_key {
+                        return Err(corrupt(format!("log adds key {} twice", key.0)));
+                    }
+                    writer.next_key = key.0 + 1;
+                    writer.pending.push(key, row);
+                }
+                // Replaying a delete of a missing record has no effect.
+                Change::Delete(key) => {
+                    writer.delete(key, &current);
+                }
+            }
+        }
         let shared = Arc::new(Shared {
-            writer: Mutex::new(Writer {
-                next_key: 0,
-                unpublished: Vec::new(),
-                pending: SegmentBuilder::new(&schema),
-                pending_deleted: BTreeSet::new(),
-                deletes: BTreeSet::new(),
-            }),
-            current: RwLock::new(Snapshot::new(schema.clone(), Vec::new())),
+            writer: Mutex::new(writer),
+            current: RwLock::new(current),
             merging: Mutex::new(()),
+            next_segment: AtomicU64::new(next_segment),
+            dir,
             schema,
             options,
             device,
         });
+        shared.commit()?;
         let committer = shared
             .options
             .commit_interval
@@ -110,20 +213,42 @@ impl Db {
 
     /// Validate `record` against the schema and assign it a new key.
     pub fn add(&self, record: Record) -> Result<Key> {
+        Ok(self.add_all([record])?[0])
+    }
+
+    /// Add `records` with one log sync, returning their keys in order.
+    ///
+    /// If one record is invalid, none is added. Use this to import many
+    /// records into a durable database.
+    pub fn add_all(&self, records: impl IntoIterator<Item = Record>) -> Result<Vec<Key>> {
         let shared = &self.shared;
-        let row = record.validate(&shared.schema, shared.options.max_record_bytes)?;
+        let rows = records
+            .into_iter()
+            .map(|record| record.validate(&shared.schema, shared.options.max_record_bytes))
+            .collect::<Result<Vec<Row>>>()?;
         let mut writer = lock(&shared.writer);
-        if writer.rows() + shared.snapshot().rows() >= u32::MAX as usize {
+        if writer.rows() + shared.snapshot().rows() + rows.len() >= u32::MAX as usize {
             return Err(RingDbError::InvalidRecord(
                 "a database holds at most u32::MAX - 1 rows, deleted rows included \
                  until they are merged away"
                     .to_string(),
             ));
         }
-        let key = Key(writer.next_key);
-        writer.next_key += 1;
-        writer.pending.push(key, row);
-        Ok(key)
+        let first = writer.next_key;
+        let keys: Vec<Key> = (first..first + rows.len() as u64).map(Key).collect();
+        if writer.store.is_some() {
+            let changes: Vec<Vec<u8>> = keys
+                .iter()
+                .zip(&rows)
+                .map(|(&key, row)| Change::encode_add(key, row))
+                .collect();
+            writer.log(&changes)?;
+        }
+        writer.next_key += rows.len() as u64;
+        for (&key, row) in keys.iter().zip(rows) {
+            writer.pending.push(key, row);
+        }
+        Ok(keys)
     }
 
     /// Delete the record with `key`, visible or not yet committed.
@@ -132,21 +257,13 @@ impl Db {
     /// already deleted.
     pub fn delete(&self, key: Key) -> Result<()> {
         let mut writer = lock(&self.shared.writer);
-        let writer = &mut *writer;
-        let inserted = if let Some(row) = writer.pending.row(key) {
-            writer.pending_deleted.insert(row)
-        } else if writer.unpublished.iter().any(|s| s.row(key).is_some())
-            || self.shared.snapshot().contains(key)
-        {
-            writer.deletes.insert(key)
-        } else {
-            false
-        };
-        if inserted {
-            Ok(())
-        } else {
-            Err(RingDbError::KeyNotFound(key.0))
+        let visible = self.shared.snapshot();
+        if !writer.is_live(key, &visible) {
+            return Err(RingDbError::KeyNotFound(key.0));
         }
+        writer.log(&[Change::encode_delete(key)])?;
+        writer.delete(key, &visible);
+        Ok(())
     }
 
     /// Commit every change now. With [`Options::auto_merge`], then merge
@@ -167,6 +284,27 @@ impl Db {
             (parts.len() > 1 || parts.iter().any(|p| !p.deleted.is_empty()))
                 .then_some(0..parts.len())
         })
+    }
+
+    /// Commit, then copy the database files into `dest`, which must not exist
+    /// or be empty. Open the copy with [`Db::open`]. Changes wait while the
+    /// files are copied.
+    pub fn backup(&self, dest: impl AsRef<Path>) -> Result<()> {
+        self.shared.commit()?;
+        let writer = lock(&self.shared.writer);
+        let Some(store) = &writer.store else {
+            return Err(RingDbError::InvalidQuery(
+                "an in-memory database has no files to back up".to_string(),
+            ));
+        };
+        let ids: Vec<u64> = self
+            .snapshot()
+            .0
+            .parts
+            .iter()
+            .map(|p| p.segment.id)
+            .collect();
+        store.backup(dest.as_ref(), &ids)
     }
 
     /// A consistent view of the visible records. Later changes do not affect it.
@@ -206,6 +344,11 @@ impl Drop for Db {
         if let Some(committer) = self.committer.take() {
             committer.stop();
         }
+        if self.shared.dir.is_some() {
+            // Logged changes are durable already; committing now only makes
+            // the next open faster.
+            let _ = self.shared.commit();
+        }
     }
 }
 
@@ -217,51 +360,76 @@ impl Shared {
             .clone()
     }
 
-    fn upload(&self, segment: &mut Segment) -> Result<()> {
-        match &self.device {
-            Some(device) => segment.upload(device),
-            None => Ok(()),
+    fn segment_id(&self) -> u64 {
+        self.next_segment.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Upload `segment` and write its file, as configured.
+    fn prepare(&self, segment: &mut Segment) -> Result<()> {
+        if let (Some(device), false) = (&self.device, segment.is_uploaded()) {
+            segment.upload(device)?;
+        }
+        if let Some(dir) = &self.dir {
+            store::write_segment(dir, segment)?;
+        }
+        Ok(())
+    }
+
+    fn manifest(&self, writer: &Writer, parts: &[Part]) -> Manifest {
+        Manifest {
+            next_key: writer.next_key,
+            next_segment: self.next_segment.load(Ordering::Relaxed),
+            parts: parts
+                .iter()
+                .map(|part| (part.segment.id, part.deleted.to_vec()))
+                .collect(),
         }
     }
 
-    /// Publish pending records and deletes in one new snapshot.
+    /// Publish pending records and deletes in one new snapshot. On failure the
+    /// changes stay pending, and the next commit retries them.
     fn commit(&self) -> Result<()> {
-        let mut writer = lock(&self.writer);
+        let mut guard = lock(&self.writer);
+        let writer = &mut *guard;
         if writer.is_empty() {
             return Ok(());
         }
-        let builder = std::mem::replace(&mut writer.pending, SegmentBuilder::new(&self.schema));
-        let deleted: Vec<u32> = std::mem::take(&mut writer.pending_deleted)
-            .into_iter()
-            .collect();
-        if !builder.is_empty() {
-            let segment = builder.finish();
-            writer.unpublished.push(segment);
-            // Keep deleted rows next to their segment until it is published.
-            if !deleted.is_empty() {
-                let index = writer.unpublished.len() - 1;
-                let keys: Vec<Key> = deleted
-                    .iter()
-                    .map(|&row| writer.unpublished[index].keys[row as usize])
-                    .collect();
-                writer.deletes.extend(keys);
+        if !writer.pending.is_empty() {
+            let builder = std::mem::replace(&mut writer.pending, SegmentBuilder::new(&self.schema));
+            let segment = builder.finish(self.segment_id());
+            for row in std::mem::take(&mut writer.pending_deleted) {
+                writer.deletes.insert(segment.keys[row as usize]);
             }
+            writer.unpublished.push(segment);
         }
         for segment in &mut writer.unpublished {
-            if !segment.is_uploaded() {
-                self.upload(segment)?;
-            }
+            self.prepare(segment)?;
         }
-        let added = std::mem::take(&mut writer.unpublished);
-        let deletes = std::mem::take(&mut writer.deletes);
-        let mut current = self.current.write().unwrap_or_else(PoisonError::into_inner);
-        let mut parts = current.0.parts.clone();
+        let mut parts = self.snapshot().0.parts.clone();
+        let added = writer.unpublished.len();
+        let segments = std::mem::take(&mut writer.unpublished);
         parts.extend(
-            added
+            segments
                 .into_iter()
                 .map(|segment| Part::new(Arc::new(segment), Vec::new())),
         );
-        apply_deletes(&mut parts, &deletes);
+        apply_deletes(&mut parts, &writer.deletes);
+        let manifest = writer
+            .store
+            .is_some()
+            .then(|| self.manifest(writer, &parts));
+        if let (Some(store), Some(manifest)) = (&mut writer.store, manifest)
+            && let Err(error) = store.write_manifest(&self.schema, &manifest, true)
+        {
+            // Keep the new segments for the retry.
+            writer.unpublished = parts
+                .drain(parts.len() - added..)
+                .map(|part| Arc::into_inner(part.segment).expect("not shared yet"))
+                .collect();
+            return Err(error);
+        }
+        writer.deletes.clear();
+        let mut current = self.current.write().unwrap_or_else(PoisonError::into_inner);
         *current = Snapshot::new(self.schema.clone(), parts);
         Ok(())
     }
@@ -277,11 +445,12 @@ impl Shared {
             };
             let inputs = &snapshot.0.parts[range];
             let merged = self.build_merge(inputs)?;
-            self.publish_merge(inputs, merged);
+            self.publish_merge(inputs, merged)?;
         }
     }
 
-    /// The live rows of adjacent `inputs` in one segment, or `None` if none is live.
+    /// The live rows of adjacent `inputs` in one prepared segment, or `None`
+    /// if none is live.
     fn build_merge(&self, inputs: &[Part]) -> Result<Option<Segment>> {
         let mut builder = SegmentBuilder::new(&self.schema);
         for part in inputs {
@@ -295,17 +464,16 @@ impl Shared {
         if builder.is_empty() {
             return Ok(None);
         }
-        let mut segment = builder.finish();
-        self.upload(&mut segment)?;
+        let mut segment = builder.finish(self.segment_id());
+        self.prepare(&mut segment)?;
         Ok(Some(segment))
     }
 
     /// Replace `inputs` with `merged`, keeping rows deleted since `inputs`
     /// were read deleted.
-    fn publish_merge(&self, inputs: &[Part], merged: Option<Segment>) {
-        let _writer = lock(&self.writer);
-        let mut current = self.current.write().unwrap_or_else(PoisonError::into_inner);
-        let mut parts = current.0.parts.clone();
+    fn publish_merge(&self, inputs: &[Part], merged: Option<Segment>) -> Result<()> {
+        let mut writer = lock(&self.writer);
+        let mut parts = self.snapshot().0.parts.clone();
         let start = parts
             .iter()
             .position(|part| Arc::ptr_eq(&part.segment, &inputs[0].segment))
@@ -321,12 +489,28 @@ impl Shared {
                     .map(|&row| now.segment.keys[row as usize])
             })
             .collect();
+        let merged_id = merged.as_ref().map(|segment| segment.id);
         let replacement = merged.map(|segment| {
             let deleted = late.iter().filter_map(|&key| segment.row(key)).collect();
             Part::new(Arc::new(segment), deleted)
         });
         parts.splice(start..end, replacement);
+        if writer.store.is_some() {
+            let manifest = self.manifest(&writer, &parts);
+            let store = writer.store.as_mut().expect("checked above");
+            if let Err(error) = store.write_manifest(&self.schema, &manifest, false) {
+                if let Some(id) = merged_id {
+                    store.remove_segment(id);
+                }
+                return Err(error);
+            }
+            for input in inputs {
+                store.remove_segment(input.segment.id);
+            }
+        }
+        let mut current = self.current.write().unwrap_or_else(PoisonError::into_inner);
         *current = Snapshot::new(self.schema.clone(), parts);
+        Ok(())
     }
 }
 
@@ -646,7 +830,7 @@ mod tests {
             db.delete(Key(key)).unwrap();
         }
         db.flush().unwrap();
-        shared.publish_merge(inputs, merged);
+        shared.publish_merge(inputs, merged).unwrap();
 
         let after = db.snapshot();
         assert_eq!(after.segments(), 2);
@@ -677,7 +861,7 @@ mod tests {
                     },
                 );
             }
-            Part::new(Arc::new(builder.finish()), (0..deleted as u32).collect())
+            Part::new(Arc::new(builder.finish(0)), (0..deleted as u32).collect())
         };
         let range = |sizes: &[(usize, usize)]| {
             let parts: Vec<Part> = sizes.iter().map(|&(n, d)| part(n, d)).collect();

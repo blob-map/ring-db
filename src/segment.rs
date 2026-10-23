@@ -2,14 +2,20 @@
 use std::sync::Arc;
 
 use crate::backend::{DiskSpec, Mask, RowHit, VulkanDevice, VulkanSegment, cpu};
+use crate::codec::{Decoder, Encoder, corrupt};
 use crate::column::{Column, ColumnBuilder};
 use crate::error::Result;
 use crate::query::Key;
 use crate::schema::Schema;
 use crate::value::Row;
 
+const MAGIC: &[u8; 8] = b"RDBSEG\0\0";
+const VERSION: u32 = 1;
+
 /// Records sorted by key, with row-major vectors and one column per field.
 pub(crate) struct Segment {
+    /// Unique within a database; names the segment file.
+    pub(crate) id: u64,
     pub(crate) dims: usize,
     pub(crate) keys: Arc<[Key]>,
     pub(crate) vectors: Vec<f32>,
@@ -20,6 +26,59 @@ pub(crate) struct Segment {
 impl Segment {
     pub(crate) fn len(&self) -> usize {
         self.keys.len()
+    }
+
+    /// The segment file contents, ending with a CRC-32.
+    pub(crate) fn encode(&self) -> Vec<u8> {
+        let mut e = Encoder::default();
+        e.bytes.extend_from_slice(MAGIC);
+        e.u32(VERSION);
+        e.u64(self.id);
+        e.u32(self.dims as u32);
+        e.u32(self.columns.len() as u32);
+        e.slice(&self.keys);
+        e.slice(&self.vectors);
+        for column in &self.columns {
+            column.encode(&mut e);
+        }
+        e.finish_with_crc()
+    }
+
+    /// Read a segment file written by [`Segment::encode`] for `schema`.
+    pub(crate) fn decode(bytes: &[u8], schema: &Schema, id: u64) -> Result<Self> {
+        let what = format!("segment {id}");
+        let mut d = Decoder::with_crc(bytes, &what)?;
+        let header = (0..8).map(|_| d.u8()).collect::<Result<Vec<u8>>>()?;
+        if header != MAGIC || d.u32()? != VERSION {
+            return Err(corrupt(format!("{what} has an unknown format")));
+        }
+        let (stored_id, dims, columns) = (d.u64()?, d.u32()? as usize, d.u32()? as usize);
+        if stored_id != id || dims != schema.dims() || columns != schema.len() {
+            return Err(corrupt(format!("{what} does not match the manifest")));
+        }
+        let keys: Vec<Key> = d.slice()?;
+        let vectors: Vec<f32> = d.slice()?;
+        let rows = keys.len();
+        if keys.is_empty() || keys.windows(2).any(|w| w[0] >= w[1]) {
+            return Err(corrupt(format!("{what} keys are empty or out of order")));
+        }
+        if rows.checked_mul(dims) != Some(vectors.len()) || vectors.iter().any(|v| !v.is_finite()) {
+            return Err(corrupt(format!("{what} has invalid vectors")));
+        }
+        let columns = (0..columns)
+            .map(|field| Column::decode(&mut d, schema.ty(field), rows))
+            .collect::<Result<_>>()?;
+        if !d.is_empty() {
+            return Err(corrupt(format!("{what} has trailing data")));
+        }
+        Ok(Self {
+            id,
+            dims,
+            keys: keys.into(),
+            vectors,
+            columns,
+            gpu: None,
+        })
     }
 
     pub(crate) fn is_uploaded(&self) -> bool {
@@ -124,9 +183,10 @@ impl SegmentBuilder {
         }
     }
 
-    /// Freeze the records. Upload them separately.
-    pub(crate) fn finish(self) -> Segment {
+    /// Freeze the records as segment `id`. Upload them separately.
+    pub(crate) fn finish(self, id: u64) -> Segment {
         Segment {
+            id,
             dims: self.dims,
             keys: self.keys.into(),
             vectors: self.vectors,

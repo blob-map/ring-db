@@ -54,9 +54,69 @@ ring-db does not use a key again, also after you delete its record.
 Searches and `get` find a record after the next commit.
 `flush` commits all changes immediately.
 
-The database stays in memory and is not saved to disk.
+`Db::in_memory` keeps the database in memory only.
+To save the database to disk, use `Db::open`.
 All methods take `&self`.
 To use a database from more than one thread, put it in an `Arc`.
+
+## Save the database to disk
+
+`Db::open(path, schema, options)` opens the database in the directory `path`.
+If the directory has no database, ring-db creates a new database in it.
+
+```rust
+use ringdb::{Db, FieldType, Options, Record, Schema};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = std::env::temp_dir().join("ring-db-readme-open");
+    let _ = std::fs::remove_dir_all(&dir);
+    let schema = Schema::new(2).field("rooms", FieldType::U32);
+
+    let db = Db::open(&dir, schema.clone(), Options::default())?;
+    let key = db.add(Record::new([1.0, 2.0]).set("rooms", 3u32))?;
+    drop(db);
+
+    let db = Db::open(&dir, schema, Options::default())?;
+    assert_eq!(db.get(key)?.vector(), [1.0, 2.0]);
+    drop(db);
+    std::fs::remove_dir_all(&dir)?;
+    Ok(())
+}
+```
+
+ring-db writes each add and delete to a log file on disk before the method returns.
+Thus, a change stays in the database after a crash or a power failure.
+Changes that were not in a commit before a crash become visible when you open the database again.
+
+The schema of an existing database cannot change.
+If the `schema` argument is different, `Db::open` returns `InvalidSchema`.
+Only one `Db` can open a directory at a time.
+A second `Db::open` of the same directory returns an `Io` error.
+
+Each write to the log waits until the disk keeps the data.
+Thus, one `add` can take some milliseconds.
+To add many records, use `db.add_all(records)`.
+It writes all records with one log write and returns their keys in order.
+If one record is not valid, `add_all` adds no records.
+
+`db.backup(dest)` makes a commit, then copies the database files into the directory `dest`.
+The directory `dest` must not exist, or it must be empty.
+To use the copy, open it with `Db::open`.
+Changes wait until the copy is complete.
+
+The database directory contains these files:
+
+| File | Contents |
+|---|---|
+| `LOCK` | A lock that prevents a second `Db::open` |
+| `MANIFEST` | The schema, the segment files, and the deleted records |
+| `seg-*.seg` | The records of one segment |
+| `wal-*.log` | The changes after the last commit |
+
+Each file has a checksum.
+If a file is damaged, `Db::open` returns `Corrupt`.
+If a crash stops a log write, ring-db ignores the incomplete change.
+Do not change the files in the directory.
 
 ## Delete and change records
 

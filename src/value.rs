@@ -1,6 +1,7 @@
 //! Field values, records to add, and documents read back.
 use std::sync::Arc;
 
+use crate::codec::{Decoder, Encoder, corrupt};
 use crate::error::{Result, RingDbError};
 use crate::query::Key;
 use crate::schema::{FieldType, Schema};
@@ -274,5 +275,64 @@ impl Document {
             .iter()
             .enumerate()
             .filter_map(|(index, value)| Some((self.schema.name(index), value.as_ref()?)))
+    }
+}
+
+impl Row {
+    /// Encode for the write-ahead log; `schema` gives the dims and field types.
+    pub(crate) fn encode(&self, e: &mut Encoder) {
+        self.vector.iter().for_each(|v| e.u32(v.to_bits()));
+        for value in &self.values {
+            let Some(value) = value else {
+                e.u8(0);
+                continue;
+            };
+            e.u8(1);
+            match value {
+                Value::U32(v) => e.u32(*v),
+                Value::U64(v) => e.u64(*v),
+                Value::I64(v) => e.u64(*v as u64),
+                Value::F32(v) => e.u32(v.to_bits()),
+                Value::Bool(v) => e.u8(u8::from(*v)),
+                Value::Text(v) => e.bytes(v.as_bytes()),
+                Value::TextList(v) => {
+                    e.u32(v.len() as u32);
+                    v.iter().for_each(|s| e.bytes(s.as_bytes()));
+                }
+                Value::Bytes(v) => e.bytes(v),
+            }
+        }
+    }
+
+    /// Decode a row written by [`Row::encode`] and check it against `schema`.
+    pub(crate) fn decode(d: &mut Decoder<'_>, schema: &Schema) -> Result<Self> {
+        let vector = (0..schema.dims())
+            .map(|_| d.u32().map(f32::from_bits))
+            .collect::<Result<Vec<f32>>>()?;
+        if vector.iter().any(|v| !v.is_finite()) {
+            return Err(corrupt("logged vector is not finite"));
+        }
+        let values = (0..schema.len())
+            .map(|field| {
+                if d.u8()? == 0 {
+                    return Ok(None);
+                }
+                let value = match schema.ty(field) {
+                    FieldType::U32 => Value::U32(d.u32()?),
+                    FieldType::U64 => Value::U64(d.u64()?),
+                    FieldType::I64 => Value::I64(d.u64()? as i64),
+                    FieldType::F32 => Value::F32(f32::from_bits(d.u32()?)),
+                    FieldType::Bool => Value::Bool(d.u8()? != 0),
+                    FieldType::Keyword | FieldType::Text => Value::Text(d.string()?),
+                    FieldType::Keywords | FieldType::TextList => {
+                        let count = d.u32()?;
+                        Value::TextList((0..count).map(|_| d.string()).collect::<Result<_>>()?)
+                    }
+                    FieldType::Bytes => Value::Bytes(d.bytes()?.to_vec()),
+                };
+                Ok(Some(value))
+            })
+            .collect::<Result<_>>()?;
+        Ok(Self { vector, values })
     }
 }

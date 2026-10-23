@@ -14,11 +14,11 @@ ring-db is a Rust 2024 exact vector database. It supports:
 - stored-only text, text-list, and byte fields read back with `get`;
 - generated, never-reused `Key`s, `delete`, and atomic commits;
 - background commits and size-tiered merges of immutable segments;
+- durable storage: a synced WAL, segment files, an atomic manifest, and `backup`;
 - CPU and Vulkan backends selected at runtime.
 
 ring-db is meant to be the source of truth for its records. Records are added and
-deleted, never changed in place. Durable storage (phase 4) is not implemented yet:
-the database is in memory only.
+deleted, never changed in place. `Db::open` is durable; `Db::in_memory` is not.
 
 ## Engineering priorities
 
@@ -65,6 +65,8 @@ src/
 ├── segment.rs         immutable Segment and SegmentBuilder
 ├── column.rs          typed columns, keyword dictionaries, inverted indexes
 ├── rows.rs            adaptive RowSet (all, empty, sparse, dense)
+├── store.rs           directory lock, WAL, MANIFEST, segment files, recovery
+├── codec.rs           checked little-endian Encoder/Decoder with CRC-32
 ├── error.rs           RingDbError
 ├── query.rs           Knn, Disk, Region, Metric, Key, Hit, RegionResult
 └── backend/
@@ -78,6 +80,7 @@ tests/
 ├── randomized.rs      comparison with an f64 reference
 ├── fields.rs          schemas, records, typed filters, segments, get
 ├── mutation.rs        deletes, commits, merges, concurrency against a model
+├── persistence.rs     reopen, crash and torn-log recovery, corruption, lock, backup
 └── vulkan.rs          CPU/Vulkan parity
 
 examples/cli.rs        filtered weighted-KNN example
@@ -271,8 +274,29 @@ Device tests also cover multi-segment databases.
 
 ## Persistence
 
-There is no persistence in phase 2. Phase 4 adds a WAL, immutable segment files, a
-manifest, recovery, and a lock file. The v1 single-build format was removed.
+`Store` (only for `Db::open`) lives in `Writer`, so every log write and manifest
+write is serialized by the writer mutex. Directory files:
+
+- `LOCK`: held with `File::try_lock` while the `Db` is open;
+- `MANIFEST`: schema, `next_key`, `next_segment`, and each part's segment id and
+  deleted rows, with a CRC; replaced by tmp file + rename + directory fsync;
+- `wal-{seq:016x}.log`: `[len u32][crc u32][payload]` frames of `Change::Add`
+  (key + encoded `Row`) and `Change::Delete`;
+- `seg-{id:016x}.seg`: an encoded `Segment` with a trailing CRC.
+
+`add`/`add_all`/`delete` append one frame batch and `sync_data` before returning; an
+I/O error poisons the store so later writes fail. A commit writes and syncs the new
+segment files, then the manifest naming them and a new WAL sequence, then deletes the
+old WAL. If the manifest write fails, the segments stay unpublished for the retry.
+Merges write their segment file before `publish_merge` writes the manifest, and
+remove replaced files after.
+
+`Store::open` locks, reads or creates the manifest, rejects a different schema,
+loads and checks every named segment, replays the WAL up to the first torn or
+corrupt frame (truncating it there), and removes unnamed files. `Db::open` then
+re-applies the recovered changes and commits. `Drop` commits durable databases.
+`backup` commits, then copies the manifest and named segments under the writer lock.
+All decoding goes through `codec::Decoder`, which returns `Corrupt`, never panics.
 
 ## Errors
 
@@ -325,6 +349,7 @@ both backends’ dataset size; `RINGDB_VULKAN_BENCH_N` overrides Vulkan only.
 | `rand` | deterministic benchmark/test data |
 | `clap` | example CLI parsing |
 | `smallvec` | inline single-disk regions |
+| `crc32fast` | checksums of WAL frames, segments, and the manifest |
 | `tempfile` | isolated test directories |
 
 The release publishes one crate. Keep release scripts and CI aligned with the package
