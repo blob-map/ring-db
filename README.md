@@ -1,33 +1,164 @@
 # ring-db
 
-ring-db is a Rust library for exact vector search on a CPU or a GPU with Vulkan.
-It finds the closest vectors, or all vectors in a region made of one or more disks.
-Each record has a vector and typed fields.
-You can filter records by their fields and set a weight for each dimension.
+**Exact vector search with filters, on a CPU or a GPU.**
 
-Exact search calculates distances for all records that pass the filter.
-ring-db uses `f32` arithmetic.
-It does not use an approximate search index.
+ring-db is a Rust library that keeps records in a database.
+Each record has a vector and some fields, for example a position, a price, and a city.
+ring-db finds the records that are closest to a point, or all the records in an area.
+You can filter the records by their fields.
+
+ring-db always gives exact results.
+It examines each record that passes the filter.
+It does not use an approximate index.
+
+- **Two searches**: the closest records (KNN), and the records in an area made of disks.
+- **Typed fields and filters**: numbers, booleans, keywords, and ranges.
+- **Changes**: add and delete records, alone or together in an atomic batch.
+- **Durable storage**: a log that stays correct after a crash, checksums, and backups.
+- **CPU or GPU**: the CPU works everywhere. Vulkan GPUs are optional.
+
+## Is ring-db correct for your project?
+
+| Use ring-db if you… | Use a different tool if you… |
+|---|---|
+| need exact results | can accept approximate results for more speed |
+| have up to some tens of millions of records | have billions of records |
+| filter records by their fields | need SQL or a database server |
+| add or delete some records each second | write thousands of records each second |
+
+ring-db is a library, not a server.
+It runs in the process of your application.
 
 ## Install
 
-Add this dependency to `Cargo.toml`:
+Add ring-db to `Cargo.toml`:
 
 ```toml
 [dependencies]
 ring-db = "0.9"
 ```
 
-The crate includes CPU and Vulkan backends.
-It has no Cargo feature flags.
-The CPU backend is the default.
-A GPU, Vulkan loader, and GPU driver are not necessary for CPU queries.
+The crate name is `ring-db`, and the library name is `ringdb`.
+You do not need a GPU, a Vulkan SDK, or Cargo features to use the CPU.
 
-## Find the closest vector
+## Quick start
 
-This example creates a database with two dimensions and no fields.
-It finds the vector closest to `[0.0, 0.0]`.
-The `dist_sq` field contains the squared distance.
+This example keeps apartments for sale in a database.
+It finds the two apartments with two rooms or more that are closest to a point.
+
+```rust
+use ringdb::{Db, FieldType, Filter, Knn, Options, Record, Schema, Value};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 1. Describe the records: a vector with 2 dimensions, and 3 fields.
+    let schema = Schema::new(2)
+        .field("title", FieldType::Text)
+        .field("rooms", FieldType::U32)
+        .field("price", FieldType::U64);
+    let db = Db::in_memory(schema, Options::default())?;
+
+    // 2. Add records. Here, the vector is a position on a map, in kilometers.
+    let studio = Record::new([0.5, 0.2])
+        .set("title", "Studio near the station")
+        .set("rooms", 1)
+        .set("price", 150_000);
+    let apartment = Record::new([1.0, 1.0])
+        .set("title", "Apartment with a balcony")
+        .set("rooms", 3)
+        .set("price", 320_000);
+    let house = Record::new([4.0, 3.0])
+        .set("title", "House with a garden")
+        .set("rooms", 5)
+        .set("price", 450_000);
+    db.add_all([studio, apartment, house])?;
+
+    // 3. Make the new records visible to searches now.
+    db.flush()?;
+
+    // 4. Find the 2 closest records with 2 rooms or more.
+    let two_rooms_or_more = Filter::range("rooms", 2..);
+    let point = [0.0, 0.0];
+    let hits = db.search(Knn::new(&point, 2).filter(&two_rooms_or_more))?;
+
+    // 5. Read the results.
+    for hit in &hits {
+        let record = db.get(hit.key)?;
+        let title = record.get("title").and_then(Value::as_str).unwrap_or("");
+        println!("{title}: {:.1} km", hit.dist_sq.sqrt());
+    }
+    assert_eq!(hits.len(), 2);
+    Ok(())
+}
+```
+
+The example prints this text:
+
+```text
+Apartment with a balcony: 1.4 km
+House with a garden: 5.0 km
+```
+
+The studio is the closest record, but it has only one room.
+Thus, the filter removes it.
+
+## Main concepts
+
+| Term | Meaning |
+|---|---|
+| Record | One vector and its field values. You add records with `add`. |
+| Key | The identifier that `add` gives to a record. ring-db does not use a key two times. |
+| Schema | The number of dimensions and the fields of each record. You cannot change it. |
+| Commit | The step that makes changes visible to searches. It occurs each second, or when you call `flush`. |
+| Segment | A block of records. Each commit adds one. ring-db merges small segments in the background. |
+| Snapshot | A view of the database at one time. Each search uses a snapshot, so changes do not affect it. |
+
+## Guide
+
+### 1. Define the schema
+
+A `Schema` gives the number of dimensions and the fields of each record.
+All vectors must have this number of dimensions.
+
+| Field type | Values | Filters |
+|---|---|---|
+| `U32`, `U64`, `I64` | Integers | Equality and ranges |
+| `F32` | Finite numbers | Equality and ranges |
+| `Bool` | `true` or `false` | Equality |
+| `Keyword` | One string, for example a city | Equality |
+| `Keywords` | Zero or more strings, for example amenities | Equality with one of the strings |
+| `Text` | One string, for example a title | No filter. ring-db only keeps the value. |
+| `TextList` | A list of strings, for example photo URLs | No filter. ring-db only keeps the value. |
+| `Bytes` | Bytes | No filter. ring-db only keeps the value. |
+
+All fields are optional.
+A record has no value for a field that you do not set.
+
+### 2. Add records
+
+`Record::new(vector)` makes a record.
+`.set(field, value)` gives a value to one field.
+
+- `db.add(record)` adds one record and returns its `Key`.
+- `db.add_all(records)` adds many records and returns their keys in the same order.
+
+ring-db examines each record before it adds it.
+It returns an error for an unknown field, a value of an incorrect type, or a field that you set two times.
+If one record is not correct, `add_all` adds no records.
+
+An integer goes into all integer fields that can hold it.
+For example, `.set("rooms", 3)` is correct for a `U32` field.
+For a `Keywords` or `TextList` field, set one string or a list, for example `["balcony", "lift"]`.
+
+A record must not be larger than 64 KiB, with its vector and its values.
+To change this limit, use `Options::max_record_bytes`.
+
+A search does not find a new record before the next commit.
+To make a commit immediately, call `db.flush()`.
+
+### 3. Find the closest records
+
+`Knn::new(&point, k)` finds the `k` records closest to `point`.
+KNN means "k nearest neighbors".
 
 ```rust
 use ringdb::{Db, Knn, Options, Record, Schema};
@@ -38,31 +169,181 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let near = db.add(Record::new([1.0, 0.0]))?;
     db.flush()?;
 
-    let origin = [0.0, 0.0];
-    let hits = db.search(Knn::new(&origin, 1))?;
-
+    let hits = db.search(Knn::new(&[0.0, 0.0], 1))?;
     assert_eq!(hits[0].key, near);
     assert_eq!(hits[0].dist_sq, 1.0);
     Ok(())
 }
 ```
 
-`add` returns a new `Key` for each record.
-ring-db does not use a key again, also after you delete its record.
-`key.get()` returns the key as a `u64` value, and `Key::new` makes a key from this value.
+Each `Hit` has the `key` of a record and its squared distance `dist_sq`.
+To get the distance, use `dist_sq.sqrt()`.
 
-Searches and `get` find a record after the next commit.
-`flush` commits all changes immediately.
+The hits are in order of distance, then in order of key.
+If fewer than `k` records pass the filter, you get all of them.
+
+### 4. Find the records in an area
+
+`Disk::new(&center, radius)` finds all records at a distance of `radius` or less from `center`.
+To find the records in two or more disks at the same time, join the disks with `.and`.
+This area is a region.
+A region can have a maximum of 16 disks.
+
+```rust
+use ringdb::{Db, Disk, Options, Record, Schema};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let db = Db::in_memory(Schema::new(2), Options::default())?;
+    db.add(Record::new([0.0, 0.0]))?;
+    let middle = db.add(Record::new([1.0, 0.0]))?;
+    db.add(Record::new([3.0, 0.0]))?;
+    db.flush()?;
+
+    // The records in the two disks.
+    let left = [0.0, 0.0];
+    let right = [2.0, 0.0];
+    let region = Disk::new(&left, 1.5).and(Disk::new(&right, 1.5));
+    let result = db.search(region)?;
+
+    assert_eq!(result.len(), 1);
+    let hit = result.get(0).expect("one record");
+    assert_eq!(hit.key, middle);
+    assert_eq!(hit.dists_sq(), &[1.0, 1.0]); // One distance for each disk.
+    Ok(())
+}
+```
+
+A search for a region returns a `RegionResult`.
+Use `result.iter()` to read all hits, or `result.keys()` to read only the keys.
+Each hit has one squared distance for each disk, in the order of the disks.
+The order of the hits can change between searches.
+
+### 5. Give a weight to each dimension
+
+ring-db uses the Euclidean distance by default:
+
+```text
+dist_sq = sum((vector[i] - point[i])^2)
+```
+
+To make some dimensions more important, give a weight to each dimension:
+
+```text
+dist_sq = sum(weights[i] * (vector[i] - point[i])^2)
+```
+
+Call `.metric(Metric::WeightedL2(&weights))` on a `Knn` or a `Disk`.
+Each search and each disk can have different weights.
+A weight of zero removes that dimension from the distance.
+Weights must be zero or more.
+
+### 6. Filter the records
+
+A `Filter` selects records by their field values.
+Each search can have one filter.
+Add it with `.filter(&filter)`.
+
+| Filter | Selected records |
+|---|---|
+| `Filter::eq(field, value)` | The field has this value. For `Keywords`, the list contains this value. |
+| `Filter::any_of(field, values)` | The field has one of these values. |
+| `Filter::range(field, range)` | The number is in the range, for example `100..=400`, `..3`, or `2.5..`. |
+| `Filter::keys(keys)` | The record has one of these keys. |
+| `a & b` | The records in `a` and in `b`. |
+| `a \| b` | The records in `a`, in `b`, or in the two. |
+| `!a` | The records that are not in `a`. |
+
+```rust
+use ringdb::{Db, Disk, FieldType, Filter, Options, Record, Schema};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Schema::new(2)
+        .field("city", FieldType::Keyword)
+        .field("amenities", FieldType::Keywords)
+        .field("price", FieldType::U64);
+    let db = Db::in_memory(schema, Options::default())?;
+    let lyon = db.add(
+        Record::new([0.0, 1.0])
+            .set("city", "Lyon")
+            .set("amenities", ["balcony", "lift"])
+            .set("price", 280_000),
+    )?;
+    db.add(Record::new([1.0, 0.0]).set("city", "Paris").set("price", 510_000))?;
+    db.flush()?;
+
+    // In Lyon or Nantes, with a balcony, for 300 000 or less.
+    let filter = Filter::any_of("city", ["Lyon", "Nantes"])
+        & Filter::eq("amenities", "balcony")
+        & Filter::range("price", ..=300_000);
+    let center = [0.0, 0.0];
+    let result = db.search(Disk::new(&center, 5.0).filter(&filter))?;
+    assert_eq!(result.keys().collect::<Vec<_>>(), [lyon]);
+    Ok(())
+}
+```
+
+Keyword filters compare the full string, with the same uppercase and lowercase letters.
+
+A record with no value for a field does not pass a filter on that field.
+Thus, `!Filter::eq("garden", true)` includes the records with no value for `garden`.
+
+### 7. Read a record
+
+`db.get(key)` returns a `Document` with the key, the vector, and the field values.
+
+- `document.vector()` returns the vector.
+- `document.get(field)` returns the `Value` of one field, or `None`.
+- `document.fields()` returns all fields that have a value.
+
+To read a `Value`, use a method, for example `as_u32()`, `as_str()`, or `as_strs()`.
+A `Keywords` value has its strings in alphabetical order, with no duplicates.
+
+`db.snapshot()` returns a `Snapshot`, which has the same `search` and `get` methods.
+Use a snapshot when two or more searches must see the same records.
+
+### 8. Delete and replace records
+
+`db.delete(key)` deletes one record.
+You cannot change a record.
+To change a record, delete it and add the new version.
+The new version gets a new key.
+
+Put the two changes in one `Batch`.
+Then, all searches find the old version or the new version, never the two and never none.
+
+```rust
+use ringdb::{Batch, Db, FieldType, Options, Record, Schema, Value};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Schema::new(2).field("price", FieldType::U64);
+    let db = Db::in_memory(schema, Options::default())?;
+    let old = db.add(Record::new([1.0, 2.0]).set("price", 300_000))?;
+
+    // The price decreases: replace the record.
+    let new = Record::new([1.0, 2.0]).set("price", 280_000);
+    let keys = db.apply(Batch::new().delete(old).add(new))?;
+    db.flush()?;
+
+    assert!(db.get(old).is_err());
+    let price = db.get(keys[0])?.get("price").and_then(Value::as_u64);
+    assert_eq!(price, Some(280_000));
+    Ok(())
+}
+```
+
+`apply` returns the keys of the added records, in the order of the batch.
+If a key is not found or a record is not correct, `apply` makes no change and returns an error.
+
+Changes become visible at the next commit.
+A background thread makes a commit each second.
+`db.flush()` makes a commit immediately.
+To make commits only when you call `flush`, use `Options::commit_interval(None)`.
+
+### 9. Save the database to disk
 
 `Db::in_memory` keeps the database in memory only.
-To save the database to disk, use `Db::open`.
-All methods take `&self`.
-To use a database from more than one thread, put it in an `Arc`.
-
-## Save the database to disk
-
-`Db::open(path, schema, options)` opens the database in the directory `path`.
-If the directory has no database, ring-db creates a new database in it.
+To keep it on disk, use `Db::open(directory, schema, options)`.
+If the directory has no database, ring-db makes a new database in it.
 
 ```rust
 use ringdb::{Db, FieldType, Options, Record, Schema};
@@ -73,9 +354,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let schema = Schema::new(2).field("rooms", FieldType::U32);
 
     let db = Db::open(&dir, schema.clone(), Options::default())?;
-    let key = db.add(Record::new([1.0, 2.0]).set("rooms", 3u32))?;
+    let key = db.add(Record::new([1.0, 2.0]).set("rooms", 3))?;
     drop(db);
 
+    // Open the database again: the record is there.
     let db = Db::open(&dir, schema, Options::default())?;
     assert_eq!(db.get(key)?.vector(), [1.0, 2.0]);
     drop(db);
@@ -84,102 +366,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-ring-db writes each add and delete to a log file on disk before the method returns.
-Thus, a change stays in the database after a crash or a power failure.
-Changes that were not in a commit before a crash become visible when you open the database again.
+Each change is on the disk before `add`, `add_all`, `delete`, or `apply` returns.
+Thus, your changes stay after a crash or a power failure.
+After a crash, a batch is fully in the database, or it is not in the database.
 
-The schema of an existing database cannot change.
-If the `schema` argument is different, `Db::open` returns `InvalidSchema`.
-Only one `Db` can open a directory at a time.
-A second `Db::open` of the same directory returns an `Io` error.
+Each write waits for the disk, which can take some milliseconds.
+To add many records, use one `add_all`, not many `add` calls.
 
-Each write to the log waits until the disk keeps the data.
-Thus, one `add` can take some milliseconds.
-To add many records, use `db.add_all(records)`.
-It writes all records with one log write and returns their keys in order.
-If one record is not valid, `add_all` adds no records.
-`db.apply(batch)` also writes all changes of the batch with one log write.
+- `Db::open` returns `InvalidSchema` if the schema is different from the schema on the disk.
+- Only one `Db` can open a directory at a time. A second `Db::open` returns an `Io` error.
+- Each file has a checksum. If a file is damaged, `Db::open` returns `Corrupt`.
+- `db.backup(directory)` copies the database to a new, empty directory. Open the copy with `Db::open`.
 
-`db.backup(dest)` makes a commit, then copies the database files into the directory `dest`.
-The directory `dest` must not exist, or it must be empty.
-To use the copy, open it with `Db::open`.
-Changes wait until the copy is complete.
+Do not change the files in the database directory.
 
-The database directory contains these files:
+### 10. Use a GPU
 
-| File | Contents |
-|---|---|
-| `LOCK` | A lock that prevents a second `Db::open` |
-| `MANIFEST` | The schema, the segment files, and the deleted records |
-| `seg-*.seg` | The records of one segment |
-| `wal-*.log` | The changes after the last commit |
-
-Each file has a checksum.
-If a file is damaged, `Db::open` returns `Corrupt`.
-If a crash stops a log write, ring-db ignores all changes of that write.
-Thus, after a crash, a batch is fully in the database or not in the database.
-Do not change the files in the directory.
-
-## Delete and change records
-
-`db.delete(key)` deletes one record.
-It returns `KeyNotFound` if the record does not exist or is already deleted.
-You cannot change a record.
-To change a record, delete it and add the new version, which gets a new key.
-
-ring-db collects changes and applies them in a commit.
-A commit makes all changes since the previous commit visible at the same time.
-A background thread makes a commit at each `Options::commit_interval`, one second by default.
-`db.flush()` makes a commit immediately.
-To make commits only with `flush`, set `commit_interval(None)`.
-
-To make changes visible at the same time, put them in a `Batch` and use `db.apply(batch)`.
-A commit cannot occur between the changes of one batch.
-Thus, searches find the old version or the new version of a record, but never both or none.
-
-```rust
-use ringdb::{Batch, Db, FieldType, Options, Record, Schema};
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let schema = Schema::new(2).field("price", FieldType::U64);
-    let db = Db::in_memory(schema, Options::default())?;
-    let old = db.add(Record::new([1.0, 2.0]).set("price", 300_000u64))?;
-
-    let new = Record::new([1.0, 2.0]).set("price", 280_000u64);
-    let keys = db.apply(Batch::new().delete(old).add(new))?;
-    db.flush()?;
-
-    assert!(db.get(old).is_err());
-    assert_eq!(db.get(keys[0])?.get("price").and_then(|v| v.as_u64()), Some(280_000));
-    Ok(())
-}
-```
-
-`apply` returns the keys of the added records, in the order of the batch.
-If a record is not valid or a key is not found, `apply` makes no changes and returns an error.
-`db.add`, `db.add_all`, and `db.delete` are batches with one type of change.
-
-Each commit adds a segment that contains the new records.
-After a commit, ring-db merges small segments into larger segments in the background.
-A merge also removes deleted records from storage.
-Searches do not stop during a merge.
-To stop automatic merges, set `auto_merge(false)`.
-
-`db.compact()` merges all segments into one segment.
-A search on one segment is the fastest.
-Use `compact` after you add many records, for example after an import.
-
-## Select CPU or Vulkan
-
-The two backends can execute all search types, weights, and filters.
-The backend selection occurs at runtime.
-
-| Backend | Selection | Runtime requirements |
-|---|---|---|
-| CPU | `BackendPreference::Cpu`, or the default | No GPU runtime |
-| Vulkan | `BackendPreference::Vulkan` | A Vulkan 1.2 loader, driver, and compatible compute device |
-
-To use Vulkan, set the backend in `Options`:
+ring-db can search on a GPU with Vulkan.
+Select the backend in `Options`:
 
 ```rust,no_run
 use ringdb::{BackendPreference, Db, Options, Record, Schema};
@@ -194,264 +398,72 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-ring-db loads Vulkan only when you select it.
-The crate contains compiled shaders.
-A Vulkan SDK and shader compiler are not necessary to build or use the crate.
+The two backends give the same results, with all searches, weights, and filters.
+Small rounding differences can occur near the edge of a disk.
 
-Vulkan can use compatible NVIDIA and AMD GPUs.
-ring-db first tries discrete GPUs, then integrated GPUs, then other compute devices.
-It can also use a software Vulkan driver.
-The backend requires Vulkan 1.2, Buffer Device Address, and 64-bit shader integers.
-ring-db examines device support and enables these features automatically.
-Subgroup extensions and 64-bit shader atomics are not necessary.
+Vulkan needs a Vulkan 1.2 loader, a GPU driver, and a compatible device.
+NVIDIA, AMD, and integrated GPUs can be compatible.
+If no compatible device is available, `Db::in_memory` and `Db::open` return `BackendUnavailable`.
+ring-db does not change to the CPU automatically.
 
-If Vulkan is unavailable, database creation returns `BackendUnavailable`.
-ring-db does not automatically change the backend to CPU.
+ring-db copies the vectors to the GPU one time and keeps them there.
+All vectors must fit in the GPU memory.
+ring-db searches small segments on the CPU, because the CPU is faster for them.
+To change this limit, use `Options::vulkan_min_rows`.
 
-The Vulkan backend uploads the vectors of each segment one time and keeps them in device memory.
-ring-db searches small segments on the CPU, because a CPU search of a small segment is faster than a GPU dispatch.
-By default, a segment is small if it has fewer than 16384 coordinates, for example 256 vectors with 64 dimensions.
-To change this limit, set `Options::vulkan_min_rows(rows)`.
-To search all segments on the GPU, set `vulkan_min_rows(0)`.
-It executes queries on one database in sequence.
-It keeps query buffers for subsequent queries until you drop the database.
-Each result owns its data and stays valid after subsequent queries.
+## Reference
 
-Vulkan uses 64-bit device addresses to access vector data and query buffers.
-A single vector buffer can be more than 4 GiB.
-The storage-buffer binding limit does not apply to these device addresses.
+### Options
 
-If a device's allocation limit is too small, ring-db divides a segment into groups of vectors called chunks.
-Queries combine the results from all segments and chunks and keep the original keys.
-KNN returns the closest vectors across the full dataset.
-All vectors and query buffers must fit the available device memory.
-An allocation that is too large causes a backend error.
-Floating-point rounding can cause small differences between CPU and Vulkan results, especially near distance limits.
+| Method | Default | Function |
+|---|---|---|
+| `backend(preference)` | `BackendPreference::Cpu` | Selects the CPU or Vulkan. |
+| `commit_interval(interval)` | One second | Sets the time between background commits. `None` stops them. |
+| `auto_merge(enabled)` | `true` | Merges small segments after each commit. |
+| `max_record_bytes(bytes)` | 64 KiB | Sets the largest size of one record. |
+| `vulkan_min_rows(rows)` | 16384 values divided by the dimensions | Sets the smallest segment that Vulkan searches. `0` sends all segments to the GPU. |
 
-To run the example with Vulkan, use this command:
+### Errors
+
+| Error | Cause |
+|---|---|
+| `DimensionMismatch` | A vector, a point, or a weight array has an incorrect number of dimensions. |
+| `InvalidRecord` | A record has an incorrect value, or it is too large. |
+| `UnknownField` | A record or a filter uses a field that is not in the schema. |
+| `InvalidQuery` | A search, a filter, or a vector is not correct, for example a coordinate that is not finite, or a filter on a `Text` field. |
+| `KeyNotFound` | No record has this key, or the record is deleted. |
+| `InvalidSchema` | The schema is not correct, or it is different from the schema on the disk. |
+| `Io` | A file operation failed, or a different `Db` has the directory open. |
+| `Corrupt` | A database file is damaged. |
+| `BackendUnavailable` | Vulkan, its driver, or a compatible device is not available. |
+| `Backend` | A GPU operation failed. |
+
+### Limits
+
+- Vector coordinates, points, and centers must be finite numbers.
+- Weights and radii must be finite and zero or more.
+- A region has 1 to 16 disks (`MAX_DISKS`).
+- A database has fewer than 4 294 967 295 rows. Deleted rows count until a merge removes them.
+
+### Tips for speed
+
+- After a large import, call `db.compact()`. A search on one segment is the fastest.
+- To add many records, use `add_all`, which writes to the disk one time.
+- Keyword filters and narrow ranges are fast. A filter that selects few records makes the search faster.
+- All methods take `&self`. To use one database from many threads, put it in an `Arc`.
+
+## Command-line example
+
+This command adds 100 000 random vectors and searches one category:
 
 ```bash
-cargo run --release --example cli -- --backend vulkan --n 100000 --dims 64 --k 10
+cargo run --release --example cli -- --n 100000 --dims 64 --k 10 --category 3
 ```
 
-## Schemas and fields
-
-A `Schema` gives the number of dimensions and the fields of each record.
-You cannot change the schema after you create the database.
-All vectors must have this number of dimensions, which must be more than zero.
-
-Each field has a name and a `FieldType`:
-
-| Type | Values | Filter |
-|---|---|---|
-| `U32`, `U64`, `I64` | Integers | Equality and ranges |
-| `F32` | Finite `f32` numbers | Equality and ranges |
-| `Bool` | `true` or `false` | Equality |
-| `Keyword` | One string, such as a city | Exact equality |
-| `Keywords` | Zero or more strings, such as amenities | Exact equality with one string |
-| `Text` | A UTF-8 string | Stored only |
-| `TextList` | A list of UTF-8 strings | Stored only |
-| `Bytes` | Bytes | Stored only |
-
-All fields are optional.
-Use `Record::set(field, value)` to give a value to a field.
-A record has no value for the fields that you do not set.
-
-An integer value can go into all integer types that can hold it.
-For example, `set("rooms", 3)` is correct for a `U32` field.
-For a `Keywords` or `TextList` field, you can set one string or a list of strings.
-
-`add` examines each record against the schema.
-It returns an error for an unknown field, an incorrect value type, or a field that you set two times.
-A record must not be larger than `Options::max_record_bytes`.
-The default limit is 64 KiB for the vector and all field values together.
-
-## Find the closest open bakery
-
-This example filters places by type and status.
-It then searches the places that pass the two filters.
-The coordinates give positions on a flat map with the same unit on both axes.
-They are not latitude and longitude.
-
-The weights `[4.0, 1.0]` multiply the squared difference on the first axis by four.
-The second axis has a weight of one.
-
-```rust
-use ringdb::{Db, FieldType, Filter, Knn, Metric, Options, Record, Schema, Value};
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let schema = Schema::new(2)
-        .field("name", FieldType::Text)
-        .field("kind", FieldType::Keyword)
-        .field("open", FieldType::Bool);
-    let db = Db::in_memory(schema, Options::default())?;
-
-    // Position, name, type, and status for each place.
-    let places = [
-        ([0.8, 1.5], "Fournil", "bakery", true),
-        ([0.2, 0.3], "Kawa", "cafe", true),
-        ([1.0, 0.4], "Mie Dorée", "bakery", false),
-        ([2.0, 0.0], "Levain", "bakery", true),
-    ];
-    for (position, name, kind, open) in places {
-        db.add(
-            Record::new(position)
-                .set("name", name)
-                .set("kind", kind)
-                .set("open", open),
-        )?;
-    }
-    db.flush()?;
-
-    let open_bakeries = Filter::eq("kind", "bakery") & Filter::eq("open", true);
-    let origin = [0.0, 0.0];
-    let weights = [4.0, 1.0];
-    let hits = db.search(
-        Knn::new(&origin, 1)
-            .metric(Metric::WeightedL2(&weights))
-            .filter(&open_bakeries),
-    )?;
-
-    let hit = hits.first().expect("one open bakery");
-    let place = db.get(hit.key)?;
-    let name = place.get("name").and_then(Value::as_str);
-    assert_eq!(name, Some("Fournil"));
-    println!("{name:?} is at distance {}", hit.dist_sq.sqrt());
-    Ok(())
-}
-```
-
-The search compares the two open bakeries.
-It does not include the cafe and the closed bakery, although they are closer to the origin.
-The result contains the bakery with the name `Fournil`.
-
-## Filters
-
-A `Filter` selects records by their field values.
-Each search can have one filter.
-To apply it, call `.filter(&filter)` on the search.
-Without this call, the search examines all records.
-
-| Filter | Selected records |
-|---|---|
-| `Filter::eq(field, value)` | The field is equal to `value`. For `Keywords`, the field contains `value` |
-| `Filter::any_of(field, values)` | The field is equal to, or contains, one or more of `values` |
-| `Filter::range(field, low..high)` | The numeric field is in the range |
-| `Filter::keys(keys)` | The record has one of `keys` |
-| `a & b` | The records in `a` and in `b` |
-| `a \| b` | The records in `a`, in `b`, or in the two filters |
-| `!a` | All records not in `a` |
-
-Ranges can use all Rust range forms, for example `100..=400`, `..3`, or `50.0..`.
-Keyword filters compare full strings, with the same case.
-
-A record with no value for a field does not pass a filter on that field.
-Thus `!Filter::eq("garden", true)` includes the records with no `garden` value.
-
-ring-db examines a filter against the schema before the search.
-It returns `UnknownField` for an unknown field.
-It returns `InvalidQuery` for a stored-only field or an incorrect value type.
-
-## Searches and distances
-
-ring-db has two search types: K-nearest-neighbor (KNN) search and region search.
-Give each search to `db.search(...)`.
-All distance limits include their boundary values.
-
-| Search | Result | Condition |
-|---|---|---|
-| `Knn::new(&query, k)` | `Vec<Hit>` | The `k` closest vectors that pass the filter |
-| `Disk::new(&center, radius)` | `RegionResult` | At most `radius` from `center` |
-| `disk_a.and(disk_b)` | `RegionResult` | In all disks |
-
-A region is the intersection of one or more disks.
-A disk is a region with one disk.
-To add a disk to a region, call `.and(disk)`.
-A region can contain a maximum of `MAX_DISKS` (16) disks.
-
-This example finds the vectors in two disks:
-
-```rust
-use ringdb::{Db, Disk, Options, Record, Schema};
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let db = Db::in_memory(Schema::new(2), Options::default())?;
-    db.add(Record::new([0.0, 0.0]))?;
-    let middle = db.add(Record::new([1.0, 0.0]))?;
-    db.add(Record::new([3.0, 0.0]))?;
-    db.flush()?;
-
-    let left = [0.0, 0.0];
-    let right = [2.0, 0.0];
-    let region = Disk::new(&left, 1.5).and(Disk::new(&right, 1.5));
-    let result = db.search(region)?;
-
-    assert_eq!(result.len(), 1);
-    let hit = result.get(0).expect("one vector in the two disks");
-    assert_eq!(hit.key, middle);
-    assert_eq!(hit.dists_sq(), &[1.0, 1.0]);
-    Ok(())
-}
-```
-
-For KNN, `k = 0` gives no results.
-If fewer than `k` vectors pass the filter, the search returns all of them.
-KNN sorts hits by squared distance, then by key.
-For equal distances, the smaller key comes first.
-Each `Hit` contains the `key` and the squared distance `dist_sq`.
-
-A `RegionResult` contains one `RegionHit` for each vector in the region.
-Each region hit contains the `key`.
-`dists_sq()` returns one squared distance for each disk, in the disk order.
-The order of region hits can change between searches.
-
-The default distance is Euclidean distance, also called L2 distance.
-ring-db calculates its square:
-
-```text
-dist_sq = sum((vector[i] - query[i])^2)
-```
-
-To use diagonal weights, call `.metric(Metric::WeightedL2(&weights))`:
-
-```text
-dist_sq = sum(weights[i] * (vector[i] - query[i])^2)
-```
-
-ring-db uses each weight as supplied.
-It does not square the weights.
-A zero weight removes that dimension from the distance calculation.
-Each KNN search and each disk can use different weights.
-Full weight matrices are not available.
-
-Search inputs have these requirements:
-
-- Vectors, query vectors, centers, and weight arrays must have the database dimension count.
-- Vector coordinates, query coordinates, and centers must be finite, without `NaN` or infinity.
-- Weights and radii must be finite and non-negative.
-- A region must contain 1 to 16 disks.
-
-To get the distance from a squared distance, use `dist_sq.sqrt()`.
-
-## Read a record
-
-`db.get(key)` returns a `Document` with the key, the vector, and the field values.
-It returns `KeyNotFound` if no visible record has this key.
-
-`document.get(field)` returns the `Value` of one field, or `None` if the record has no value.
-Use the `Value` methods, such as `as_u32()` or `as_str()`, to read the value.
-`document.fields()` returns all fields that have a value, in schema order.
-
-A `Keywords` value contains its strings in sorted order, without duplicates.
-An empty list has the same result as no value.
-
-`db.snapshot()` returns a `Snapshot`.
-A snapshot is a view of the database at one time.
-Searches and `get` on a snapshot do not see the records that you add after this time.
+To use Vulkan, add `--backend vulkan`.
+For the API reference, run `cargo doc --open`.
 
 ## Development
-
-The shell commands in this section use Bash syntax.
 
 Run the standard checks:
 
@@ -461,43 +473,34 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-`cargo test` also compiles the Rust examples in this README.
-It executes the examples that do not have the `no_run` attribute.
-A GPU is not necessary for the standard tests.
+`cargo test` also tests the Rust examples in this README.
+It does not need a GPU.
 
-To compare Vulkan queries with CPU results, run the device tests:
+To compare Vulkan results with CPU results, use a hardware or software Vulkan device:
 
 ```bash
 RINGDB_VULKAN_TEST=1 cargo test --test vulkan
 ```
 
-A compatible hardware or software Vulkan device is necessary for these tests.
-Without `RINGDB_VULKAN_TEST=1`, the device tests do not execute GPU queries.
-The test for an unavailable driver always executes.
-The continuous integration (CI) tests use Mesa software Vulkan.
-
-To test vector addresses beyond 4 GiB, use this command:
+To test vector addresses above 4 GiB, use this command.
+It needs more than 4 GiB of GPU memory.
 
 ```bash
 RINGDB_VULKAN_TEST=1 RINGDB_VULKAN_LARGE_TEST=1 cargo test --test vulkan vulkan_reads_vectors_past_four_gib
 ```
 
-This test uses more than 4 GiB of device memory and additional host memory.
-Devices with a small allocation limit use multiple buffers during this test.
-
-The `src/backend/vulkan/shaders` directory contains shader sources and compiled SPIR-V files.
-For shader development, install `glslc` and `spirv-val`.
-After a shader source change, regenerate and validate the compiled files:
+The crate contains compiled shaders.
+To change a shader in `src/backend/vulkan/shaders`, install `glslc` and `spirv-val`.
+Then compile and validate the shaders:
 
 ```bash
 sh src/backend/vulkan/shaders/compile.sh
 ```
 
-These shader tools are not necessary for applications that use ring-db.
-
 ## Benchmarks
 
-To run benchmarks with a smaller dataset, use one of these commands:
+The benchmarks use 30 million vectors by default.
+To use fewer vectors, set `RINGDB_BENCH_N`:
 
 ```bash
 RINGDB_BENCH_N=100000 cargo bench --bench query_backends
@@ -505,85 +508,40 @@ RINGDB_BENCH_N=100000 cargo bench --bench query_backends cpu_knn
 RINGDB_BENCH_N=100000 cargo bench --bench query_backends cpu_region
 ```
 
-The default dataset has 30 million vectors.
-`RINGDB_BENCH_N` sets the vector count for the two backends.
-`RINGDB_VULKAN_BENCH_N` sets a different count for Vulkan alone.
-The Vulkan benchmark groups do not execute if a compatible runtime or device is unavailable.
+`RINGDB_VULKAN_BENCH_N` sets a different number of vectors for Vulkan.
+If Vulkan is not available, the Vulkan benchmarks do not run.
 
-To compare CPU and Vulkan on 10 million vectors with 64 dimensions, use this command:
+To compare the CPU and Vulkan on the same data, use this command:
 
 ```bash
 cargo bench --bench backend_compare -- \
   --n 10000000 --dims 64 --k 10 --samples 20 --rounds 2
 ```
 
-This benchmark generates the same data from a fixed random seed.
-It executes one backend at a time and reverses their order in each round.
-It uses four query vectors for five workloads:
-
-- Disk
-- Three-disk intersection
-- Exact KNN
-- Weighted KNN
-- KNN with a filter that selects 1% of the vectors.
-
-The times include result transfers.
-They do not include dataset generation, upload, warm-up queries, validation, and result destruction.
-The benchmark gives median and 95th-percentile query times.
-It writes each sample to `target/backend-compare.csv`.
-
-The benchmark validates KNN keys, result order, and distances.
-For region searches, it examines membership differences with `f64` calculations near distance limits.
-Differences more than the accepted tolerance cause an error.
-
-To change a benchmark run, use these command-line options:
+This benchmark runs five searches: a disk, an intersection of three disks, KNN, weighted KNN, and KNN with a filter.
+It runs one backend at a time and compares their results.
+It gives the median and 95th-percentile times, and it writes all samples to `target/backend-compare.csv`.
+The times include the transfer of results, but not the upload of the data.
 
 | Option | Function |
 |---|---|
-| `--probe` | Show Vulkan device limits without a dataset |
-| `--n 100000 --samples 2 --rounds 1` | Use a small dataset for a short test |
-| `--backend cpu` | Run CPU alone, without a Vulkan load |
-| `--backend vulkan` | Run Vulkan alone |
-| `--workload intersection3` | Run only the three-disk intersection |
-| `--output path.csv` | Select a different CSV file |
-| `--radius-scale` | Multiply disk radii by this value; default `1` |
-| `--intersection-shift` | Set the coordinate offset of the other two centers; default `0.01` |
+| `--probe` | Shows the limits of the Vulkan device. It makes no data. |
+| `--n 100000 --samples 2 --rounds 1` | Makes a short test with little data. |
+| `--backend cpu` or `--backend vulkan` | Runs one backend only. It does not compare results. |
+| `--workload intersection3` | Runs only the intersection of three disks. |
+| `--output path.csv` | Writes the samples to a different file. |
+| `--radius-scale` | Multiplies the disk radii. The default is `1`. |
+| `--intersection-shift` | Moves the centers of the second and third disks. The default is `0.01`. |
 
-A run with only one backend does not compare results with the other backend.
-For 10 million vectors with 64 dimensions, vector data uses 2.56 GB.
-Query buffers and results use more memory.
+These environment variables help you examine Vulkan:
 
-To test smaller chunks, set `RINGDB_VULKAN_CHUNK_BYTES` to a positive byte count.
-This development option sets an upper limit for each vector buffer.
-It cannot increase device limits.
-Leave it unset for automatic chunk sizes.
+| Variable | Function |
+|---|---|
+| `RINGDB_VULKAN_CHUNK_BYTES` | Sets the largest GPU buffer for vectors, in bytes, to test chunks. |
+| `RINGDB_VULKAN_TIMINGS=1` | Logs the GPU time of each submission. Do not use it to measure full search times. |
+| `VK_DRIVER_FILES` | Selects a Vulkan driver. |
 
-This command divides 10 million vectors into chunks of at most 5 million vectors:
-
-```bash
-RINGDB_VULKAN_CHUNK_BYTES=1280000000 cargo bench --bench backend_compare -- \
-  --n 10000000 --dims 64 --k 10 --samples 20 --rounds 2
-```
-
-For timing measurements, disable Vulkan validation layers.
-If necessary, use `VK_DRIVER_FILES` to select a Vulkan driver manifest.
-
-To log Vulkan GPU times, set `RINGDB_VULKAN_TIMINGS=1`.
-The selected compute queue must have timestamp support for this option.
-The logged times include GPU work, barriers, and transfers in each submission.
-They do not include CPU work and do not give the full query time.
-
-For comparisons of full query times, keep `RINGDB_VULKAN_TIMINGS` unset.
-
-## Command-line example
-
-To search one category, run this command:
-
-```bash
-cargo run --release --example cli -- --n 100000 --dims 64 --k 10 --category 3
-```
-
-For the API reference, run `cargo doc --open`.
+For correct times, do not use the Vulkan validation layers.
 
 ## License
 
