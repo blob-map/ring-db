@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use common::{group, knn_keys, manual, region_keys};
 use rand::{RngExt, SeedableRng};
-use ringdb::{BackendPreference, Db, Disk, Key, Knn, Options, Record, RingDbError, Value};
+use ringdb::{BackendPreference, Batch, Db, Disk, Key, Knn, Options, Record, RingDbError, Value};
 
 fn db(options: Options) -> Db {
     Db::in_memory(common::schema(1), options).unwrap()
@@ -96,6 +96,70 @@ fn an_update_between_explicit_commits_is_atomic() {
         assert_eq!(doc.vector(), [version as f32]);
         key = next;
     }
+}
+
+#[test]
+fn a_failed_batch_makes_no_change() {
+    let db = db(manual(BackendPreference::Cpu));
+    let keys: Vec<Key> = (0..3).map(|i| add(&db, i as f32)).collect();
+    db.flush().unwrap();
+    let record = |x: f32| Record::new([x]).set("group", 0u32);
+    not_found(
+        db.apply(
+            Batch::new()
+                .delete(keys[0])
+                .delete(Key::new(9))
+                .add(record(5.0)),
+        ),
+    );
+    not_found(db.apply(Batch::new().delete(keys[1]).delete(keys[1])));
+    let invalid = Batch::new()
+        .delete(keys[2])
+        .add(record(6.0).set("nope", 1u32));
+    assert!(matches!(
+        db.apply(invalid),
+        Err(RingDbError::UnknownField(_))
+    ));
+    assert!(db.apply(Batch::new()).unwrap().is_empty());
+    db.flush().unwrap();
+    assert_eq!(visible(&db), [0, 1, 2]);
+    // No key was used by the failed batches.
+    let added = db
+        .apply(
+            Batch::new()
+                .delete(keys[0])
+                .add(record(7.0))
+                .add(record(8.0)),
+        )
+        .unwrap();
+    assert_eq!(added, [Key::new(3), Key::new(4)]);
+    db.flush().unwrap();
+    assert_eq!(visible(&db), [1, 2, 3, 4]);
+}
+
+#[test]
+fn batches_replace_records_atomically_during_background_commits() {
+    let db = db_with_interval(Duration::from_millis(1));
+    let first = add(&db, 0.0);
+    db.flush().unwrap();
+    let done = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let mut key = first;
+            for version in 1..=500 {
+                let record = Record::new([version as f32]).set("group", 0u32);
+                key = db.apply(Batch::new().delete(key).add(record)).unwrap()[0];
+            }
+            done.store(true, Ordering::Relaxed);
+        });
+        while !done.load(Ordering::Relaxed) {
+            // Exactly one version is visible in every snapshot.
+            assert_eq!(visible(&db).len(), 1);
+        }
+    });
+    db.flush().unwrap();
+    let keys = visible(&db);
+    assert_eq!(db.get(Key::new(keys[0])).unwrap().vector(), [500.0]);
 }
 
 fn db_with_interval(interval: Duration) -> Db {

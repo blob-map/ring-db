@@ -22,7 +22,7 @@ use crate::query::{
 use crate::rows::RowSet;
 use crate::schema::Schema;
 use crate::segment::{Segment, SegmentBuilder};
-use crate::store::{self, Change, Manifest, Store};
+use crate::store::{self, Change, LogFrame, Manifest, Store};
 use crate::value::{Document, Record, Row};
 
 /// A segment is rewritten when at least this fraction of its rows is deleted.
@@ -44,6 +44,9 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// A background thread commits every [`Options::commit_interval`];
 /// [`flush`](Self::flush) commits at once. To change a record, delete it and
 /// add the new version, which gets a new key.
+///
+/// [`apply`](Self::apply) makes several changes at once: they become visible
+/// in the same commit, so a delete and an add can replace a record atomically.
 ///
 /// A database opened with [`Db::open`] is durable: each change is synced to a
 /// write-ahead log before the call returns, and survives a crash.
@@ -88,13 +91,6 @@ impl Writer {
         self.unpublished.iter().map(Segment::len).sum::<usize>() + self.pending.len()
     }
 
-    fn log(&mut self, changes: &[Vec<u8>]) -> Result<()> {
-        match &mut self.store {
-            Some(store) => store.log(changes),
-            None => Ok(()),
-        }
-    }
-
     /// Whether `key` is added and not deleted, committed or not.
     fn is_live(&self, key: Key, visible: &Snapshot) -> bool {
         match self.pending.row(key) {
@@ -116,6 +112,49 @@ impl Writer {
             Some(row) => self.pending_deleted.insert(row),
             None => self.deletes.insert(key),
         }
+    }
+}
+
+/// Deletes and adds that [`Db::apply`] makes together.
+///
+/// ```
+/// use ringdb::{Batch, Db, Options, Record, Schema};
+///
+/// let db = Db::in_memory(Schema::new(1), Options::default()).unwrap();
+/// let old = db.add(Record::new([1.0])).unwrap();
+/// let keys = db.apply(Batch::new().delete(old).add(Record::new([2.0]))).unwrap();
+/// db.flush().unwrap();
+/// assert_eq!(db.get(keys[0]).unwrap().vector(), [2.0]);
+/// assert!(db.get(old).is_err());
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct Batch {
+    deletes: Vec<Key>,
+    adds: Vec<Record>,
+}
+
+impl Batch {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Delete the record with `key`.
+    #[must_use]
+    pub fn delete(mut self, key: Key) -> Self {
+        self.deletes.push(key);
+        self
+    }
+
+    /// Add `record`. [`Db::apply`] returns its key.
+    #[must_use]
+    #[allow(clippy::should_implement_trait)] // the same name as `Db::add`
+    pub fn add(mut self, record: Record) -> Self {
+        self.adds.push(record);
+        self
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.deletes.is_empty() && self.adds.is_empty()
     }
 }
 
@@ -219,13 +258,44 @@ impl Db {
     /// If one record is invalid, none is added. Use this to import many
     /// records into a durable database.
     pub fn add_all(&self, records: impl IntoIterator<Item = Record>) -> Result<Vec<Key>> {
+        let adds = records.into_iter().collect();
+        self.apply(Batch {
+            deletes: Vec::new(),
+            adds,
+        })
+    }
+
+    /// Delete the record with `key`, visible or not yet committed.
+    ///
+    /// Returns [`RingDbError::KeyNotFound`] if no such record exists or it is
+    /// already deleted.
+    pub fn delete(&self, key: Key) -> Result<()> {
+        self.apply(Batch::new().delete(key)).map(drop)
+    }
+
+    /// Make the deletes and adds of `batch`, and return the keys of its added
+    /// records in order.
+    ///
+    /// All changes become visible in the same commit. A durable database logs
+    /// them with one sync, and recovery after a crash keeps all of them or none.
+    /// If a record is invalid, or a key is not found or is deleted twice, this
+    /// returns an error and makes no change.
+    pub fn apply(&self, batch: Batch) -> Result<Vec<Key>> {
         let shared = &self.shared;
-        let rows = records
+        let rows = batch
+            .adds
             .into_iter()
             .map(|record| record.validate(&shared.schema, shared.options.max_record_bytes))
             .collect::<Result<Vec<Row>>>()?;
         let mut writer = lock(&shared.writer);
-        if writer.rows() + shared.snapshot().rows() + rows.len() >= u32::MAX as usize {
+        let visible = shared.snapshot();
+        let mut deleted = BTreeSet::new();
+        for &key in &batch.deletes {
+            if !deleted.insert(key) || !writer.is_live(key, &visible) {
+                return Err(RingDbError::KeyNotFound(key.0));
+            }
+        }
+        if !rows.is_empty() && writer.rows() + visible.rows() + rows.len() >= u32::MAX as usize {
             return Err(RingDbError::InvalidRecord(
                 "a database holds at most u32::MAX - 1 rows, deleted rows included \
                  until they are merged away"
@@ -234,34 +304,24 @@ impl Db {
         }
         let first = writer.next_key;
         let keys: Vec<Key> = (first..first + rows.len() as u64).map(Key).collect();
-        if writer.store.is_some() {
-            let changes: Vec<Vec<u8>> = keys
-                .iter()
+        if let Some(store) = &mut writer.store
+            && !(keys.is_empty() && deleted.is_empty())
+        {
+            let mut frame = LogFrame::default();
+            deleted.iter().for_each(|&key| frame.delete(key));
+            keys.iter()
                 .zip(&rows)
-                .map(|(&key, row)| Change::encode_add(key, row))
-                .collect();
-            writer.log(&changes)?;
+                .for_each(|(&key, row)| frame.add(key, row));
+            store.log(&frame)?;
+        }
+        for key in deleted {
+            writer.delete(key, &visible);
         }
         writer.next_key += rows.len() as u64;
         for (&key, row) in keys.iter().zip(rows) {
             writer.pending.push(key, row);
         }
         Ok(keys)
-    }
-
-    /// Delete the record with `key`, visible or not yet committed.
-    ///
-    /// Returns [`RingDbError::KeyNotFound`] if no such record exists or it is
-    /// already deleted.
-    pub fn delete(&self, key: Key) -> Result<()> {
-        let mut writer = lock(&self.shared.writer);
-        let visible = self.shared.snapshot();
-        if !writer.is_live(key, &visible) {
-            return Err(RingDbError::KeyNotFound(key.0));
-        }
-        writer.log(&[Change::encode_delete(key)])?;
-        writer.delete(key, &visible);
-        Ok(())
     }
 
     /// Commit every change now. With [`Options::auto_merge`], then merge

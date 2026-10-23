@@ -12,7 +12,7 @@ ring-db is a Rust 2024 exact vector database. It supports:
 - a fixed `Schema` of typed, optional fields per record;
 - typed `Filter`s over numeric, bool, and keyword fields;
 - stored-only text, text-list, and byte fields read back with `get`;
-- generated, never-reused `Key`s, `delete`, and atomic commits;
+- generated, never-reused `Key`s, `delete`, atomic `Batch`es, and commits;
 - background commits and size-tiered merges of immutable segments;
 - durable storage: a synced WAL, segment files, an atomic manifest, and `backup`;
 - CPU and Vulkan backends selected at runtime.
@@ -114,7 +114,9 @@ hold it; `Drop` stops and joins that thread.
 ## Commits, deletes, and merges
 
 The writer mutex holds the next key, the pending `SegmentBuilder`, deleted pending
-rows, and visible keys to delete. A commit freezes the builder into a `Segment`,
+rows, and visible keys to delete. `Db::apply` is the only write path: it validates the
+whole `Batch`, then logs and applies it under one writer lock, so no commit splits a
+batch. A commit freezes the builder into a `Segment`,
 uploads it, and publishes adds and deletes in one new `Snapshot` (an `Arc` replaced
 under an `RwLock`). Lock `writer` before `current`, always. Searches and `get` run
 on a snapshot clone without locks. Uncommitted changes are invisible.
@@ -284,11 +286,12 @@ write is serialized by the writer mutex. Directory files:
 - `LOCK`: held with `File::try_lock` while the `Db` is open;
 - `MANIFEST`: schema, `next_key`, `next_segment`, and each part's segment id and
   deleted rows, with a CRC; replaced by tmp file + rename + directory fsync;
-- `wal-{seq:016x}.log`: `[len u32][crc u32][payload]` frames of `Change::Add`
-  (key + encoded `Row`) and `Change::Delete`;
+- `wal-{seq:016x}.log`: `[len u32][crc u32][payload]` frames. A payload is the
+  `LogFrame` of one `Db::apply`: its deletes, then its adds (key + encoded `Row`);
 - `seg-{id:016x}.seg`: an encoded `Segment` with a trailing CRC.
 
-`add`/`add_all`/`delete` append one frame batch and `sync_data` before returning; an
+Each `apply` (and so `add`/`add_all`/`delete`) appends one frame and calls
+`sync_data` before returning, so recovery keeps a whole batch or none of it. An
 I/O error poisons the store so later writes fail. A commit writes and syncs the new
 segment files, then the manifest naming them and a new WAL sequence, then deletes the
 old WAL. If the manifest write fails, the segments stay unpublished for the retry.

@@ -6,7 +6,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use common::knn_keys;
-use ringdb::{Db, Disk, FieldType, Filter, Key, Knn, Options, Record, RingDbError, Schema, Value};
+use ringdb::{
+    Batch, Db, Disk, FieldType, Filter, Key, Knn, Options, Record, RingDbError, Schema, Value,
+};
 
 fn schema() -> Schema {
     Schema::new(2)
@@ -193,23 +195,24 @@ fn logged_changes_survive_a_crash_and_a_torn_tail() {
         let keys = db.add_all((0..10).map(record)).unwrap();
         db.flush().unwrap();
         // Logged but never committed.
-        db.delete(keys[3]).unwrap();
-        db.add(record(10)).unwrap();
+        db.apply(Batch::new().delete(keys[3]).add(record(10)))
+            .unwrap();
         let doomed = db.add(record(11)).unwrap();
         db.delete(doomed).unwrap();
         db.add(record(12)).unwrap();
+        // The parent tears this batch, so that none of it is recovered.
+        db.apply(Batch::new().delete(keys[0]).add(record(13)))
+            .unwrap();
         std::process::abort();
     }
     let dir = tempfile::tempdir().unwrap();
     crash("logged_changes_survive_a_crash_and_a_torn_tail", dir.path());
-    // A crash in the middle of a record leaves a partial frame.
+    // A crash in the middle of a write leaves a partial frame.
     let wal = file_with_prefix(dir.path(), "wal-");
-    OpenOptions::new()
-        .append(true)
-        .open(&wal)
-        .unwrap()
-        .write_all(&[40, 0, 0, 0, 1, 2, 3, 4, 1, 9])
-        .unwrap();
+    let mut file = OpenOptions::new().append(true).open(&wal).unwrap();
+    file.set_len(file.metadata().unwrap().len() - 1).unwrap();
+    file.write_all(&[40, 0, 0, 0, 1, 2, 3, 4, 1, 9]).unwrap();
+    drop(file);
 
     let db = open(dir.path());
     let keys: Vec<u64> = contents(&db).iter().map(|c| c.0).collect();

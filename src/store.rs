@@ -7,10 +7,11 @@
 //! - `seg-<id>.seg`, one immutable file per segment;
 //! - `wal-<seq>.log`, the changes since the manifest was written.
 //!
-//! Every add and delete is appended to the log and synced before it returns. A
-//! commit writes new segment files, starts a new log, and then replaces the
-//! manifest with a rename. Recovery loads the manifest's segments and replays
-//! its log up to the first torn record. Files that the manifest does not name
+//! The changes of each write call ([`Db::apply`](crate::Db::apply) and the
+//! methods built on it) are appended to the log as one frame and synced before
+//! the call returns. A commit writes new segment files, starts a new log, and
+//! then replaces the manifest with a rename. Recovery loads the manifest's
+//! segments and replays its log up to the first torn frame. Files that the manifest does not name
 //! are left over from an interrupted commit or merge and are removed.
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Write};
@@ -56,32 +57,30 @@ pub(crate) enum Change {
 }
 
 impl Change {
-    pub(crate) fn encode_add(key: Key, row: &Row) -> Vec<u8> {
-        let mut e = Encoder::default();
-        e.u8(1);
-        e.u64(key.0);
-        row.encode(&mut e);
-        e.bytes
-    }
-
-    pub(crate) fn encode_delete(key: Key) -> Vec<u8> {
-        let mut e = Encoder::default();
-        e.u8(2);
-        e.u64(key.0);
-        e.bytes
-    }
-
-    fn decode(bytes: &[u8], schema: &Schema) -> Result<Self> {
-        let mut d = Decoder::new(bytes);
-        let change = match (d.u8()?, Key(d.u64()?)) {
-            (1, key) => Self::Add(key, Row::decode(&mut d, schema)?),
+    fn decode(d: &mut Decoder<'_>, schema: &Schema) -> Result<Self> {
+        Ok(match (d.u8()?, Key(d.u64()?)) {
+            (1, key) => Self::Add(key, Row::decode(d, schema)?),
             (2, key) => Self::Delete(key),
             _ => return Err(corrupt("unknown log record")),
-        };
-        if !d.is_empty() {
-            return Err(corrupt("log record has trailing data"));
-        }
-        Ok(change)
+        })
+    }
+}
+
+/// The changes of one log frame, which recovery replays all together or not
+/// at all.
+#[derive(Default)]
+pub(crate) struct LogFrame(Encoder);
+
+impl LogFrame {
+    pub(crate) fn add(&mut self, key: Key, row: &Row) {
+        self.0.u8(1);
+        self.0.u64(key.0);
+        row.encode(&mut self.0);
+    }
+
+    pub(crate) fn delete(&mut self, key: Key) {
+        self.0.u8(2);
+        self.0.u64(key.0);
     }
 }
 
@@ -188,8 +187,8 @@ pub(crate) fn write_segment(dir: &Path, segment: &Segment) -> Result<()> {
     Ok(())
 }
 
-/// Read log records until the end or the first torn record, and cut the file
-/// there so that new records follow the last complete one.
+/// Read log frames until the end or the first torn frame, and cut the file
+/// there so that new frames follow the last complete one.
 fn replay(path: &Path, schema: &Schema) -> Result<Vec<Change>> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
@@ -218,7 +217,10 @@ fn replay(path: &Path, schema: &Schema) -> Result<Vec<Change>> {
         if crc32fast::hash(payload) != crc {
             break;
         }
-        changes.push(Change::decode(payload, schema)?);
+        let mut d = Decoder::new(payload);
+        while !d.is_empty() {
+            changes.push(Change::decode(&mut d, schema)?);
+        }
         at += 8 + len;
     }
     if at < bytes.len() {
@@ -377,21 +379,22 @@ impl Store {
     }
 
     /// Append encoded changes to the log and sync them.
-    pub(crate) fn log(&mut self, changes: &[Vec<u8>]) -> Result<()> {
+    pub(crate) fn log(&mut self, frame: &LogFrame) -> Result<()> {
         if self.failed {
             return Err(RingDbError::Io(io::Error::other(
                 "an earlier log write failed; reopen the database",
             )));
         }
-        let mut frames = Vec::new();
-        for payload in changes {
-            frames.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-            frames.extend_from_slice(&crc32fast::hash(payload).to_le_bytes());
-            frames.extend_from_slice(payload);
-        }
+        let payload = &frame.0.bytes;
+        let len = u32::try_from(payload.len())
+            .map_err(|_| RingDbError::InvalidRecord("a batch must be smaller than 4 GiB".into()))?;
+        let mut bytes = Vec::with_capacity(8 + payload.len());
+        bytes.extend_from_slice(&len.to_le_bytes());
+        bytes.extend_from_slice(&crc32fast::hash(payload).to_le_bytes());
+        bytes.extend_from_slice(payload);
         let result = self
             .wal
-            .write_all(&frames)
+            .write_all(&bytes)
             .and_then(|()| self.wal.sync_data());
         if result.is_err() {
             self.failed = true;

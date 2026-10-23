@@ -52,7 +52,7 @@ mod value;
 mod readme {}
 
 pub use config::{BackendPreference, Options};
-pub use db::{Db, Snapshot};
+pub use db::{Batch, Db, Snapshot};
 pub use error::RingDbError;
 pub use filter::Filter;
 pub use query::{Disk, Hit, Key, Knn, MAX_DISKS, Metric, Query, Region, RegionHit, RegionResult};

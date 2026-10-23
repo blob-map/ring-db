@@ -98,6 +98,7 @@ Thus, one `add` can take some milliseconds.
 To add many records, use `db.add_all(records)`.
 It writes all records with one log write and returns their keys in order.
 If one record is not valid, `add_all` adds no records.
+`db.apply(batch)` also writes all changes of the batch with one log write.
 
 `db.backup(dest)` makes a commit, then copies the database files into the directory `dest`.
 The directory `dest` must not exist, or it must be empty.
@@ -115,7 +116,8 @@ The database directory contains these files:
 
 Each file has a checksum.
 If a file is damaged, `Db::open` returns `Corrupt`.
-If a crash stops a log write, ring-db ignores the incomplete change.
+If a crash stops a log write, ring-db ignores all changes of that write.
+Thus, after a crash, a batch is fully in the database or not in the database.
 Do not change the files in the directory.
 
 ## Delete and change records
@@ -131,8 +133,31 @@ A background thread makes a commit at each `Options::commit_interval`, one secon
 `db.flush()` makes a commit immediately.
 To make commits only with `flush`, set `commit_interval(None)`.
 
-A delete and an add are visible at the same time if no commit occurs between them.
-Thus, to change a record without a commit between the two operations, use `commit_interval(None)` and `flush`.
+To make changes visible at the same time, put them in a `Batch` and use `db.apply(batch)`.
+A commit cannot occur between the changes of one batch.
+Thus, searches find the old version or the new version of a record, but never both or none.
+
+```rust
+use ringdb::{Batch, Db, FieldType, Options, Record, Schema};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Schema::new(2).field("price", FieldType::U64);
+    let db = Db::in_memory(schema, Options::default())?;
+    let old = db.add(Record::new([1.0, 2.0]).set("price", 300_000u64))?;
+
+    let new = Record::new([1.0, 2.0]).set("price", 280_000u64);
+    let keys = db.apply(Batch::new().delete(old).add(new))?;
+    db.flush()?;
+
+    assert!(db.get(old).is_err());
+    assert_eq!(db.get(keys[0])?.get("price").and_then(|v| v.as_u64()), Some(280_000));
+    Ok(())
+}
+```
+
+`apply` returns the keys of the added records, in the order of the batch.
+If a record is not valid or a key is not found, `apply` makes no changes and returns an error.
+`db.add`, `db.add_all`, and `db.delete` are batches with one type of change.
 
 Each commit adds a segment that contains the new records.
 After a commit, ring-db merges small segments into larger segments in the background.
