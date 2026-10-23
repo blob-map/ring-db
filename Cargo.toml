@@ -29,7 +29,8 @@ harness = false
 [dependencies]
 rayon = "1.11.0"
 thiserror = "2"
-bytemuck = { version = "1", features = ["derive"] }
+smallvec = { version = "1.15", features = ["const_generics"] }
+bytemuck = { version = "1", features = ["derive", "extern_crate_alloc"] }
 ash = { version = "0.38", default-features = false, features = ["loaded", "std"] }
 
 [dev-dependencies]

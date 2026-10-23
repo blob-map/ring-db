@@ -6,9 +6,9 @@ Quick context for contributors and coding agents.
 
 ring-db is a Rust 2024 exact vector database. It supports:
 
-- ring, range, disk, and disk-intersection searches;
-- exact K-nearest-neighbor search;
-- ordinary L2 and per-query diagonal weighted L2;
+- exact K-nearest-neighbor search (`Knn`);
+- region search: the intersection of 1 to `MAX_DISKS` disks (`Disk`, `Region`);
+- ordinary L2 and diagonal weighted L2, per KNN query or per disk (`Metric`);
 - explicit integer metadata tags compiled into candidate sets;
 - fixed-size Pod payload records with zero-copy reads;
 - CPU and Vulkan backends selected at runtime;
@@ -60,18 +60,18 @@ src/
 ├── metadata.rs        tags, adaptive CandidateSet, metadata persistence
 ├── payload.rs         fixed-size Pod persistence helpers
 ├── persist.rs         database header and vector-file I/O
-├── query.rs           query types, Hit, and QueryResult
+├── query.rs           Knn, Disk, Region, Metric, Key, Hit, RegionResult
 └── backend/
-    ├── mod.rs         RingComputeBackend contract and DiskSpec
+    ├── mod.rs         kernel inputs: Mask, DiskSpec, RowHit
     ├── cpu.rs         Rayon-parallel exact reference backend
     └── vulkan/        Vulkan backend, runtime, and embedded SPIR-V shaders
 
 tests/
-├── correctness.rs
-├── metadata_knn.rs
-├── random.rs
-├── weighted.rs
-└── vulkan.rs
+├── common/mod.rs      shared builders and reference distances
+├── search.rs          analytical search semantics
+├── randomized.rs      comparison with an f64 reference
+├── persistence.rs
+└── vulkan.rs          CPU/Vulkan parity
 
 examples/cli.rs        filtered weighted-KNN example
 benches/query_backends.rs
@@ -102,14 +102,14 @@ db.add_vector(&vector, record)?;
 db.add_vector_with_metadata(&vector, record, &tags)?;
 ```
 
-IDs are sequential `u32` values in insertion order. `add_vector_with_metadata` rejects a
+Keys are `Key(u64)` values, sequential in insertion order. `add_vector_with_metadata` rejects a
 new row once the ID space is exhausted.
 
 After sealing, payload access is always zero-copy and bounds checked:
 
 ```rust
-let record: &Record = db.fetch_payload(id)?;
-let records: Vec<&Record> = db.fetch_payloads(&ids)?;
+let record: &Record = db.fetch_payload(key)?;
+let records: Vec<&Record> = db.fetch_payloads(&keys)?;
 ```
 
 ## Metadata
@@ -143,25 +143,30 @@ The representation is selected internally:
 - `Sparse` is a sorted, unique `u32` ID list;
 - `Dense` is a bitset.
 
-Keep this representation private. Backends consume the borrowed `CandidateSetView`.
+Keep this representation private. The engine converts the borrowed `CandidateSetView` into a kernel `Mask`.
 
 ## Query semantics
 
-| Type | Meaning |
-|---|---|
-| `RingQuery` | inclusive `[max(0, d - lambda), d + lambda]` |
-| `RangeQuery` | inclusive `[d_min, d_max]` |
-| `DiskQuery` | inclusive `[0, d_max]` |
-| `DiskIntersectionQuery` | vector must satisfy every disk |
-| `KnnQuery` | exact best `k`, ordered by `(dist_sq, id)` |
+Every search goes through `SealedRingDb::search`, which takes a sealed `Query`:
 
-All query builders accept `.with_candidates(&set)`. Ring, range, disk, and KNN queries
-also accept `.with_weights(&weights)` directly. Each `DiskQuery` borrows its optional weights
-and candidate set. The engine intersects candidate sets attached to individual disks with
-the outer intersection query's candidate set before backend dispatch.
+| Type | Output | Meaning |
+|---|---|---|
+| `Knn` | `Vec<Hit>` | exact best `k`, ordered by `(dist_sq, key)` |
+| `Disk` | `RegionResult` | inclusive `dist_sq <= radius^2` |
+| `Region` | `RegionResult` | vector must satisfy every disk (1..=`MAX_DISKS`) |
+
+A disk is a one-disk region: `Disk::and` and `Disk::filter` return a `Region`.
+`Knn::metric` and `Disk::metric` take `Metric::L2` or `Metric::WeightedL2(&w)`.
+Each search has at most one filter (`.filter(&set)`); there are no per-disk filters.
+
+`RegionResult` stores flat `u32` records `[row, d0..dN-1]` (distances as `f32`
+bits) and resolves keys lazily through a shared `Arc<[Key]>`. `RegionHit::dists_sq`
+returns every disk's squared distance in disk order; there is no combined score.
+Do not split records into separate key and distance vectors: large fresh result
+allocations page-fault, and the extra bytes cost several percent on region scans.
 
 `k = 0` returns no hits. If fewer than `k` candidates exist, KNN returns all of them.
-Ties are deterministic by vector ID.
+Ties are deterministic by key.
 
 The metrics are:
 
@@ -170,7 +175,7 @@ ordinary distance: dist_sq = sum((vector[i] - query[i])^2)
 weighted:        dist_sq = sum(weights[i] * (vector[i] - query[i])^2)
 ```
 
-Weights are query-only final coefficients. They must match `dims`, be finite, and be
+Weights are search-only final coefficients. They must match `dims`, be finite, and be
 non-negative. They are never persisted.
 
 ## Engine lifecycle
@@ -178,7 +183,7 @@ non-negative. They are never persisted.
 `RingDb<T>` stages row-major vectors, Pod records, and metadata postings.
 `build()` finishes immutable stores and uploads vector data once. `SealedRingDb<T>` owns:
 
-- `Box<dyn RingComputeBackend>` for hot vector data;
+- a `Block`: host vectors, row keys, and an optional resident `VulkanSegment`;
 - one private, aligned `Box<[T]>` for payloads;
 - `MetadataIndex` for candidate construction.
 
@@ -212,12 +217,12 @@ The GPU backend requires Vulkan 1.2, `bufferDeviceAddress`, and `shaderInt64`.
 Check loader/device versions and both features before device creation; reject
 unsupported devices with `BackendUnavailable`. CPU has no Vulkan requirement.
 
-`src/backend/vulkan/mod.rs` implements the existing backend trait. `runtime.rs`
+`src/backend/vulkan/mod.rs` exposes `VulkanDevice` and per-block `VulkanSegment`. `runtime.rs`
 owns Vulkan resources and synchronous submissions; its execution mutex serializes
 the queue, command pool, and reusable query buffers shared by
-geometric and KNN queries.
-Geometric queries copy the count in the scan submission and read hits directly
-into an owned Pod `Vec<Hit>`. Buffer capacities grow on demand and remain allocated
+region and KNN queries.
+Region scans write a count word followed by `[row, d0..dN-1]` records; readback
+appends them directly to the owned `RegionResult` records. Buffer capacities grow on demand and remain allocated
 until the backend is dropped; never expose references to this reusable storage.
 Large host copies use up to four workers, including the caller, with scoped
 helper threads. Do not use the caller's Rayon pool while holding the execution
@@ -230,13 +235,12 @@ indexing: Vulkan 1.2 does not guarantee 64-bit offset arithmetic in access chain
 No `VK_EXT_shader_64bit_indexing` extension is required by this approach.
 Vectors are uploaded once, transposed independently within each chunk. Chunk row
 counts fit the device's allocation limit for vectors, output, and KNN scratch.
-Each shader returns global IDs. Sparse candidates are sliced by global ID;
+Each shader returns block rows (`row_offset` adds the chunk start). Sparse candidates are sliced by global ID;
 dense candidates retain their bit offset when a chunk starts inside a word.
-Geometric readback appends directly to the final owned result. KNN merges each
-chunk's best results and preserves exact global `(dist_sq, id)` ordering.
+KNN merges each chunk's best results and preserves exact `(dist_sq, row)` ordering.
 The three scan pipelines specialize All/Sparse/Dense candidate handling. Small-K
 selection uses GPU reductions without 64-bit atomics or subgroup requirements.
-Large-K queries may select on the host. Preserve deterministic `(dist_sq, id)` order
+Large-K queries may select on the host. Preserve deterministic `(dist_sq, row)` order
 and zero-weight handling before coordinate subtraction.
 
 `RINGDB_VULKAN_TIMINGS=1` enables optional GPU timestamps around each submission.
@@ -313,8 +317,8 @@ cargo test
 cargo build --release
 
 RUSTFLAGS="-C target-cpu=native" cargo bench --bench query_backends
-RINGDB_BENCH_N=100000 cargo bench --bench query_backends cpu_knn_f32
-RINGDB_BENCH_N=100000 cargo bench --bench query_backends metadata
+RINGDB_BENCH_N=100000 cargo bench --bench query_backends cpu_knn
+RINGDB_BENCH_N=100000 cargo bench --bench query_backends cpu_region
 cargo bench --bench backend_compare -- --n 10000000 --dims 64
 
 cargo run --release --example cli -- --n 100000 --dims 64 --k 10 --category 3

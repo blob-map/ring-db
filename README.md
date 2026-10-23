@@ -1,7 +1,7 @@
 # ring-db
 
 ring-db is a Rust library for exact vector search on a CPU or a GPU with Vulkan.
-It finds the closest vectors or all vectors between given distance limits.
+It finds the closest vectors, or all vectors in a region made of one or more disks.
 You can filter vectors with metadata tags and set a weight for each dimension.
 
 Exact search calculates distances for all vectors that pass the filter.
@@ -29,7 +29,7 @@ It finds the vector closest to `[0.0, 0.0]`.
 The `dist_sq` field contains the squared distance.
 
 ```rust
-use ringdb::{KnnQuery, RingDb, RingDbConfig};
+use ringdb::{Knn, RingDb, RingDbConfig};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut db = RingDb::new(RingDbConfig::new(2))?;
@@ -38,16 +38,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = db.build()?;
 
     let origin = [0.0, 0.0];
-    let result = db.query_knn(&KnnQuery::new(&origin, 1))?;
+    let hits = db.search(Knn::new(&origin, 1))?;
 
-    assert_eq!(result.hits[0].id, 1);
-    assert_eq!(result.hits[0].dist_sq, 1.0);
+    assert_eq!(hits[0].key.get(), 1);
+    assert_eq!(hits[0].dist_sq, 1.0);
     Ok(())
 }
 ```
 
-Each vector has a `u32` ID.
-The IDs start at zero and follow the insertion order.
+Each vector has a `Key`.
+`key.get()` returns the key as a `u64` value.
+The keys start at zero and follow the insertion order.
 
 After you insert the data, call `build()`.
 This method returns a `SealedRingDb` for subsequent queries.
@@ -96,14 +97,14 @@ ring-db does not automatically change the backend to CPU.
 The Vulkan backend uploads vectors one time and keeps them in device memory.
 It executes queries on one database in sequence.
 It keeps query buffers for subsequent queries until you drop the database.
-Each result owns its hit data and stays valid after subsequent queries.
+Each result owns its data and stays valid after subsequent queries.
 
 Vulkan uses 64-bit device addresses to access vector data and query buffers.
 A single vector buffer can be more than 4 GiB.
 The storage-buffer binding limit does not apply to these device addresses.
 
 If a device's allocation limit is too small, ring-db divides the dataset into groups of vectors called chunks.
-Queries combine the results from all chunks and keep the original vector IDs.
+Queries combine the results from all chunks and keep the original vector keys.
 KNN returns the closest vectors across the full dataset.
 All vectors and query buffers must fit the available device memory.
 An allocation that is too large causes a backend error.
@@ -156,7 +157,7 @@ This direct dependency is not necessary for applications with only the unit payl
 ```rust
 use bytemuck::{Pod, Zeroable};
 use ringdb::{
-    KnnQuery, MetadataKey, MetadataTag, MetadataValue, RingDb, RingDbConfig,
+    Knn, MetadataKey, MetadataTag, MetadataValue, Metric, RingDb, RingDbConfig,
 };
 
 const KIND: MetadataKey = MetadataKey::new(1);
@@ -201,14 +202,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let origin = [0.0, 0.0];
     let weights = [4.0, 1.0];
-    let result = db.query_knn(
-        &KnnQuery::new(&origin, 1)
-            .with_weights(&weights)
-            .with_candidates(&open_bakeries),
+    let hits = db.search(
+        Knn::new(&origin, 1)
+            .metric(Metric::WeightedL2(&weights))
+            .filter(&open_bakeries),
     )?;
 
-    let hit = result.hits.first().expect("one open bakery");
-    let place = db.fetch_payload(hit.id)?;
+    let hit = hits.first().expect("one open bakery");
+    let place = db.fetch_payload(hit.key)?;
     assert_eq!(place.name_id, 100);
     println!("name ID: {}, distance: {}", place.name_id, hit.dist_sq.sqrt());
     Ok(())
@@ -246,34 +247,68 @@ ring-db validates the vector count for each set.
 It does not validate database identity.
 Sets from different databases with the same vector count can pass this validation.
 
-To apply a filter, call `.with_candidates(&set)` on the query.
-Without this call, the query searches all vectors.
-For `DiskIntersectionQuery`, a vector must pass the filters on the query and on all disks.
+To apply a filter, call `.filter(&set)` on the search.
+Without this call, the search examines all vectors.
+Each search has a maximum of one filter.
+To use more than one condition, combine the sets before the search.
 
 Metadata filters compare integers for equality.
 They cannot compare text or select a numeric range.
 To filter strings, give an integer ID to each different string.
 Keep the relation between IDs and strings in your application.
 
-## Query types and distances
+## Searches and distances
 
-K-nearest-neighbor (KNN) search returns up to `k` closest vectors that pass the filter.
-Other query types return all vectors that satisfy their distance limits and filters.
+ring-db has two search types: K-nearest-neighbor (KNN) search and region search.
+Give each search to `db.search(...)`.
 All distance limits include their boundary values.
 
-| Query type | Database method | Distance condition |
+| Search | Result | Condition |
 |---|---|---|
-| `KnnQuery` | `query_knn` | The `k` closest vectors |
-| `RingQuery` | `query` | Between `max(0, d - lambda)` and `d + lambda` |
-| `RangeQuery` | `query_range` | Between `d_min` and `d_max` |
-| `DiskQuery` | `query_disk` | At most `d_max` from the query vector |
-| `DiskIntersectionQuery` | `query_disk_intersection` | In all disks |
+| `Knn::new(&query, k)` | `Vec<Hit>` | The `k` closest vectors that pass the filter |
+| `Disk::new(&center, radius)` | `RegionResult` | At most `radius` from `center` |
+| `disk_a.and(disk_b)` | `RegionResult` | In all disks |
+
+A region is the intersection of one or more disks.
+A disk is a region with one disk.
+To add a disk to a region, call `.and(disk)`.
+A region can contain a maximum of `MAX_DISKS` (16) disks.
+
+This example finds the vectors in two disks:
+
+```rust
+use ringdb::{Disk, RingDb, RingDbConfig};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut db = RingDb::new(RingDbConfig::new(2))?;
+    db.add_vector(&[0.0, 0.0], ())?;
+    db.add_vector(&[1.0, 0.0], ())?;
+    db.add_vector(&[3.0, 0.0], ())?;
+    let db = db.build()?;
+
+    let left = [0.0, 0.0];
+    let right = [2.0, 0.0];
+    let region = Disk::new(&left, 1.5).and(Disk::new(&right, 1.5));
+    let result = db.search(region)?;
+
+    assert_eq!(result.len(), 1);
+    let hit = result.get(0).expect("one vector in the two disks");
+    assert_eq!(hit.key.get(), 1);
+    assert_eq!(hit.dists_sq(), &[1.0, 1.0]);
+    Ok(())
+}
+```
 
 For KNN, `k = 0` gives no results.
-If fewer than `k` vectors pass the filter, the query returns all of them.
-KNN sorts results by squared distance, then by vector ID.
-For equal distances, the smaller ID comes first.
-The result order for other query types can change between queries.
+If fewer than `k` vectors pass the filter, the search returns all of them.
+KNN sorts hits by squared distance, then by key.
+For equal distances, the smaller key comes first.
+Each `Hit` contains the `key` and the squared distance `dist_sq`.
+
+A `RegionResult` contains one `RegionHit` for each vector in the region.
+Each region hit contains the `key`.
+`dists_sq()` returns one squared distance for each disk, in the disk order.
+The order of region hits can change between searches.
 
 The default distance is Euclidean distance, also called L2 distance.
 ring-db calculates its square:
@@ -282,7 +317,7 @@ ring-db calculates its square:
 dist_sq = sum((vector[i] - query[i])^2)
 ```
 
-To use diagonal weights, call `.with_weights(&weights)`:
+To use diagonal weights, call `.metric(Metric::WeightedL2(&weights))`:
 
 ```text
 dist_sq = sum(weights[i] * (vector[i] - query[i])^2)
@@ -291,24 +326,17 @@ dist_sq = sum(weights[i] * (vector[i] - query[i])^2)
 ring-db uses each weight as supplied.
 It does not square the weights.
 A zero weight removes that dimension from the distance calculation.
-Each query can use different weights.
-
-For a disk intersection, set weights on each disk.
+Each KNN search and each disk can use different weights.
 Full weight matrices are not available.
 
-Query inputs have these requirements:
+Search inputs have these requirements:
 
-- Vectors, query vectors, and weight arrays must have the database dimension count.
-- Vector coordinates and query coordinates must be finite, without `NaN` or infinity.
-- Weights and distance limits must be finite and non-negative.
-- A range must have `d_min <= d_max`.
-- A disk intersection must contain one or more disks.
+- Vectors, query vectors, centers, and weight arrays must have the database dimension count.
+- Vector coordinates, query coordinates, and centers must be finite, without `NaN` or infinity.
+- Weights and radii must be finite and non-negative.
+- A region must contain 1 to 16 disks.
 
-Each query returns a `QueryResult` with `hits`, `backend_used`, and `elapsed`.
-Each hit contains the vector ID and `dist_sq`.
-For a disk intersection, `dist_sq` uses the first disk's query vector and weights.
-
-To get the distance from `dist_sq`, use `dist_sq.sqrt()`.
+To get the distance from a squared distance, use `dist_sq.sqrt()`.
 
 ## Payload records
 
@@ -339,9 +367,9 @@ In this example, `name_len` contains the number of bytes in the name.
 When you read the text, make sure that `name_len` is not more than the array length.
 Make sure that the text has correct UTF-8 encoding.
 
-`db.fetch_payload(id)?` returns a reference to one payload.
-`db.fetch_payloads(&ids)?` returns a vector of references in the requested ID order.
-The two methods validate IDs and return an error for an invalid ID.
+`db.fetch_payload(key)?` returns a reference to one payload.
+`db.fetch_payloads(&keys)?` returns a vector of references in the requested key order.
+The two methods validate keys and return an error for an invalid key.
 They do not copy or deserialize payload records.
 
 ## Save and load a database
@@ -440,8 +468,8 @@ To run benchmarks with a smaller dataset, use one of these commands:
 
 ```bash
 RINGDB_BENCH_N=100000 cargo bench --bench query_backends
-RINGDB_BENCH_N=100000 cargo bench --bench query_backends cpu_knn_f32
-RINGDB_BENCH_N=100000 cargo bench --bench query_backends metadata
+RINGDB_BENCH_N=100000 cargo bench --bench query_backends cpu_knn
+RINGDB_BENCH_N=100000 cargo bench --bench query_backends cpu_region
 ```
 
 The default dataset has 30 million vectors.
@@ -458,9 +486,8 @@ cargo bench --bench backend_compare -- \
 
 This benchmark generates the same data from a fixed random seed.
 It executes one backend at a time and reverses their order in each round.
-It uses four query vectors for six workloads:
+It uses four query vectors for five workloads:
 
-- Ring
 - Disk
 - Three-disk intersection
 - Exact KNN
@@ -472,8 +499,8 @@ They do not include dataset generation, upload, warm-up queries, validation, and
 The benchmark gives median and 95th-percentile query times.
 It writes each sample to `target/backend-compare.csv`.
 
-The benchmark validates KNN IDs, result order, and distances.
-For geometric queries, it examines membership differences with `f64` calculations near distance limits.
+The benchmark validates KNN keys, result order, and distances.
+For region searches, it examines membership differences with `f64` calculations near distance limits.
 Differences more than the accepted tolerance cause an error.
 
 To change a benchmark run, use these command-line options:
@@ -486,7 +513,7 @@ To change a benchmark run, use these command-line options:
 | `--backend vulkan` | Run Vulkan alone |
 | `--workload intersection3` | Run only the three-disk intersection |
 | `--output path.csv` | Select a different CSV file |
-| `--radius-scale` | Multiply geometric radii by this value; default `1` |
+| `--radius-scale` | Multiply disk radii by this value; default `1` |
 | `--intersection-shift` | Set the coordinate offset of the other two centers; default `0.01` |
 
 A run with only one backend does not compare results with the other backend.

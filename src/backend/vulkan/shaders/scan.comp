@@ -52,7 +52,7 @@ void main() {
     if (group >= group_count(p.work_count)) return;
     uint slot = group * 128u + gl_LocalInvocationID.x;
     if (slot >= p.work_count) return;
-    if (p.mode == 2u) {
+    if (p.mode == 1u) {
         scratch_word(2ul * slot).value = INVALID;
         scratch_word(2ul * slot + 1u).value = 0x7f800000u;
     }
@@ -63,22 +63,24 @@ void main() {
         uint bits = input_word(p.candidate_offset + bit_id / 32u);
         if ((bits & (1u << (bit_id % 32u))) == 0u) return;
     }
-    float first = distance_sq(id, 0u);
-    if (p.mode == 2u) {
+    if (p.mode == 1u) {
         scratch_word(2ul * slot).value = id + p.row_offset;
-        scratch_word(2ul * slot + 1u).value = floatBitsToUint(first);
+        scratch_word(2ul * slot + 1u).value = floatBitsToUint(distance_sq(id, 0u));
         return;
     }
-    if (p.mode == 0u) {
-        if (!(first >= p.lower_sq && first <= p.upper_sq)) return;
-    } else {
-        if (first > uintBitsToFloat(input_word(1))) return;
-        for (uint disk = 1u; disk < p.disk_count; ++disk) {
-            float upper_sq = uintBitsToFloat(input_word(disk * (2u + 2u * p.dims) + 1u));
-            if (distance_sq(id, disk) > upper_sq) return;
-        }
+    // Reject at the first disk that excludes the row; NaN never matches.
+    float dists[MAX_DISKS];
+    for (uint disk = 0u; disk < p.disk_count; ++disk) {
+        float d = distance_sq(id, disk);
+        float radius_sq = uintBitsToFloat(input_word(disk * (2u + 2u * p.dims) + 1u));
+        if (!(d <= radius_sq)) return;
+        dists[disk] = d;
     }
+    // Output: the hit count, then per hit its row and disk_count distances.
     uint dst = atomicAdd(output_word(0).value, 1u);
-    output_word(1u + 2ul * dst).value = id + p.row_offset;
-    output_word(2u + 2ul * dst).value = floatBitsToUint(first);
+    uint64_t record = 1ul + uint64_t(dst) * uint64_t(1u + p.disk_count);
+    output_word(record).value = id + p.row_offset;
+    for (uint disk = 0u; disk < p.disk_count; ++disk) {
+        output_word(record + 1ul + uint64_t(disk)).value = floatBitsToUint(dists[disk]);
+    }
 }

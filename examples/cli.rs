@@ -2,7 +2,7 @@ use bytemuck::{Pod, Zeroable};
 use clap::{Parser, ValueEnum};
 use rand::{RngExt, SeedableRng};
 use ringdb::{
-    BackendPreference, KnnQuery, MetadataKey, MetadataTag, MetadataValue, RingDb, RingDbConfig,
+    BackendPreference, Knn, MetadataKey, MetadataTag, MetadataValue, Metric, RingDb, RingDbConfig,
 };
 
 const CATEGORY: MetadataKey = MetadataKey::new(1);
@@ -126,20 +126,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let candidates = db.metadata_eq(CATEGORY, MetadataValue::new(u64::from(cli.category)));
     let mut weights = vec![1.0f32; cli.dims];
     weights[0] = cli.first_dim_weight;
-    let result = db.query_knn(
-        &KnnQuery::new(&query, cli.k)
-            .with_weights(&weights)
-            .with_candidates(&candidates),
+    let started = std::time::Instant::now();
+    let hits = db.search(
+        Knn::new(&query, cli.k)
+            .metric(Metric::WeightedL2(&weights))
+            .filter(&candidates),
     )?;
 
     println!("  candidates  : {}", candidates.len());
-    println!("  query time  : {:.2?}", result.elapsed);
-    println!("  hits        : {}", result.hits.len());
-    for hit in result.hits.iter().take(20) {
-        let record = db.fetch_payload(hit.id)?;
+    println!("  query time  : {:.2?}", started.elapsed());
+    println!("  hits        : {}", hits.len());
+    for hit in hits.iter().take(20) {
+        let record = db.fetch_payload(hit.key)?;
         println!(
-            "    id={} source={} category={} distance={:.6}",
-            hit.id,
+            "    key={} source={} category={} distance={:.6}",
+            hit.key.get(),
             record.source_id,
             record.category_id,
             hit.dist_sq.sqrt()

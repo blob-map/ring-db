@@ -21,15 +21,14 @@ layout(push_constant) uniform Params {
     uint work_count;
     uint candidate_offset;
     uint disk_count;
-    uint mode; // 0: range, 1: intersection, 2: KNN
-    float lower_sq;
-    float upper_sq;
+    uint mode; // 0: region, 1: KNN
     uint reduce_count;
     uint output_index;
     uint row_offset;
     uint reserved;
 } p;
 const uint INVALID = 0xffffffffu;
+const uint MAX_DISKS = 16u;
 
 uint group_index() {
     return gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;

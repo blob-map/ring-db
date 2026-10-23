@@ -1,11 +1,12 @@
 use std::mem::{align_of, size_of};
 use std::path::Path;
-use std::time::Instant;
+use std::sync::Arc;
 
 use bytemuck::Pod;
+use smallvec::SmallVec;
 
 use crate::BackendPreference;
-use crate::backend::{CpuBackend, DiskSpec, RingComputeBackend, VulkanBackend};
+use crate::backend::{DiskSpec, Mask, VulkanDevice, VulkanSegment, cpu};
 use crate::config::RingDbConfig;
 use crate::error::{Result, RingDbError};
 use crate::metadata::{
@@ -15,35 +16,38 @@ use crate::metadata::{
 use crate::payload::{read_pod_file, write_pod_file};
 use crate::persist::{DatabaseMeta, read_f32_file, read_meta, write_f32_file, write_meta};
 use crate::query::{
-    DiskIntersectionQuery, DiskQuery, KnnQuery, QueryResult, RangeQuery, RingQuery,
+    Disk, Hit, Key, KeyLookup, Knn, MAX_DISKS, Metric, Query, Region, RegionResult,
 };
 
-fn make_backend(preference: BackendPreference) -> Result<Box<dyn RingComputeBackend>> {
+fn make_device(preference: BackendPreference) -> Result<Option<Arc<VulkanDevice>>> {
     match preference {
-        BackendPreference::Cpu => Ok(Box::new(CpuBackend::new())),
-        BackendPreference::Vulkan => Ok(Box::new(VulkanBackend::new()?)),
+        BackendPreference::Cpu => Ok(None),
+        BackendPreference::Vulkan => Ok(Some(Arc::new(VulkanDevice::new()?))),
     }
 }
 
-fn validate_query_input(dims: usize, query: &[f32], weights: Option<&[f32]>) -> Result<()> {
-    if query.len() != dims {
+fn validate_vector(dims: usize, vector: &[f32], label: &str) -> Result<()> {
+    if vector.len() != dims {
         return Err(RingDbError::DimensionMismatch {
             expected: dims,
-            got: query.len(),
+            got: vector.len(),
         });
     }
-    if let Some((index, value)) = query
+    if let Some((index, value)) = vector
         .iter()
         .copied()
         .enumerate()
         .find(|(_, value)| !value.is_finite())
     {
         return Err(RingDbError::InvalidQuery(format!(
-            "query coordinate at index {index} must be finite, got {value}"
+            "{label} coordinate at index {index} must be finite, got {value}"
         )));
     }
+    Ok(())
+}
 
-    let Some(weights) = weights else {
+fn validate_metric(dims: usize, metric: Metric<'_>) -> Result<()> {
+    let Some(weights) = metric.weights() else {
         return Ok(());
     };
     if weights.len() != dims {
@@ -65,30 +69,118 @@ fn validate_query_input(dims: usize, query: &[f32], weights: Option<&[f32]>) -> 
     Ok(())
 }
 
-fn validate_distance(value: f32, label: &str) -> Result<()> {
-    if value.is_finite() && value >= 0.0 {
-        return Ok(());
+fn validate_disk<'a>(dims: usize, disk: &Disk<'a>) -> Result<DiskSpec<'a>> {
+    validate_vector(dims, disk.center, "disk center")?;
+    validate_metric(dims, disk.metric)?;
+    if !disk.radius.is_finite() || disk.radius < 0.0 {
+        return Err(RingDbError::InvalidQuery(format!(
+            "disk radius must be finite and non-negative, got {}",
+            disk.radius
+        )));
     }
-    Err(RingDbError::InvalidQuery(format!(
-        "{label} must be finite and non-negative, got {value}"
-    )))
+    Ok(DiskSpec {
+        center: disk.center,
+        weights: disk.metric.weights(),
+        radius_sq: disk.radius * disk.radius,
+    })
 }
 
-fn candidate_view(
-    candidates: Option<&CandidateSet>,
-    n_vectors: usize,
-) -> Result<CandidateSetView<'_>> {
-    match candidates {
-        Some(candidates) => {
-            if candidates.universe_len() != n_vectors {
-                return Err(RingDbError::CandidateSetMismatch {
-                    expected: n_vectors,
-                    got: candidates.universe_len(),
-                });
-            }
-            Ok(candidates.view())
+/// `None` means that no row can match.
+fn mask(filter: Option<&CandidateSet>, n_vectors: usize) -> Result<Option<Mask<'_>>> {
+    let Some(filter) = filter else {
+        return Ok(Some(Mask::All));
+    };
+    if filter.universe_len() != n_vectors {
+        return Err(RingDbError::CandidateSetMismatch {
+            expected: n_vectors,
+            got: filter.universe_len(),
+        });
+    }
+    Ok(match filter.view() {
+        CandidateSetView::All => Some(Mask::All),
+        CandidateSetView::Empty => None,
+        CandidateSetView::Sparse(ids) => Some(Mask::Sparse(ids)),
+        CandidateSetView::Dense(words) => Some(Mask::Dense(words)),
+    })
+}
+
+/// Vectors and keys of one block, with an optional resident device copy.
+struct Block {
+    vectors: Vec<f32>,
+    keys: Arc<[Key]>,
+    gpu: Option<(Arc<VulkanDevice>, VulkanSegment)>,
+}
+
+impl Block {
+    fn new(dims: usize, vectors: Vec<f32>, device: Option<&Arc<VulkanDevice>>) -> Result<Self> {
+        let keys = (0..(vectors.len() / dims) as u64).map(Key).collect();
+        let gpu = match device {
+            Some(device) => Some((device.clone(), device.upload(dims, &vectors)?)),
+            None => None,
+        };
+        Ok(Self { vectors, keys, gpu })
+    }
+}
+
+/// Read-only view used to execute one search.
+pub struct Searcher<'a> {
+    dims: usize,
+    block: &'a Block,
+}
+
+impl Searcher<'_> {
+    pub(crate) fn knn(&self, query: &Knn<'_>) -> Result<Vec<Hit>> {
+        validate_vector(self.dims, query.query, "query")?;
+        validate_metric(self.dims, query.metric)?;
+        let Some(mask) = mask(query.filter, self.block.keys.len())? else {
+            return Ok(Vec::new());
+        };
+        if query.k == 0 {
+            return Ok(Vec::new());
         }
-        None => Ok(CandidateSetView::All),
+        let weights = query.metric.weights();
+        let hits = match &self.block.gpu {
+            Some((device, segment)) => device.knn(segment, query.query, weights, query.k, mask)?,
+            None => cpu::knn(
+                &self.block.vectors,
+                self.dims,
+                query.query,
+                weights,
+                query.k,
+                mask,
+            ),
+        };
+        Ok(hits
+            .into_iter()
+            .map(|hit| Hit {
+                key: self.block.keys[hit.row as usize],
+                dist_sq: hit.dist_sq,
+            })
+            .collect())
+    }
+
+    pub(crate) fn region(&self, region: &Region<'_>) -> Result<RegionResult> {
+        if region.disks.len() > MAX_DISKS {
+            return Err(RingDbError::InvalidQuery(format!(
+                "a region can contain at most {MAX_DISKS} disks, got {}",
+                region.disks.len()
+            )));
+        }
+        let disks: SmallVec<[DiskSpec<'_>; 1]> = region
+            .disks
+            .iter()
+            .map(|disk| validate_disk(self.dims, disk))
+            .collect::<Result<_>>()?;
+        let mut out = RegionResult::new(disks.len(), KeyLookup(self.block.keys.clone()));
+        let Some(mask) = mask(region.filter, self.block.keys.len())? else {
+            return Ok(out);
+        };
+        let records = &mut out.records;
+        match &self.block.gpu {
+            Some((device, segment)) => device.region(segment, 0, &disks, mask, records)?,
+            None => cpu::region(&self.block.vectors, self.dims, 0, &disks, mask, records),
+        }
+        Ok(out)
     }
 }
 
@@ -107,11 +199,11 @@ fn prepare_persist_dir(dir: &Path) -> Result<()> {
 /// Mutable builder for an immutable exact vector database.
 ///
 /// `T` is a fixed-size Pod record stored verbatim next to each vector. Metadata
-/// used for filtering is supplied explicitly as integer tags; query backends
-/// never interpret the payload layout.
+/// used for filtering is supplied explicitly as integer tags; kernels never
+/// interpret the payload layout.
 pub struct RingDb<T: Pod + Send + Sync = ()> {
     config: RingDbConfig,
-    backend: Box<dyn RingComputeBackend>,
+    device: Option<Arc<VulkanDevice>>,
     n_vectors: usize,
     vectors: Vec<f32>,
     payloads: Vec<T>,
@@ -127,7 +219,7 @@ impl<T: Pod + Send + Sync> RingDb<T> {
             ));
         }
         Ok(Self {
-            backend: make_backend(config.backend_preference)?,
+            device: make_device(config.backend_preference)?,
             config,
             n_vectors: 0,
             vectors: Vec::new(),
@@ -148,28 +240,12 @@ impl<T: Pod + Send + Sync> RingDb<T> {
         payload: T,
         tags: &[MetadataTag],
     ) -> Result<()> {
-        if vector.len() != self.config.dims {
-            return Err(RingDbError::DimensionMismatch {
-                expected: self.config.dims,
-                got: vector.len(),
-            });
-        }
+        validate_vector(self.config.dims, vector, "vector")?;
         if self.n_vectors >= u32::MAX as usize {
             return Err(RingDbError::InvalidQuery(
                 "ring-db supports at most u32::MAX vectors".to_string(),
             ));
         }
-        if let Some((index, value)) = vector
-            .iter()
-            .copied()
-            .enumerate()
-            .find(|(_, value)| !value.is_finite())
-        {
-            return Err(RingDbError::InvalidQuery(format!(
-                "vector coordinate at index {index} must be finite, got {value}"
-            )));
-        }
-
         self.payloads.push(payload);
         self.metadata_builder.push_vector(tags);
         self.vectors.extend_from_slice(vector);
@@ -181,7 +257,7 @@ impl<T: Pod + Send + Sync> RingDb<T> {
     pub fn build(self) -> Result<SealedRingDb<T>> {
         let Self {
             config,
-            mut backend,
+            device,
             n_vectors,
             vectors,
             payloads,
@@ -207,14 +283,13 @@ impl<T: Pod + Send + Sync> RingDb<T> {
             None
         };
 
-        backend.upload_f32_dataset(config.dims, vectors)?;
+        let block = Block::new(config.dims, vectors, device.as_ref())?;
         if let Some((path, meta)) = persist_meta {
             write_meta(&path, meta)?;
         }
         Ok(SealedRingDb {
             config,
-            backend,
-            n_vectors,
+            block,
             payloads: payloads.into_boxed_slice(),
             metadata_index,
         })
@@ -249,15 +324,14 @@ impl<T: Pod + Send + Sync> RingDb<T> {
         }
         let payloads = read_pod_file(&dir.join("payloads.bin"), meta.n_vectors)?;
         let metadata_index = MetadataIndex::load(&dir.join("metadata.bin"), meta.n_vectors)?;
-        let mut backend = make_backend(backend_preference)?;
-        backend.upload_f32_dataset(meta.dims, vectors)?;
+        let device = make_device(backend_preference)?;
+        let block = Block::new(meta.dims, vectors, device.as_ref())?;
 
         Ok(SealedRingDb {
             config: RingDbConfig::new(meta.dims)
                 .with_persist_dir(dir)
                 .with_backend_preference(backend_preference),
-            backend,
-            n_vectors: meta.n_vectors,
+            block,
             payloads,
             metadata_index,
         })
@@ -276,127 +350,32 @@ impl<T: Pod + Send + Sync> RingDb<T> {
     }
 
     pub fn backend_name(&self) -> &str {
-        self.backend.name()
+        backend_name(self.config.backend_preference)
+    }
+}
+
+fn backend_name(preference: BackendPreference) -> &'static str {
+    match preference {
+        BackendPreference::Cpu => "cpu",
+        BackendPreference::Vulkan => "vulkan",
     }
 }
 
 /// Immutable database returned by [`RingDb::build`] or [`RingDb::load`].
 pub struct SealedRingDb<T: Pod + Send + Sync = ()> {
     config: RingDbConfig,
-    backend: Box<dyn RingComputeBackend>,
-    n_vectors: usize,
+    block: Block,
     payloads: Box<[T]>,
     metadata_index: MetadataIndex,
 }
 
 impl<T: Pod + Send + Sync> SealedRingDb<T> {
-    pub fn query(&self, query: &RingQuery<'_>) -> Result<QueryResult> {
-        let started = Instant::now();
-        validate_query_input(self.dims(), query.query, query.weights)?;
-        validate_distance(query.d, "ring target distance")?;
-        validate_distance(query.lambda, "ring half-width")?;
-        let candidates = candidate_view(query.candidates, self.n_vectors)?;
-        let hits = self.backend.ring_query_f32(
-            self.dims(),
-            query.query,
-            query.weights,
-            (query.d - query.lambda).max(0.0),
-            query.d + query.lambda,
-            candidates,
-        )?;
-        Ok(self.result(hits, started))
-    }
-
-    pub fn query_range(&self, query: &RangeQuery<'_>) -> Result<QueryResult> {
-        let started = Instant::now();
-        validate_query_input(self.dims(), query.query, query.weights)?;
-        validate_distance(query.d_min, "range lower bound")?;
-        validate_distance(query.d_max, "range upper bound")?;
-        if query.d_min > query.d_max {
-            return Err(RingDbError::InvalidQuery(format!(
-                "range lower bound {} exceeds upper bound {}",
-                query.d_min, query.d_max
-            )));
-        }
-        let candidates = candidate_view(query.candidates, self.n_vectors)?;
-        let hits = self.backend.ring_query_f32(
-            self.dims(),
-            query.query,
-            query.weights,
-            query.d_min,
-            query.d_max,
-            candidates,
-        )?;
-        Ok(self.result(hits, started))
-    }
-
-    pub fn query_disk(&self, query: &DiskQuery<'_>) -> Result<QueryResult> {
-        let started = Instant::now();
-        validate_query_input(self.dims(), query.query, query.weights)?;
-        validate_distance(query.d_max, "disk radius")?;
-        let candidates = candidate_view(query.candidates, self.n_vectors)?;
-        let hits = self.backend.disk_query_f32(
-            self.dims(),
-            query.query,
-            query.weights,
-            query.d_max,
-            candidates,
-        )?;
-        Ok(self.result(hits, started))
-    }
-
-    pub fn query_disk_intersection(
-        &self,
-        query: &DiskIntersectionQuery<'_>,
-    ) -> Result<QueryResult> {
-        let started = Instant::now();
-        if query.disks.is_empty() {
-            return Err(RingDbError::InvalidQuery(
-                "disk intersection requires at least one disk".to_string(),
-            ));
-        }
-
-        let mut effective_candidates = query.candidates.cloned();
-        for disk in query.disks {
-            validate_query_input(self.dims(), disk.query, disk.weights)?;
-            validate_distance(disk.d_max, "disk radius")?;
-            if let Some(candidates) = disk.candidates {
-                candidate_view(Some(candidates), self.n_vectors)?;
-                effective_candidates = Some(match effective_candidates {
-                    Some(current) => current.intersection(candidates)?,
-                    None => candidates.clone(),
-                });
-            }
-        }
-        let candidates = candidate_view(effective_candidates.as_ref(), self.n_vectors)?;
-        let disks: Vec<_> = query
-            .disks
-            .iter()
-            .map(|disk| DiskSpec {
-                query: disk.query,
-                d_max: disk.d_max,
-                weights: disk.weights,
-            })
-            .collect();
-        let hits = self
-            .backend
-            .disk_intersection_query_f32(self.dims(), &disks, candidates)?;
-        Ok(self.result(hits, started))
-    }
-
-    /// Execute an exact nearest-neighbor query.
-    pub fn query_knn(&self, query: &KnnQuery<'_>) -> Result<QueryResult> {
-        let started = Instant::now();
-        validate_query_input(self.dims(), query.query, query.weights)?;
-        let candidates = candidate_view(query.candidates, self.n_vectors)?;
-        let hits = self.backend.knn_query_f32(
-            self.dims(),
-            query.query,
-            query.weights,
-            query.k,
-            candidates,
-        )?;
-        Ok(self.result(hits, started))
+    /// Run a [`Knn`], [`Disk`], or [`Region`] search.
+    pub fn search<Q: Query>(&self, query: Q) -> Result<Q::Output> {
+        query.execute(&Searcher {
+            dims: self.config.dims,
+            block: &self.block,
+        })
     }
 
     /// Return the vectors carrying exactly this metadata tag.
@@ -406,30 +385,31 @@ impl<T: Pod + Send + Sync> SealedRingDb<T> {
 
     /// Create a validated candidate set from vector IDs.
     pub fn candidates_from_ids(&self, ids: impl IntoIterator<Item = u32>) -> Result<CandidateSet> {
-        CandidateSet::from_ids(self.n_vectors, ids)
+        CandidateSet::from_ids(self.len(), ids)
     }
 
-    /// Fetch one Pod payload by vector ID without copying it.
-    pub fn fetch_payload(&self, id: u32) -> Result<&T> {
-        self.payloads
-            .get(id as usize)
+    /// Fetch one Pod payload by key without copying it.
+    pub fn fetch_payload(&self, key: Key) -> Result<&T> {
+        usize::try_from(key.0)
+            .ok()
+            .and_then(|row| self.payloads.get(row))
             .ok_or(RingDbError::InvalidVectorId {
-                id,
-                len: self.n_vectors,
+                id: key.0 as u32,
+                len: self.len(),
             })
     }
 
-    /// Fetch Pod payload references in the same order as `ids`.
-    pub fn fetch_payloads(&self, ids: &[u32]) -> Result<Vec<&T>> {
-        ids.iter().map(|&id| self.fetch_payload(id)).collect()
+    /// Fetch Pod payload references in the same order as `keys`.
+    pub fn fetch_payloads(&self, keys: &[Key]) -> Result<Vec<&T>> {
+        keys.iter().map(|&key| self.fetch_payload(key)).collect()
     }
 
     pub fn len(&self) -> usize {
-        self.n_vectors
+        self.block.keys.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.n_vectors == 0
+        self.block.keys.is_empty()
     }
 
     pub fn dims(&self) -> usize {
@@ -437,14 +417,6 @@ impl<T: Pod + Send + Sync> SealedRingDb<T> {
     }
 
     pub fn backend_name(&self) -> &str {
-        self.backend.name()
-    }
-
-    fn result(&self, hits: Vec<crate::query::Hit>, started: Instant) -> QueryResult {
-        QueryResult {
-            hits,
-            backend_used: self.backend.name(),
-            elapsed: started.elapsed(),
-        }
+        backend_name(self.config.backend_preference)
     }
 }
