@@ -499,6 +499,51 @@ sh src/backend/vulkan/shaders/compile.sh
 
 ## Benchmarks
 
+### Results
+
+These are the median times of one search on 10 million random vectors in one segment.
+
+- Computer: AMD Ryzen 9 7900X3D (12 cores, 24 threads), 62 GiB of memory, NVIDIA GeForce RTX 4080, Linux.
+- Software: ring-db at commit `ca7f32a`, Rust 1.98, release build, no `target-cpu` option.
+- Command: `RINGDB_BENCH_N=10000000 cargo bench --bench query_backends`.
+
+**Closest records, 64 dimensions**
+
+| Search | CPU | Vulkan |
+|---|---|---|
+| KNN, `k` = 1 | 45.6 ms | 4.2 ms |
+| KNN, `k` = 10 | 45.5 ms | 5.5 ms |
+| KNN, `k` = 100 | 45.8 ms | 18.2 ms |
+| Weighted KNN, `k` = 10 | 45.6 ms | 5.5 ms |
+| KNN, `k` = 10, keyword filter, 10% of records | 12.5 ms | 6.2 ms |
+| KNN, `k` = 10, keyword filter, 1% of records | 0.61 ms | 0.95 ms |
+| KNN, `k` = 10, keyword filter, 0.1% of records | 0.084 ms | 0.21 ms |
+| KNN, `k` = 10, range filter, 10% of records | 5.6 ms | 3.4 ms |
+| KNN, `k` = 10, range filter, 1% of records | 0.23 ms | 0.21 ms |
+| KNN, `k` = 10, range filter, 0.1% of records | 0.066 ms | 0.13 ms |
+
+The range filter selects records that are adjacent in memory.
+The keyword filter selects records that are spread out.
+Thus, the range filter is faster in this benchmark.
+With a filter that selects few records, the CPU can be faster than Vulkan.
+
+**Records in an area**
+
+Each disk contains approximately half of the vectors.
+Thus, one disk returns approximately 5 million hits.
+Most of the time is for the results, not for the distances.
+
+| Search | 16 dimensions | 32 dimensions | 64 dimensions | 128 dimensions |
+|---|---|---|---|---|
+| Disk, CPU | 14.7 ms | 27.6 ms | 51.6 ms | 97.6 ms |
+| Disk, Vulkan | 3.0 ms | 4.0 ms | 5.9 ms | 9.7 ms |
+| 3 disks, CPU | 30.4 ms | 43.8 ms | 68.8 ms | 118 ms |
+| 3 disks, Vulkan | 7.5 ms | 8.0 ms | 10.3 ms | 13.8 ms |
+
+Weights do not make these searches slower.
+
+### Run the benchmarks
+
 The benchmarks use 30 million vectors by default.
 To use fewer vectors, set `RINGDB_BENCH_N`:
 
