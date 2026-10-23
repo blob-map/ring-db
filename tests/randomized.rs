@@ -1,13 +1,13 @@
 //! Randomized searches compared with a scalar f64 reference.
 mod common;
 
-use common::{cpu, knn_keys, reference_dist};
+use common::{cpu, keys, knn_keys, reference_dist};
 use rand::{RngExt, SeedableRng};
-use ringdb::{CandidateSet, Disk, Knn, Metric, Region, SealedRingDb};
+use ringdb::{Db, Disk, Filter, Knn, Metric, Region};
 
 struct Case {
     vectors: Vec<Vec<f32>>,
-    db: SealedRingDb<u32>,
+    db: Db,
 }
 
 fn random_vectors(rng: &mut impl RngExt, n: usize, dims: usize) -> Vec<Vec<f32>> {
@@ -28,21 +28,30 @@ fn random_weights(rng: &mut impl RngExt, dims: usize) -> Vec<f32> {
         .collect()
 }
 
-/// Filters covering all, sparse, dense, and complemented representations.
-fn filters(db: &SealedRingDb<u32>) -> Vec<(Option<CandidateSet>, Vec<bool>)> {
-    let n = db.len() as u32;
-    let sets = [
-        db.candidates_from_ids(0..n).unwrap(),
-        db.candidates_from_ids([0, 5, n / 2, n - 1]).unwrap(),
-        db.candidates_from_ids((0..n).filter(|i| i % 3 != 1))
-            .unwrap(),
-        db.candidates_from_ids([1, 2, 64]).unwrap().complement(),
+/// Filters covering all, sparse, dense, and complemented row sets, and
+/// numeric conditions, with the membership each one implies.
+fn filters(n: u64) -> Vec<(Option<Filter>, Vec<bool>)> {
+    type Member = fn(u64, u64) -> bool;
+    let cases: [(Filter, Member); 6] = [
+        (keys(0..n), |_, _| true),
+        (keys([0, 5, n / 2, n - 1]), |i, n| {
+            [0, 5, n / 2, n - 1].contains(&i)
+        }),
+        (keys((0..n).filter(|i| i % 3 != 1)), |i, _| i % 3 != 1),
+        (!keys([1, 2, 64]), |i, _| ![1, 2, 64].contains(&i)),
+        (Filter::range("id", 10..=90) & !common::group(0), |i, _| {
+            (10..=90).contains(&i) && i % 3 != 0
+        }),
+        (common::group(2) | Filter::range("id", ..7), |i, _| {
+            i % 3 == 2 || i < 7
+        }),
     ];
     std::iter::once((None, vec![true; n as usize]))
-        .chain(sets.into_iter().map(|set| {
-            let members = (0..n).map(|id| set.contains(id).unwrap()).collect();
-            (Some(set), members)
-        }))
+        .chain(
+            cases
+                .into_iter()
+                .map(|(filter, member)| (Some(filter), (0..n).map(|i| member(i, n)).collect())),
+        )
         .collect()
 }
 
@@ -116,7 +125,7 @@ fn knn_and_regions_match_the_reference_for_every_filter_and_metric() {
                 }
             })
             .collect();
-        for (filter, members) in filters(&case.db) {
+        for (filter, members) in filters(case.vectors.len() as u64) {
             for weights in metrics {
                 for k in [0, 1, 7, 200] {
                     let mut query = Knn::new(&centers[0], k);

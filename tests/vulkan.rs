@@ -1,11 +1,24 @@
 mod common;
 
-use common::{build, same_knn, same_region};
+use common::{build, keys, same_knn, same_region};
 use rand::{RngExt, SeedableRng};
 use ringdb::{
-    BackendPreference, CandidateSet, Disk, Knn, MetadataValue, Metric, Region, RingDb,
-    RingDbConfig, RingDbError, SealedRingDb,
+    BackendPreference, Db, Disk, Filter, Key, Knn, Metric, Options, Record, Region, RingDbError,
+    Schema, Value,
 };
+
+fn vulkan() -> Options {
+    Options::default().backend(BackendPreference::Vulkan)
+}
+
+/// The `id` field of `key`, which the common builders set to the key.
+fn id(db: &Db, key: Key) -> u64 {
+    db.get(key)
+        .unwrap()
+        .get("id")
+        .and_then(Value::as_u64)
+        .unwrap()
+}
 
 fn requested() -> bool {
     std::env::var("RINGDB_VULKAN_TEST").as_deref() == Ok("1")
@@ -19,7 +32,7 @@ fn knn<'a>(
     query: &'a [f32],
     k: usize,
     weights: Option<&'a [f32]>,
-    filter: Option<&'a CandidateSet>,
+    filter: Option<&'a Filter>,
 ) -> Knn<'a> {
     let query = Knn::new(query, k).metric(metric(weights));
     match filter {
@@ -28,7 +41,7 @@ fn knn<'a>(
     }
 }
 
-fn region<'a>(disks: &[Disk<'a>], filter: Option<&'a CandidateSet>) -> Region<'a> {
+fn region<'a>(disks: &[Disk<'a>], filter: Option<&'a Filter>) -> Region<'a> {
     let mut region = Region::from(disks[0]);
     for disk in &disks[1..] {
         region = region.and(*disk);
@@ -39,12 +52,12 @@ fn region<'a>(disks: &[Disk<'a>], filter: Option<&'a CandidateSet>) -> Region<'a
     }
 }
 
-fn parity_knn(cpu: &SealedRingDb<u32>, gpu: &SealedRingDb<u32>, query: Knn<'_>) {
-    assert_eq!(gpu.backend_name(), "vulkan");
+fn parity_knn(cpu: &Db, gpu: &Db, query: Knn<'_>) {
+    assert_eq!(gpu.backend(), BackendPreference::Vulkan);
     same_knn(&cpu.search(query).unwrap(), &gpu.search(query).unwrap());
 }
 
-fn parity_region(cpu: &SealedRingDb<u32>, gpu: &SealedRingDb<u32>, query: Region<'_>) {
+fn parity_region(cpu: &Db, gpu: &Db, query: Region<'_>) {
     same_region(
         &cpu.search(query.clone()).unwrap(),
         &gpu.search(query).unwrap(),
@@ -57,15 +70,13 @@ fn cpu_works_and_vulkan_reports_unavailable_without_a_driver() {
     // device tests or change a loader that is already initialized.
     const CHILD: &str = "RINGDB_VULKAN_MISSING_DRIVER_CHILD";
     if std::env::var_os(CHILD).is_some() {
-        let result = RingDb::<()>::new(
-            RingDbConfig::new(1).with_backend_preference(BackendPreference::Vulkan),
-        );
+        let result = Db::in_memory(Schema::new(1), vulkan());
         assert!(matches!(result, Err(RingDbError::BackendUnavailable(_))));
-        let mut cpu: RingDb = RingDb::new(RingDbConfig::new(1)).unwrap();
-        cpu.add_vector(&[1.0], ()).unwrap();
-        cpu.add_vector(&[3.0], ()).unwrap();
-        let cpu = cpu.build().unwrap();
-        assert_eq!(cpu.backend_name(), "cpu");
+        let cpu = Db::in_memory(Schema::new(1), Options::default()).unwrap();
+        cpu.add(Record::new([1.0])).unwrap();
+        cpu.add(Record::new([3.0])).unwrap();
+        cpu.flush().unwrap();
+        assert_eq!(cpu.backend(), BackendPreference::Cpu);
         let hits = cpu.search(Knn::new(&[0.0], 1)).unwrap();
         assert_eq!(hits[0].key.get(), 0);
         assert_eq!(hits[0].dist_sq, 1.0);
@@ -93,14 +104,14 @@ fn cpu_works_and_vulkan_reports_unavailable_without_a_driver() {
     );
 }
 
-fn candidates(db: &SealedRingDb<u32>) -> Vec<CandidateSet> {
+fn candidates(db: &Db) -> Vec<Filter> {
+    let n = db.len() as u64;
     vec![
-        db.candidates_from_ids(0..db.len() as u32).unwrap(),
-        db.candidates_from_ids([]).unwrap(),
-        db.candidates_from_ids([0, 31, 64, db.len() as u32 - 1])
-            .unwrap(),
-        db.metadata_eq(common::GROUP, MetadataValue::new(1)),
-        db.candidates_from_ids([0, 63]).unwrap().complement(),
+        keys(0..n),
+        keys([]),
+        keys([0, 31, 64, n - 1]),
+        common::group(1),
+        !keys([0, 63]),
     ]
 }
 
@@ -117,7 +128,7 @@ fn vulkan_matches_cpu_for_queries_weights_and_candidate_forms() {
             .collect();
         let cpu = build(&vectors, BackendPreference::Cpu);
         let gpu = build(&vectors, BackendPreference::Vulkan);
-        assert_eq!(gpu.backend_name(), "vulkan");
+        assert_eq!(gpu.backend(), BackendPreference::Vulkan);
         let origin = vec![0.0; dims];
         let shifted = vec![0.5; dims];
         let weights: Vec<_> = (0..dims).map(|i| [0.0, 0.25, 2.0, 1.0][i % 4]).collect();
@@ -183,12 +194,8 @@ fn vulkan_knn_reduction_preserves_ties_infinity_and_zero_weights() {
     let vectors: Vec<Vec<f32>> = (0..16_513).map(|id| vec![(id % 7) as f32]).collect();
     let cpu = build(&vectors, BackendPreference::Cpu);
     let gpu = build(&vectors, BackendPreference::Vulkan);
-    let sparse = gpu
-        .candidates_from_ids((0..gpu.len() as u32).step_by(33))
-        .unwrap();
-    let dense = gpu
-        .candidates_from_ids((0..gpu.len() as u32).step_by(2))
-        .unwrap();
+    let sparse = keys((0..gpu.len() as u64).step_by(33));
+    let dense = keys((0..gpu.len() as u64).step_by(2));
     for filter in [None, Some(&sparse), Some(&dense)] {
         for k in [1, 5, 17, 300, 20_000] {
             parity_knn(&cpu, &gpu, knn(&[0.0], k, None, filter));
@@ -216,11 +223,7 @@ fn vulkan_handles_empty_databases_bounds_and_validation() {
     if !requested() {
         return;
     }
-    let empty: SealedRingDb =
-        RingDb::new(RingDbConfig::new(2).with_backend_preference(BackendPreference::Vulkan))
-            .unwrap()
-            .build()
-            .unwrap();
+    let empty = Db::in_memory(Schema::new(2), vulkan()).unwrap();
     let origin = [0.0, 0.0];
     assert!(empty.search(Knn::new(&origin, 10)).unwrap().is_empty());
     assert!(empty.search(Disk::new(&origin, 10.0)).unwrap().is_empty());
@@ -241,10 +244,10 @@ fn vulkan_handles_empty_databases_bounds_and_validation() {
         common::region_keys(&gpu.search(Disk::new(&origin, 0.0)).unwrap()),
         [0]
     );
-    let wrong = empty.candidates_from_ids([]).unwrap();
+    let unknown = Filter::eq("missing", 1);
     assert!(matches!(
-        gpu.search(Knn::new(&origin, 1).filter(&wrong)),
-        Err(RingDbError::CandidateSetMismatch { .. })
+        gpu.search(Knn::new(&origin, 1).filter(&unknown)),
+        Err(RingDbError::UnknownField(_))
     ));
 
     // Nearby values at a large offset must use direct deltas, not norms.
@@ -269,8 +272,8 @@ fn vulkan_reuses_query_buffers_without_stale_or_aliased_results() {
     let snapshot = retained.clone();
     let retained_knn = gpu.search(Knn::new(&origin, 300)).unwrap();
     let knn_snapshot = retained_knn.clone();
-    let sparse = gpu.candidates_from_ids([0, 50, 2048]).unwrap();
-    let dense = gpu.candidates_from_ids((0..2049).step_by(2)).unwrap();
+    let sparse = keys([0, 50, 2048]);
+    let dense = keys((0..2049).step_by(2));
     let ones = [1.0; 7];
     for filter in [None, Some(&sparse), Some(&dense), None] {
         for radius in [1.0, 256.0, 0.0, 8.0, 128.0, 0.0] {
@@ -297,13 +300,11 @@ fn vulkan_reads_large_results_from_concurrent_rayon_callers() {
     // Exceed the parallel readback threshold, with hit records that can
     // straddle byte-copy chunks. Keep dimensions small for software CI.
     let rows = 2_100_013;
-    let mut builder =
-        RingDb::new(RingDbConfig::new(1).with_backend_preference(BackendPreference::Vulkan))
-            .unwrap();
+    let db = Db::in_memory(Schema::new(1), vulkan()).unwrap();
     for id in 0..rows {
-        builder.add_vector(&[(id % 1024) as f32], ()).unwrap();
+        db.add(Record::new([(id % 1024) as f32])).unwrap();
     }
-    let db = builder.build().unwrap();
+    db.flush().unwrap();
     // A query must not run unrelated caller jobs while holding its mutex.
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(2)
@@ -333,61 +334,59 @@ fn vulkan_reads_large_results_from_concurrent_rayon_callers() {
     });
 }
 
+/// The same records on `backend`, split into segments after each of `cuts`.
+fn segmented(vectors: &[Vec<f32>], cuts: &[usize], backend: BackendPreference) -> Db {
+    let db = Db::in_memory(
+        common::schema(vectors[0].len()),
+        Options::default().backend(backend),
+    )
+    .unwrap();
+    for (id, vector) in vectors.iter().enumerate() {
+        let record = Record::new(vector.as_slice())
+            .set("group", (id % 3) as u32)
+            .set("id", id as u64);
+        db.add(record).unwrap();
+        if cuts.contains(&id) {
+            db.flush().unwrap();
+        }
+    }
+    db.flush().unwrap();
+    db
+}
+
 #[test]
-fn vulkan_loads_persisted_payloads_metadata_and_supports_concurrent_queries() {
+fn vulkan_searches_segments_and_supports_concurrent_queries() {
     if !requested() {
         return;
     }
-    let dir = tempfile::tempdir().unwrap();
-    let mut db = RingDb::new(RingDbConfig::new(3).with_persist_dir(dir.path())).unwrap();
-    for id in 0..269u32 {
-        db.add_vector_with_metadata(
-            &[id as f32, 1.0, 2.0],
-            id,
-            &[ringdb::MetadataTag::new(
-                common::GROUP,
-                MetadataValue::new((id % 3) as u64),
-            )],
-        )
-        .unwrap();
-    }
-    let cpu = db.build().unwrap();
-    let gpu = RingDb::<u32>::load(dir.path(), BackendPreference::Vulkan).unwrap();
-    let filter = gpu.metadata_eq(common::GROUP, MetadataValue::new(1));
+    let vectors: Vec<Vec<f32>> = (0..269).map(|id| vec![id as f32, 1.0, 2.0]).collect();
+    // Segments of 1, 63, 64, and 141 rows, cut inside and at bitmap words.
+    let cuts = [0, 63, 127];
+    let cpu = build(&vectors, BackendPreference::Cpu);
+    let gpu = segmented(&vectors, &cuts, BackendPreference::Vulkan);
+    let filter = common::group(1);
     std::thread::scope(|scope| {
         for shift in 0..4 {
             let (cpu, gpu, filter) = (&cpu, &gpu, &filter);
             scope.spawn(move || {
-                let point = [shift as f32, 0.0, 0.0];
-                for _ in 0..4 {
-                    let query = Knn::new(&point, 3).filter(filter);
+                let point = [shift as f32 * 40.0, 0.0, 0.0];
+                for k in [3, 100] {
+                    let query = Knn::new(&point, k).filter(filter);
                     let result = gpu.search(query).unwrap();
                     for hit in &result {
-                        assert_eq!(
-                            u64::from(*gpu.fetch_payload(hit.key).unwrap()),
-                            hit.key.get()
-                        );
+                        assert_eq!(id(gpu, hit.key), hit.key.get());
                     }
                     same_knn(&cpu.search(query).unwrap(), &result);
-                    parity_region(cpu, gpu, Disk::new(&point, 100.0).filter(filter));
+                    parity_knn(cpu, gpu, Knn::new(&point, k));
                 }
+                parity_region(cpu, gpu, Disk::new(&point, 100.0).filter(filter));
+                let region = Disk::new(&point, 120.0).and(Disk::new(&[60.0, 1.0, 2.0], 90.0));
+                parity_region(cpu, gpu, region);
+                let edges = keys([0, 1, 63, 64, 127, 128, 268]);
+                parity_region(cpu, gpu, Disk::new(&point, 1e4).filter(&edges));
             });
         }
     });
-
-    // Persisting on Vulkan also reloads on CPU without a format change.
-    let dir = tempfile::tempdir().unwrap();
-    let mut db = RingDb::new(
-        RingDbConfig::new(1)
-            .with_persist_dir(dir.path())
-            .with_backend_preference(BackendPreference::Vulkan),
-    )
-    .unwrap();
-    db.add_vector(&[3.0], 17u32).unwrap();
-    let _gpu = db.build().unwrap();
-    let loaded = RingDb::<u32>::load(dir.path(), BackendPreference::Cpu).unwrap();
-    let hit = loaded.search(Knn::new(&[0.0], 1)).unwrap()[0];
-    assert_eq!(*loaded.fetch_payload(hit.key).unwrap(), 17);
 }
 
 #[test]
@@ -425,17 +424,14 @@ fn vulkan_chunks_preserve_global_ids_filters_and_exact_knn() {
     let cpu = build(&vectors, BackendPreference::Cpu);
     let gpu = build(&vectors, BackendPreference::Vulkan);
     let sets = [
-        gpu.candidates_from_ids([]).unwrap(),
-        gpu.candidates_from_ids(0..2309).unwrap(),
-        gpu.candidates_from_ids([
+        keys([]),
+        keys(0..2309),
+        keys([
             0, 31, 32, 63, 64, 1022, 1023, 1026, 1027, 1028, 2045, 2046, 2053, 2054, 2308,
-        ])
-        .unwrap(),
-        gpu.candidates_from_ids((0..2309).step_by(2)).unwrap(),
-        gpu.candidates_from_ids([2054, 2308]).unwrap(),
-        gpu.candidates_from_ids([0, 1026, 1027, 2053, 2054, 2308])
-            .unwrap()
-            .complement(),
+        ]),
+        keys((0..2309).step_by(2)),
+        keys([2054, 2308]),
+        !keys([0, 1026, 1027, 2053, 2054, 2308]),
     ];
     let retained = gpu.search(Disk::new(&[0.0; 3], 100.0)).unwrap();
     let snapshot = retained.clone();
@@ -459,10 +455,7 @@ fn vulkan_chunks_preserve_global_ids_filters_and_exact_knn() {
     }
     assert_eq!(retained, snapshot);
     for hit in retained.iter() {
-        assert_eq!(
-            u64::from(*gpu.fetch_payload(hit.key).unwrap()),
-            hit.key.get()
-        );
+        assert_eq!(id(&gpu, hit.key), hit.key.get());
     }
 
     // Overflowed distances remain valid KNN candidates. Zero weights must
@@ -477,14 +470,8 @@ fn vulkan_chunks_preserve_global_ids_filters_and_exact_knn() {
         }
     }
 
-    // Loading a persisted CPU database follows the same chunked upload path.
-    let dir = tempfile::tempdir().unwrap();
-    let mut persisted = RingDb::new(RingDbConfig::new(3).with_persist_dir(dir.path())).unwrap();
-    for (id, vector) in vectors.iter().enumerate() {
-        persisted.add_vector(vector, id as u32).unwrap();
-    }
-    let cpu = persisted.build().unwrap();
-    let gpu = RingDb::<u32>::load(dir.path(), BackendPreference::Vulkan).unwrap();
+    // Chunked segments of different sizes keep their row offsets.
+    let gpu = segmented(&vectors, &[700, 1500], BackendPreference::Vulkan);
     std::thread::scope(|scope| {
         for center in [[0.0; 3], [2.0; 3], [6.0; 3]] {
             let (cpu, gpu) = (&cpu, &gpu);
@@ -510,18 +497,16 @@ fn vulkan_reads_vectors_past_four_gib() {
     }
     let rows = 16_777_219u32;
     let special = [0, rows - 300, rows - 2, rows - 1];
-    let mut db: RingDb =
-        RingDb::new(RingDbConfig::new(64).with_backend_preference(BackendPreference::Vulkan))
-            .unwrap();
+    let db = Db::in_memory(Schema::new(64), vulkan()).unwrap();
     for id in 0..rows {
         let mut row = [100.0; 64];
         if let Some(rank) = special.iter().position(|&candidate| candidate == id) {
             row.fill(0.0);
             row[63] = (3 - rank) as f32;
         }
-        db.add_vector(&row, ()).unwrap();
+        db.add(Record::new(row)).unwrap();
     }
-    let db = db.build().unwrap();
+    db.flush().unwrap();
     let point = [0.0; 64];
     // The last coordinate of the last two vectors is beyond byte offset 2^32
     // when this device can hold the vectors in one allocation.
@@ -535,12 +520,12 @@ fn vulkan_reads_vectors_past_four_gib() {
         hits.iter().map(|h| h.dist_sq).collect::<Vec<_>>(),
         [0.0, 1.0, 4.0, 9.0]
     );
-    let sparse = db.candidates_from_ids([0, rows - 1]).unwrap();
+    let sparse = keys([0, u64::from(rows - 1)]);
     assert_eq!(
         common::knn_keys(&db.search(query.filter(&sparse)).unwrap()),
         [rows - 1, 0].map(u64::from)
     );
-    let dense = db.candidates_from_ids([0]).unwrap().complement();
+    let dense = !keys([0]);
     let inside = db.search(Disk::new(&point, 2.0).filter(&dense)).unwrap();
     assert_eq!(
         common::region_keys(&inside),

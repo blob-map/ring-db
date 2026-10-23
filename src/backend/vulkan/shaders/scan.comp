@@ -79,7 +79,7 @@ void main() {
     // Output: the hit count, then per hit its row and disk_count distances.
     uint dst = atomicAdd(output_word(0).value, 1u);
     uint64_t record = 1ul + uint64_t(dst) * uint64_t(1u + p.disk_count);
-    output_word(record).value = id + p.row_offset;
+    output_word(record).value = id + p.row_offset + p.row_base;
     for (uint disk = 0u; disk < p.disk_count; ++disk) {
         output_word(record + 1ul + uint64_t(disk)).value = floatBitsToUint(dists[disk]);
     }

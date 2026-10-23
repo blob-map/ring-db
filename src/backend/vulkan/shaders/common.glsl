@@ -24,8 +24,8 @@ layout(push_constant) uniform Params {
     uint mode; // 0: region, 1: KNN
     uint reduce_count;
     uint output_index;
-    uint row_offset;
-    uint reserved;
+    uint row_offset; // first row of the chunk within its segment
+    uint row_base;   // added to region output rows
 } p;
 const uint INVALID = 0xffffffffu;
 const uint MAX_DISKS = 16u;

@@ -1,7 +1,6 @@
 //! # ringDB
 //!
-//! An exact vector database for geometric and nearest-neighbor queries in
-//! high-dimensional spaces.
+//! An exact vector database with typed, filterable fields.
 //!
 //! ringDB has two exact search primitives: k-nearest neighbors ([`Knn`]) and
 //! regions ([`Region`]), the intersection of one or more [`Disk`]s. Each query
@@ -15,35 +14,45 @@
 //! ## Quick start
 //!
 //! ```
-//! use ringdb::{Disk, Knn, RingDb, RingDbConfig};
+//! use ringdb::{Db, Disk, FieldType, Filter, Knn, Options, Record, Schema};
 //!
-//! let mut db = RingDb::new(RingDbConfig::new(4)).unwrap();
-//! db.add_vector(&[1.0f32, 0.0, 0.0, 0.0], ()).unwrap();
-//! db.add_vector(&[0.0, 5.0, 0.0, 0.0], ()).unwrap();
+//! let schema = Schema::new(2)
+//!     .field("city", FieldType::Keyword)
+//!     .field("rooms", FieldType::U32);
+//! let db = Db::in_memory(schema, Options::default()).unwrap();
+//! let near = db.add(Record::new([1.0, 0.0]).set("city", "Lyon").set("rooms", 3)).unwrap();
+//! db.add(Record::new([0.0, 5.0]).set("city", "Paris").set("rooms", 2)).unwrap();
+//! db.flush().unwrap();
 //!
-//! let db = db.build().unwrap();
-//! let origin = [0.0f32; 4];
+//! let origin = [0.0, 0.0];
 //! let nearest = db.search(Knn::new(&origin, 1)).unwrap();
-//! assert_eq!(nearest[0].dist_sq, 1.0);
-//! let inside = db.search(Disk::new(&origin, 2.0)).unwrap();
-//! assert_eq!(inside.len(), 1);
+//! assert_eq!((nearest[0].key, nearest[0].dist_sq), (near, 1.0));
+//! let lyon = Filter::eq("city", "Lyon");
+//! let inside = db.search(Disk::new(&origin, 10.0).filter(&lyon)).unwrap();
+//! assert_eq!(inside.keys().collect::<Vec<_>>(), [near]);
+//! assert_eq!(db.get(near).unwrap().get("rooms").and_then(|v| v.as_u32()), Some(3));
 //! ```
 mod backend;
+mod column;
 mod config;
-mod engine;
+mod db;
 mod error;
-mod metadata;
-mod payload;
-mod persist;
+mod filter;
 mod query;
+mod rows;
+mod schema;
+mod segment;
+mod value;
 
 // Compile README examples with the public API as part of `cargo test`.
 #[cfg(doctest)]
 #[doc = include_str!("../README.md")]
 mod readme {}
 
-pub use config::{BackendPreference, RingDbConfig};
-pub use engine::{RingDb, SealedRingDb};
+pub use config::{BackendPreference, Options};
+pub use db::{Db, Snapshot};
 pub use error::RingDbError;
-pub use metadata::{CandidateSet, MetadataKey, MetadataTag, MetadataValue};
+pub use filter::Filter;
 pub use query::{Disk, Hit, Key, Knn, MAX_DISKS, Metric, Query, Region, RegionHit, RegionResult};
+pub use schema::{FieldType, Schema};
+pub use value::{Document, Record, Value};

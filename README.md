@@ -2,9 +2,10 @@
 
 ring-db is a Rust library for exact vector search on a CPU or a GPU with Vulkan.
 It finds the closest vectors, or all vectors in a region made of one or more disks.
-You can filter vectors with metadata tags and set a weight for each dimension.
+Each record has a vector and typed fields.
+You can filter records by their fields and set a weight for each dimension.
 
-Exact search calculates distances for all vectors that pass the filter.
+Exact search calculates distances for all records that pass the filter.
 ring-db uses `f32` arithmetic.
 It does not use an approximate search index.
 
@@ -24,39 +25,42 @@ A GPU, Vulkan loader, and GPU driver are not necessary for CPU queries.
 
 ## Find the closest vector
 
-This example creates a database with two dimensions and no payload.
+This example creates a database with two dimensions and no fields.
 It finds the vector closest to `[0.0, 0.0]`.
 The `dist_sq` field contains the squared distance.
 
 ```rust
-use ringdb::{Knn, RingDb, RingDbConfig};
+use ringdb::{Db, Knn, Options, Record, Schema};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut db = RingDb::new(RingDbConfig::new(2))?;
-    db.add_vector(&[3.0, 4.0], ())?;
-    db.add_vector(&[1.0, 0.0], ())?;
-    let db = db.build()?;
+    let db = Db::in_memory(Schema::new(2), Options::default())?;
+    db.add(Record::new([3.0, 4.0]))?;
+    let near = db.add(Record::new([1.0, 0.0]))?;
+    db.flush()?;
 
     let origin = [0.0, 0.0];
     let hits = db.search(Knn::new(&origin, 1))?;
 
-    assert_eq!(hits[0].key.get(), 1);
+    assert_eq!(hits[0].key, near);
     assert_eq!(hits[0].dist_sq, 1.0);
     Ok(())
 }
 ```
 
-Each vector has a `Key`.
-`key.get()` returns the key as a `u64` value.
-The keys start at zero and follow the insertion order.
+`add` returns a new `Key` for each record.
+ring-db does not use a key again.
+`key.get()` returns the key as a `u64` value, and `Key::new` makes a key from this value.
 
-After you insert the data, call `build()`.
-This method returns a `SealedRingDb` for subsequent queries.
-You cannot insert, change, or remove records after this call.
+Searches and `get` find a record after `flush`.
+`flush` makes all added records visible.
+
+The database stays in memory and is not saved to disk.
+All methods take `&self`.
+To use a database from more than one thread, put it in an `Arc`.
 
 ## Select CPU or Vulkan
 
-The two backends can execute all query types, weights, and metadata filters.
+The two backends can execute all search types, weights, and filters.
 The backend selection occurs at runtime.
 
 | Backend | Selection | Runtime requirements |
@@ -64,18 +68,17 @@ The backend selection occurs at runtime.
 | CPU | `BackendPreference::Cpu`, or the default | No GPU runtime |
 | Vulkan | `BackendPreference::Vulkan` | A Vulkan 1.2 loader, driver, and compatible compute device |
 
-To use Vulkan, set the backend in `RingDbConfig`:
+To use Vulkan, set the backend in `Options`:
 
 ```rust,no_run
-use ringdb::{BackendPreference, RingDb, RingDbConfig};
+use ringdb::{BackendPreference, Db, Options, Record, Schema};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = RingDbConfig::new(64)
-        .with_backend_preference(BackendPreference::Vulkan);
-    let mut db: RingDb = RingDb::new(config)?;
-    db.add_vector(&[0.0; 64], ())?;
-    let db = db.build()?;
-    assert_eq!(db.backend_name(), "vulkan");
+    let options = Options::default().backend(BackendPreference::Vulkan);
+    let db = Db::in_memory(Schema::new(64), options)?;
+    db.add(Record::new([0.0; 64]))?;
+    db.flush()?;
+    assert_eq!(db.backend(), BackendPreference::Vulkan);
     Ok(())
 }
 ```
@@ -94,7 +97,9 @@ Subgroup extensions and 64-bit shader atomics are not necessary.
 If Vulkan is unavailable, database creation returns `BackendUnavailable`.
 ring-db does not automatically change the backend to CPU.
 
-The Vulkan backend uploads vectors one time and keeps them in device memory.
+ring-db keeps records in groups called segments.
+Each `flush` makes one new segment from the added records.
+The Vulkan backend uploads the vectors of each segment one time and keeps them in device memory.
 It executes queries on one database in sequence.
 It keeps query buffers for subsequent queries until you drop the database.
 Each result owns its data and stays valid after subsequent queries.
@@ -103,8 +108,8 @@ Vulkan uses 64-bit device addresses to access vector data and query buffers.
 A single vector buffer can be more than 4 GiB.
 The storage-buffer binding limit does not apply to these device addresses.
 
-If a device's allocation limit is too small, ring-db divides the dataset into groups of vectors called chunks.
-Queries combine the results from all chunks and keep the original vector keys.
+If a device's allocation limit is too small, ring-db divides a segment into groups of vectors called chunks.
+Queries combine the results from all segments and chunks and keep the original keys.
 KNN returns the closest vectors across the full dataset.
 All vectors and query buffers must fit the available device memory.
 An allocation that is too large causes a backend error.
@@ -116,22 +121,37 @@ To run the example with Vulkan, use this command:
 cargo run --release --example cli -- --backend vulkan --n 100000 --dims 64 --k 10
 ```
 
-## Vectors, payloads, and metadata
+## Schemas and fields
 
-Each database record has these parts:
+A `Schema` gives the number of dimensions and the fields of each record.
+You cannot change the schema after you create the database.
+All vectors must have this number of dimensions, which must be more than zero.
 
-| Part | Function | Type |
+Each field has a name and a `FieldType`:
+
+| Type | Values | Filter |
 |---|---|---|
-| Vector | Calculate the distance from a query vector | One `f32` value for each dimension |
-| Payload | Keep application data for retrieval with a result | A fixed-size `bytemuck::Pod` record, or `()` |
-| Metadata tags | Select the vectors to search | Integer keys and values |
+| `U32`, `U64`, `I64` | Integers | Equality and ranges |
+| `F32` | Finite `f32` numbers | Equality and ranges |
+| `Bool` | `true` or `false` | Equality |
+| `Keyword` | One string, such as a city | Exact equality |
+| `Keywords` | Zero or more strings, such as amenities | Exact equality with one string |
+| `Text` | A UTF-8 string | Stored only |
+| `TextList` | A list of UTF-8 strings | Stored only |
+| `Bytes` | Bytes | Stored only |
 
-All vectors in a database must have the same number of dimensions.
-The number of dimensions must be more than zero.
+All fields are optional.
+Use `Record::set(field, value)` to give a value to a field.
+A record has no value for the fields that you do not set.
 
-ring-db uses metadata tags to select vectors before it calculates distances.
-It does not read payload fields to apply a filter.
-Your application supplies the tags as separate values when it inserts a vector.
+An integer value can go into all integer types that can hold it.
+For example, `set("rooms", 3)` is correct for a `U32` field.
+For a `Keywords` or `TextList` field, you can set one string or a list of strings.
+
+`add` examines each record against the schema.
+It returns an error for an unknown field, an incorrect value type, or a field that you set two times.
+A record must not be larger than `Options::max_record_bytes`.
+The default limit is 64 KiB for the vector and all field values together.
 
 ## Find the closest open bakery
 
@@ -143,63 +163,34 @@ They are not latitude and longitude.
 The weights `[4.0, 1.0]` multiply the squared difference on the first axis by four.
 The second axis has a weight of one.
 
-For the payload examples, add this dependency to the `[dependencies]` section:
-
-```toml
-bytemuck = { version = "1", features = ["derive"] }
-```
-
-The `derive` feature belongs to `bytemuck`.
-It generates the necessary traits for your payload type.
-ring-db itself has no feature flags.
-This direct dependency is not necessary for applications with only the unit payload `()`.
-
 ```rust
-use bytemuck::{Pod, Zeroable};
-use ringdb::{
-    Knn, MetadataKey, MetadataTag, MetadataValue, Metric, RingDb, RingDbConfig,
-};
-
-const KIND: MetadataKey = MetadataKey::new(1);
-const STATUS: MetadataKey = MetadataKey::new(2);
-const BAKERY: MetadataValue = MetadataValue::new(10);
-const CAFE: MetadataValue = MetadataValue::new(11);
-const OPEN: MetadataValue = MetadataValue::new(20);
-const CLOSED: MetadataValue = MetadataValue::new(21);
-
-#[repr(C)]
-#[derive(Debug, Copy, Clone, Pod, Zeroable)]
-struct Place {
-    name_id: u32,
-}
+use ringdb::{Db, FieldType, Filter, Knn, Metric, Options, Record, Schema, Value};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut db: RingDb<Place> = RingDb::new(RingDbConfig::new(2))?;
+    let schema = Schema::new(2)
+        .field("name", FieldType::Text)
+        .field("kind", FieldType::Keyword)
+        .field("open", FieldType::Bool);
+    let db = Db::in_memory(schema, Options::default())?;
 
-    // Position, name ID, type, and status for each place.
+    // Position, name, type, and status for each place.
     let places = [
-        ([0.8, 1.5], 100, BAKERY, OPEN),
-        ([0.2, 0.3], 101, CAFE, OPEN),
-        ([1.0, 0.4], 102, BAKERY, CLOSED),
-        ([2.0, 0.0], 103, BAKERY, OPEN),
+        ([0.8, 1.5], "Fournil", "bakery", true),
+        ([0.2, 0.3], "Kawa", "cafe", true),
+        ([1.0, 0.4], "Mie Dorée", "bakery", false),
+        ([2.0, 0.0], "Levain", "bakery", true),
     ];
-
-    for (position, name_id, kind, status) in places {
-        db.add_vector_with_metadata(
-            &position,
-            Place { name_id },
-            &[
-                MetadataTag::new(KIND, kind),
-                MetadataTag::new(STATUS, status),
-            ],
+    for (position, name, kind, open) in places {
+        db.add(
+            Record::new(position)
+                .set("name", name)
+                .set("kind", kind)
+                .set("open", open),
         )?;
     }
-    let db = db.build()?;
+    db.flush()?;
 
-    let bakeries = db.metadata_eq(KIND, BAKERY);
-    let open = db.metadata_eq(STATUS, OPEN);
-    let open_bakeries = bakeries.intersection(&open)?;
-
+    let open_bakeries = Filter::eq("kind", "bakery") & Filter::eq("open", true);
     let origin = [0.0, 0.0];
     let weights = [4.0, 1.0];
     let hits = db.search(
@@ -209,53 +200,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     let hit = hits.first().expect("one open bakery");
-    let place = db.fetch_payload(hit.key)?;
-    assert_eq!(place.name_id, 100);
-    println!("name ID: {}, distance: {}", place.name_id, hit.dist_sq.sqrt());
+    let place = db.get(hit.key)?;
+    let name = place.get("name").and_then(Value::as_str);
+    assert_eq!(name, Some("Fournil"));
+    println!("{name:?} is at distance {}", hit.dist_sq.sqrt());
     Ok(())
 }
 ```
 
-The query compares the two open bakeries.
+The search compares the two open bakeries.
 It does not include the cafe and the closed bakery, although they are closer to the origin.
-The result contains the bakery with name ID `100`.
+The result contains the bakery with the name `Fournil`.
 
-## Metadata filters
+## Filters
 
-A metadata tag contains a `MetadataKey` (`u32`) and a `MetadataValue` (`u64`).
-Your application gives values and meanings to these integers.
-If you save the database, keep the same meanings for these integers when you load it.
+A `Filter` selects records by their field values.
+Each search can have one filter.
+To apply it, call `.filter(&filter)` on the search.
+Without this call, the search examines all records.
 
-`metadata_eq(key, value)` returns a `CandidateSet` with the vector IDs that have that tag.
-A tag with no matches gives an empty set.
-You can use a candidate set in more than one query.
+| Filter | Selected records |
+|---|---|
+| `Filter::eq(field, value)` | The field is equal to `value`. For `Keywords`, the field contains `value` |
+| `Filter::any_of(field, values)` | The field is equal to, or contains, one or more of `values` |
+| `Filter::range(field, low..high)` | The numeric field is in the range |
+| `Filter::keys(keys)` | The record has one of `keys` |
+| `a & b` | The records in `a` and in `b` |
+| `a \| b` | The records in `a`, in `b`, or in the two filters |
+| `!a` | All records not in `a` |
 
-For filter operations, use these methods:
+Ranges can use all Rust range forms, for example `100..=400`, `..3`, or `50.0..`.
+Keyword filters compare full strings, with the same case.
 
-| Method | Operation | Selected IDs |
-|---|---|---|
-| `a.intersection(&b)?` | AND | IDs in the two sets |
-| `a.union(&b)?` | OR | IDs in one or two sets |
-| `a.complement()` | NOT | All database IDs not in `a` |
-| `db.candidates_from_ids(ids)?` | Select by ID | Valid IDs from the supplied list |
+A record with no value for a field does not pass a filter on that field.
+Thus `!Filter::eq("garden", true)` includes the records with no `garden` value.
 
-For example, `open.complement()` includes all records without the `STATUS = OPEN` tag.
-This includes records with no status tag.
-
-Use candidate sets from the database that you query.
-ring-db validates the vector count for each set.
-It does not validate database identity.
-Sets from different databases with the same vector count can pass this validation.
-
-To apply a filter, call `.filter(&set)` on the search.
-Without this call, the search examines all vectors.
-Each search has a maximum of one filter.
-To use more than one condition, combine the sets before the search.
-
-Metadata filters compare integers for equality.
-They cannot compare text or select a numeric range.
-To filter strings, give an integer ID to each different string.
-Keep the relation between IDs and strings in your application.
+ring-db examines a filter against the schema before the search.
+It returns `UnknownField` for an unknown field.
+It returns `InvalidQuery` for a stored-only field or an incorrect value type.
 
 ## Searches and distances
 
@@ -277,14 +259,14 @@ A region can contain a maximum of `MAX_DISKS` (16) disks.
 This example finds the vectors in two disks:
 
 ```rust
-use ringdb::{Disk, RingDb, RingDbConfig};
+use ringdb::{Db, Disk, Options, Record, Schema};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut db = RingDb::new(RingDbConfig::new(2))?;
-    db.add_vector(&[0.0, 0.0], ())?;
-    db.add_vector(&[1.0, 0.0], ())?;
-    db.add_vector(&[3.0, 0.0], ())?;
-    let db = db.build()?;
+    let db = Db::in_memory(Schema::new(2), Options::default())?;
+    db.add(Record::new([0.0, 0.0]))?;
+    let middle = db.add(Record::new([1.0, 0.0]))?;
+    db.add(Record::new([3.0, 0.0]))?;
+    db.flush()?;
 
     let left = [0.0, 0.0];
     let right = [2.0, 0.0];
@@ -293,7 +275,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     assert_eq!(result.len(), 1);
     let hit = result.get(0).expect("one vector in the two disks");
-    assert_eq!(hit.key.get(), 1);
+    assert_eq!(hit.key, middle);
     assert_eq!(hit.dists_sq(), &[1.0, 1.0]);
     Ok(())
 }
@@ -338,83 +320,21 @@ Search inputs have these requirements:
 
 To get the distance from a squared distance, use `dist_sq.sqrt()`.
 
-## Payload records
+## Read a record
 
-The payload type `T` must implement `bytemuck::Pod + Send + Sync`.
-`Pod` means plain old data.
+`db.get(key)` returns a `Document` with the key, the vector, and the field values.
+It returns `KeyNotFound` if no visible record has this key.
 
-For a database without payload data, use `()`.
-For payload data, use a fixed-size record:
+`document.get(field)` returns the `Value` of one field, or `None` if the record has no value.
+Use the `Value` methods, such as `as_u32()` or `as_str()`, to read the value.
+`document.fields()` returns all fields that have a value, in schema order.
 
-```rust
-use bytemuck::{Pod, Zeroable};
+A `Keywords` value contains its strings in sorted order, without duplicates.
+An empty list has the same result as no value.
 
-#[repr(C)]
-#[derive(Debug, Copy, Clone, Pod, Zeroable)]
-struct Record {
-    category_id: u32,
-    name_len: u32,
-    name: [u8; 64],
-}
-```
-
-A Pod record cannot contain pointers, `String`, or `Vec` fields.
-The `Pod` derive rejects field types and implicit padding that do not satisfy the trait requirements.
-
-A byte array can hold text up to a fixed capacity.
-In this example, `name_len` contains the number of bytes in the name.
-
-When you read the text, make sure that `name_len` is not more than the array length.
-Make sure that the text has correct UTF-8 encoding.
-
-`db.fetch_payload(key)?` returns a reference to one payload.
-`db.fetch_payloads(&keys)?` returns a vector of references in the requested key order.
-The two methods validate keys and return an error for an invalid key.
-They do not copy or deserialize payload records.
-
-## Save and load a database
-
-Before you call `build()`, set a directory with `with_persist_dir()`.
-Use an empty directory or a path for a new directory.
-
-This example saves one vector without a payload, then loads the database:
-
-```rust,no_run
-use std::path::Path;
-use ringdb::{BackendPreference, RingDb, RingDbConfig};
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let path = Path::new("places-db");
-    let config = RingDbConfig::new(2).with_persist_dir(path);
-    let mut db = RingDb::new(config)?;
-    db.add_vector(&[0.8, 1.5], ())?;
-    let _db = db.build()?;
-
-    let loaded = RingDb::<()>::load(path, BackendPreference::Cpu)?;
-    assert_eq!(loaded.len(), 1);
-    Ok(())
-}
-```
-
-Format version 1 uses these files:
-
-| File | Contents |
-|---|---|
-| `meta.bin` | Format version, byte order, dimensions, vector count, and payload layout |
-| `vectors.bin` | `f32` coordinates in vector order, with little-endian byte order |
-| `payloads.bin` | Payload records in their native memory layout |
-| `metadata.bin` | Metadata tags and their vector IDs |
-
-ring-db writes the three data files first and `meta.bin` last.
-It does not overwrite a database.
-A power failure can cause data loss.
-
-Load the database with the same payload record layout that you used to save it.
-ring-db validates byte order, payload size, and alignment.
-It does not save field names or validate their meanings.
-
-A database load reads payloads into memory one time.
-The saved database does not contain queries or weights.
+`db.snapshot()` returns a `Snapshot`.
+A snapshot is a view of the database at one time.
+Searches and `get` on a snapshot do not see the records that you add after this time.
 
 ## Development
 
@@ -544,7 +464,7 @@ For comparisons of full query times, keep `RINGDB_VULKAN_TIMINGS` unset.
 
 ## Command-line example
 
-To search one metadata category, run this command:
+To search one category, run this command:
 
 ```bash
 cargo run --release --example cli -- --n 100000 --dims 64 --k 10 --category 3

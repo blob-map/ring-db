@@ -38,8 +38,10 @@ struct Params {
     mode: u32,
     reduce_count: u32,
     output_index: u32,
+    /// First row of the chunk within its segment.
     row_offset: u32,
-    reserved: u32,
+    /// Added to region output rows: the segment's first row in a snapshot.
+    row_base: u32,
 }
 
 struct Chunk {
@@ -222,7 +224,7 @@ impl VulkanDevice {
         }
         for chunk in &segment.chunks {
             let mut query = self.prepare(segment, chunk, disks, mask)?;
-            query.params.row_offset = base + chunk.offset as u32;
+            query.params.row_base = base;
             self.region_chunk(query, records)?;
         }
         Ok(())

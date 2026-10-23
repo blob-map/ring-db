@@ -2,37 +2,42 @@
 #![allow(dead_code)]
 
 use ringdb::{
-    BackendPreference, Hit, MetadataKey, MetadataTag, MetadataValue, RegionResult, RingDb,
-    RingDbConfig, SealedRingDb,
+    BackendPreference, Db, FieldType, Filter, Hit, Key, Options, Record, RegionResult, Schema,
 };
 
-pub const GROUP: MetadataKey = MetadataKey::new(1);
+/// Row `i` has key `i`, `group = i % 3`, and `id = i`.
+pub fn schema(dims: usize) -> Schema {
+    Schema::new(dims)
+        .field("group", FieldType::U32)
+        .field("id", FieldType::U64)
+}
 
-/// Build a database whose row `i` has payload `i` and tag `GROUP = i % 3`.
-pub fn build(vectors: &[Vec<f32>], backend: BackendPreference) -> SealedRingDb<u32> {
+pub fn build(vectors: &[Vec<f32>], backend: BackendPreference) -> Db {
     build_dims(vectors[0].len(), vectors, backend)
 }
 
-pub fn build_dims(
-    dims: usize,
-    vectors: &[Vec<f32>],
-    backend: BackendPreference,
-) -> SealedRingDb<u32> {
-    let mut db = RingDb::new(RingDbConfig::new(dims).with_backend_preference(backend)).unwrap();
+pub fn build_dims(dims: usize, vectors: &[Vec<f32>], backend: BackendPreference) -> Db {
+    let db = Db::in_memory(schema(dims), Options::default().backend(backend)).unwrap();
     for (id, vector) in vectors.iter().enumerate() {
-        let tag = MetadataTag::new(GROUP, MetadataValue::new((id % 3) as u64));
-        db.add_vector_with_metadata(vector, id as u32, &[tag])
-            .unwrap();
+        let record = Record::new(vector.as_slice())
+            .set("group", (id % 3) as u32)
+            .set("id", id as u64);
+        assert_eq!(db.add(record).unwrap().get(), id as u64);
     }
-    db.build().unwrap()
+    db.flush().unwrap();
+    db
 }
 
-pub fn cpu(vectors: &[Vec<f32>]) -> SealedRingDb<u32> {
+pub fn cpu(vectors: &[Vec<f32>]) -> Db {
     build(vectors, BackendPreference::Cpu)
 }
 
-pub fn keys(values: impl IntoIterator<Item = u64>) -> Vec<u64> {
-    values.into_iter().collect()
+pub fn group(value: u32) -> Filter {
+    Filter::eq("group", value)
+}
+
+pub fn keys(ids: impl IntoIterator<Item = u64>) -> Filter {
+    Filter::keys(ids.into_iter().map(Key::new))
 }
 
 pub fn knn_keys(hits: &[Hit]) -> Vec<u64> {

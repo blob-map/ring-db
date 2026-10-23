@@ -1,12 +1,10 @@
 //! Analytical semantics of the two search primitives on the CPU backend.
 mod common;
 
-use common::{GROUP, assert_close, cpu, knn_keys, region_keys, region_rows};
-use ringdb::{
-    Disk, Knn, MAX_DISKS, MetadataValue, Metric, RingDb, RingDbConfig, RingDbError, SealedRingDb,
-};
+use common::{assert_close, cpu, group, keys, knn_keys, region_keys, region_rows};
+use ringdb::{Db, Disk, Knn, MAX_DISKS, Metric, Options, Record, RingDbError, Schema};
 
-fn line(xs: &[f32]) -> SealedRingDb<u32> {
+fn line(xs: &[f32]) -> Db {
     cpu(&xs.iter().map(|&x| vec![x, 0.0]).collect::<Vec<_>>())
 }
 
@@ -172,21 +170,22 @@ fn filters_restrict_both_primitives() {
     let db = line(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
     let origin = [0.0, 0.0];
     // Group 1 holds keys 1 and 4.
-    let group = db.metadata_eq(GROUP, MetadataValue::new(1));
+    let group = group(1);
     let hits = db.search(Knn::new(&origin, 10).filter(&group)).unwrap();
     assert_eq!(knn_keys(&hits), [1, 4]);
     let inside = db.search(Disk::new(&origin, 3.0).filter(&group)).unwrap();
     assert_eq!(region_keys(&inside), [1]);
+    let others = !group;
     let both = db
         .search(
             Disk::new(&origin, 10.0)
                 .and(Disk::new(&[5.0, 0.0], 4.5))
-                .filter(&group.complement()),
+                .filter(&others),
         )
         .unwrap();
     assert_eq!(region_keys(&both), [2, 3, 5]);
 
-    let missing = db.metadata_eq(GROUP, MetadataValue::new(99));
+    let missing = common::group(99);
     assert!(
         db.search(Knn::new(&origin, 10).filter(&missing))
             .unwrap()
@@ -198,7 +197,7 @@ fn filters_restrict_both_primitives() {
             .is_empty()
     );
 
-    let sparse = db.candidates_from_ids([0, 5]).unwrap();
+    let sparse = keys([0, 5, 77]);
     assert_eq!(
         knn_keys(&db.search(Knn::new(&origin, 1).filter(&sparse)).unwrap()),
         [0]
@@ -206,24 +205,8 @@ fn filters_restrict_both_primitives() {
 }
 
 #[test]
-fn filters_from_another_database_are_rejected() {
-    let db = line(&[0.0, 1.0]);
-    let other = line(&[0.0, 1.0, 2.0]);
-    let foreign = other.candidates_from_ids([0]).unwrap();
-    let origin = [0.0, 0.0];
-    assert!(matches!(
-        db.search(Knn::new(&origin, 1).filter(&foreign)),
-        Err(RingDbError::CandidateSetMismatch { .. })
-    ));
-    assert!(matches!(
-        db.search(Disk::new(&origin, 1.0).filter(&foreign)),
-        Err(RingDbError::CandidateSetMismatch { .. })
-    ));
-}
-
-#[test]
 fn empty_databases_return_no_results() {
-    let db: SealedRingDb = RingDb::new(RingDbConfig::new(2)).unwrap().build().unwrap();
+    let db = Db::in_memory(Schema::new(2), Options::default()).unwrap();
     let origin = [0.0, 0.0];
     assert!(db.search(Knn::new(&origin, 3)).unwrap().is_empty());
     let result = db.search(Disk::new(&origin, 3.0)).unwrap();
@@ -238,12 +221,9 @@ fn malformed_queries_are_rejected() {
     let db = line(&[1.0]);
     let origin = [0.0, 0.0];
     let short = [1.0];
-    invalid(RingDb::<()>::new(RingDbConfig::new(0)));
-    invalid(
-        RingDb::<()>::new(RingDbConfig::new(2))
-            .unwrap()
-            .add_vector(&[f32::NAN, 0.0], ()),
-    );
+    let schemaless = Db::in_memory(Schema::new(2), Options::default()).unwrap();
+    invalid(schemaless.add(Record::new([f32::NAN, 0.0])));
+    mismatch(schemaless.add(Record::new([0.0])), 2, 1);
     mismatch(db.search(Knn::new(&[0.0; 3], 1)), 2, 3);
     mismatch(
         db.search(Knn::new(&origin, 1).metric(Metric::WeightedL2(&short))),

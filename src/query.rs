@@ -3,8 +3,10 @@ use std::sync::Arc;
 
 use smallvec::SmallVec;
 
-use crate::error::Result;
-use crate::metadata::CandidateSet;
+use crate::backend::DiskSpec;
+use crate::db::Snapshot;
+use crate::error::{Result, RingDbError};
+use crate::filter::Filter;
 
 /// The largest number of disks one [`Region`] can contain.
 pub const MAX_DISKS: usize = 16;
@@ -17,6 +19,11 @@ pub const MAX_DISKS: usize = 16;
 pub struct Key(pub(crate) u64);
 
 impl Key {
+    /// Rebuild a key from the value returned by [`Key::get`].
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
     /// The integer value of this key.
     pub const fn get(self) -> u64 {
         self.0
@@ -51,7 +58,7 @@ pub struct Knn<'a> {
     pub(crate) query: &'a [f32],
     pub(crate) k: usize,
     pub(crate) metric: Metric<'a>,
-    pub(crate) filter: Option<&'a CandidateSet>,
+    pub(crate) filter: Option<&'a Filter>,
 }
 
 impl<'a> Knn<'a> {
@@ -71,7 +78,7 @@ impl<'a> Knn<'a> {
     }
 
     #[must_use]
-    pub const fn filter(mut self, filter: &'a CandidateSet) -> Self {
+    pub const fn filter(mut self, filter: &'a Filter) -> Self {
         self.filter = Some(filter);
         self
     }
@@ -110,7 +117,7 @@ impl<'a> Disk<'a> {
     }
 
     #[must_use]
-    pub fn filter(self, filter: &'a CandidateSet) -> Region<'a> {
+    pub fn filter(self, filter: &'a Filter) -> Region<'a> {
         Region::from(self).filter(filter)
     }
 }
@@ -119,7 +126,7 @@ impl<'a> Disk<'a> {
 #[derive(Debug, Clone)]
 pub struct Region<'a> {
     pub(crate) disks: SmallVec<[Disk<'a>; 1]>,
-    pub(crate) filter: Option<&'a CandidateSet>,
+    pub(crate) filter: Option<&'a Filter>,
 }
 
 impl<'a> Region<'a> {
@@ -131,7 +138,7 @@ impl<'a> Region<'a> {
     }
 
     #[must_use]
-    pub fn filter(mut self, filter: &'a CandidateSet) -> Self {
+    pub fn filter(mut self, filter: &'a Filter) -> Self {
         self.filter = Some(filter);
         self
     }
@@ -159,12 +166,17 @@ pub struct Hit {
 }
 
 /// Resolves the rows of a search back to record keys.
+///
+/// Rows are numbered across the segments of a snapshot: each segment's keys
+/// start at its base row.
 #[derive(Debug, Clone)]
-pub(crate) struct KeyLookup(pub(crate) Arc<[Key]>);
+pub(crate) struct KeyLookup(pub(crate) Arc<[(u32, Arc<[Key]>)]>);
 
 impl KeyLookup {
     fn key(&self, row: u32) -> Key {
-        self.0[row as usize]
+        let part = self.0.partition_point(|(base, _)| *base <= row) - 1;
+        let (base, keys) = &self.0[part];
+        keys[(row - base) as usize]
     }
 }
 
@@ -257,7 +269,7 @@ pub trait Query: sealed::Sealed {
     type Output;
 
     #[doc(hidden)]
-    fn execute(self, searcher: &crate::engine::Searcher<'_>) -> Result<Self::Output>;
+    fn execute(self, snapshot: &Snapshot) -> Result<Self::Output>;
 }
 
 impl sealed::Sealed for Knn<'_> {}
@@ -267,23 +279,82 @@ impl sealed::Sealed for Region<'_> {}
 impl Query for Knn<'_> {
     type Output = Vec<Hit>;
 
-    fn execute(self, searcher: &crate::engine::Searcher<'_>) -> Result<Vec<Hit>> {
-        searcher.knn(&self)
+    fn execute(self, snapshot: &Snapshot) -> Result<Vec<Hit>> {
+        snapshot.knn(&self)
     }
 }
 
 impl Query for Region<'_> {
     type Output = RegionResult;
 
-    fn execute(self, searcher: &crate::engine::Searcher<'_>) -> Result<RegionResult> {
-        searcher.region(&self)
+    fn execute(self, snapshot: &Snapshot) -> Result<RegionResult> {
+        snapshot.region(&self)
     }
 }
 
 impl Query for Disk<'_> {
     type Output = RegionResult;
 
-    fn execute(self, searcher: &crate::engine::Searcher<'_>) -> Result<RegionResult> {
-        Region::from(self).execute(searcher)
+    fn execute(self, snapshot: &Snapshot) -> Result<RegionResult> {
+        Region::from(self).execute(snapshot)
     }
+}
+
+pub(crate) fn validate_vector(dims: usize, vector: &[f32], label: &str) -> Result<()> {
+    if vector.len() != dims {
+        return Err(RingDbError::DimensionMismatch {
+            expected: dims,
+            got: vector.len(),
+        });
+    }
+    if let Some((index, value)) = vector
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite())
+    {
+        return Err(RingDbError::InvalidQuery(format!(
+            "{label} coordinate at index {index} must be finite, got {value}"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_metric(dims: usize, metric: Metric<'_>) -> Result<()> {
+    let Some(weights) = metric.weights() else {
+        return Ok(());
+    };
+    if weights.len() != dims {
+        return Err(RingDbError::DimensionMismatch {
+            expected: dims,
+            got: weights.len(),
+        });
+    }
+    if let Some((index, weight)) = weights
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, weight)| !weight.is_finite() || *weight < 0.0)
+    {
+        return Err(RingDbError::InvalidQuery(format!(
+            "weight at index {index} must be finite and non-negative, got {weight}"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_disk<'a>(dims: usize, disk: &Disk<'a>) -> Result<DiskSpec<'a>> {
+    validate_vector(dims, disk.center, "disk center")?;
+    validate_metric(dims, disk.metric)?;
+    if !disk.radius.is_finite() || disk.radius < 0.0 {
+        return Err(RingDbError::InvalidQuery(format!(
+            "disk radius must be finite and non-negative, got {}",
+            disk.radius
+        )));
+    }
+    Ok(DiskSpec {
+        center: disk.center,
+        weights: disk.metric.weights(),
+        radius_sq: disk.radius * disk.radius,
+    })
 }

@@ -11,7 +11,7 @@ use ash::{Entry, vk};
 use clap::{Parser, ValueEnum};
 use rand::{RngExt, SeedableRng};
 use ringdb::{
-    BackendPreference, CandidateSet, Disk, Knn, Metric, RingDb, RingDbConfig, SealedRingDb,
+    BackendPreference, Db, Disk, FieldType, Filter, Knn, Metric, Options, Record, Schema,
 };
 
 /// A comparable hit: key and squared distance to the first disk or query.
@@ -118,12 +118,12 @@ struct Inputs {
     queries: Vec<Query>,
     weights: Vec<f32>,
     radius: f32,
-    candidates: CandidateSet,
+    filter: Filter,
     k: usize,
 }
 
 impl Inputs {
-    fn new(db: &SealedRingDb, args: &Args) -> BenchResult<Self> {
+    fn new(args: &Args) -> BenchResult<Self> {
         let mut rng = rand::rngs::SmallRng::seed_from_u64(args.seed.wrapping_add(1));
         let queries = (0..args.queries)
             .map(|_| {
@@ -143,14 +143,14 @@ impl Inputs {
                 .map(|i| [0.25, 0.75, 1.25, 1.75][i % 4])
                 .collect(),
             radius: (2.0 * args.dims as f32 / 3.0).sqrt() * args.radius_scale,
-            // A reusable 1% candidate set, built outside query timing.
-            candidates: db.candidates_from_ids((0..args.n as u32).step_by(100))?,
+            // Every 100th record has this keyword.
+            filter: Filter::eq("bucket", "0"),
             k: args.k,
         })
     }
 
     /// The timed call: one public search, including its result transfer.
-    fn run(&self, db: &SealedRingDb, workload: Workload, index: usize) -> BenchResult<Output> {
+    fn run(&self, db: &Db, workload: Workload, index: usize) -> BenchResult<Output> {
         let q = &self.queries[index % self.queries.len()];
         Ok(match workload {
             Workload::Disk => Output::Region(db.search(Disk::new(&q.point, self.radius))?),
@@ -166,7 +166,7 @@ impl Inputs {
                 db.search(Knn::new(&q.point, self.k).metric(Metric::WeightedL2(&self.weights)))?,
             ),
             Workload::FilteredKnn => {
-                Output::Knn(db.search(Knn::new(&q.point, self.k).filter(&self.candidates))?)
+                Output::Knn(db.search(Knn::new(&q.point, self.k).filter(&self.filter))?)
             }
         })
     }
@@ -206,24 +206,23 @@ impl Output {
     }
 }
 
-fn build(
-    args: &Args,
-    backend: BackendPreference,
-) -> BenchResult<(SealedRingDb, Duration, Duration)> {
-    let mut db = RingDb::new(RingDbConfig::new(args.dims).with_backend_preference(backend))?;
+fn build(args: &Args, backend: BackendPreference) -> BenchResult<(Db, Duration, Duration)> {
+    let schema = Schema::new(args.dims).field("bucket", FieldType::Keyword);
+    let db = Db::in_memory(schema, Options::default().backend(backend))?;
     let mut rng = rand::rngs::SmallRng::seed_from_u64(args.seed);
     let mut row = vec![0.0; args.dims];
     let started = Instant::now();
-    for _ in 0..args.n {
+    let buckets: Vec<String> = (0..100).map(|i| i.to_string()).collect();
+    for id in 0..args.n {
         for x in &mut row {
             *x = rng.random_range(-1.0..1.0);
         }
-        db.add_vector(&row, ())?;
+        db.add(Record::new(row.as_slice()).set("bucket", buckets[id % 100].as_str()))?;
     }
     let generate = started.elapsed();
     let started = Instant::now();
-    let sealed = db.build()?;
-    Ok((sealed, generate, started.elapsed()))
+    db.flush()?;
+    Ok((db, generate, started.elapsed()))
 }
 
 struct BoundaryDifference {
@@ -520,7 +519,7 @@ fn main() -> BenchResult<()> {
                 generation.as_secs_f64(),
                 upload.as_secs_f64()
             );
-            let inputs = Inputs::new(&db, &args)?;
+            let inputs = Inputs::new(&args)?;
             let mut boundaries = Vec::new();
             for (workload_index, &workload) in workloads.iter().enumerate() {
                 let reference = &mut references[workload_index];
