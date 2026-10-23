@@ -13,10 +13,20 @@ pub(crate) fn corrupt(message: impl Into<String>) -> RingDbError {
 
 #[derive(Default)]
 pub(crate) struct Encoder {
-    pub(crate) bytes: Vec<u8>,
+    bytes: Vec<u8>,
 }
 
 impl Encoder {
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// The magic bytes and format version that start a file.
+    pub(crate) fn header(&mut self, magic: &[u8; 8], version: u32) {
+        self.bytes.extend_from_slice(magic);
+        self.u32(version);
+    }
+
     pub(crate) fn u8(&mut self, value: u8) {
         self.bytes.push(value);
     }
@@ -81,6 +91,14 @@ impl<'a> Decoder<'a> {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.at == self.bytes.len()
+    }
+
+    /// Check a header written by [`Encoder::header`].
+    pub(crate) fn header(&mut self, magic: &[u8; 8], version: u32, what: &str) -> Result<()> {
+        if self.take(8)? != magic || self.u32()? != version {
+            return Err(corrupt(format!("{what} has an unknown format")));
+        }
+        Ok(())
     }
 
     fn take(&mut self, len: usize) -> Result<&'a [u8]> {
@@ -176,6 +194,7 @@ mod tests {
     #[test]
     fn values_round_trip_and_bounds_are_checked() {
         let mut e = Encoder::default();
+        e.header(b"TESTFILE", 3);
         e.u8(7);
         e.u32(0xDEAD_BEEF);
         e.slice(&[1.5f32, -2.0, 3.25]);
@@ -185,6 +204,8 @@ mod tests {
         let bytes = e.finish_with_crc();
 
         let mut d = Decoder::with_crc(&bytes, "test").unwrap();
+        assert!(Decoder::new(&bytes).header(b"TESTFILE", 4, "test").is_err());
+        d.header(b"TESTFILE", 3, "test").unwrap();
         assert_eq!(d.u8().unwrap(), 7);
         assert_eq!(d.u32().unwrap(), 0xDEAD_BEEF);
         assert_eq!(d.slice::<f32>().unwrap(), [1.5, -2.0, 3.25]);
@@ -201,6 +222,6 @@ mod tests {
         // A huge count must not allocate or panic.
         let mut e = Encoder::default();
         e.u64(u64::MAX / 2);
-        assert!(Decoder::new(&e.bytes).slice::<u32>().is_err());
+        assert!(Decoder::new(e.as_bytes()).slice::<u32>().is_err());
     }
 }

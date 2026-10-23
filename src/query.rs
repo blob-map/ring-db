@@ -4,9 +4,9 @@ use std::sync::Arc;
 use smallvec::SmallVec;
 
 use crate::backend::DiskSpec;
-use crate::db::Snapshot;
 use crate::error::{Result, RingDbError};
 use crate::filter::Filter;
+use crate::snapshot::Snapshot;
 
 /// The largest number of disks one [`Region`] can contain.
 pub const MAX_DISKS: usize = 16;
@@ -220,7 +220,7 @@ impl RegionResult {
 
     pub fn get(&self, index: usize) -> Option<RegionHit<'_>> {
         let start = index.checked_mul(self.stride())?;
-        let record = self.records.get(start..start + self.stride())?;
+        let record = self.records.get(start..start.checked_add(self.stride())?)?;
         Some(RegionHit {
             key: self.keys.key(record[0]),
             dists_sq: bytemuck::cast_slice(&record[1..]),
@@ -300,7 +300,14 @@ impl Query for Disk<'_> {
     }
 }
 
-pub(crate) fn validate_vector(dims: usize, vector: &[f32], label: &str) -> Result<()> {
+/// Check the length and coordinates of `vector`. A coordinate that is not
+/// finite is reported with `invalid`.
+pub(crate) fn validate_vector(
+    dims: usize,
+    vector: &[f32],
+    label: &str,
+    invalid: fn(String) -> RingDbError,
+) -> Result<()> {
     if vector.len() != dims {
         return Err(RingDbError::DimensionMismatch {
             expected: dims,
@@ -313,7 +320,7 @@ pub(crate) fn validate_vector(dims: usize, vector: &[f32], label: &str) -> Resul
         .enumerate()
         .find(|(_, value)| !value.is_finite())
     {
-        return Err(RingDbError::InvalidQuery(format!(
+        return Err(invalid(format!(
             "{label} coordinate at index {index} must be finite, got {value}"
         )));
     }
@@ -344,17 +351,20 @@ pub(crate) fn validate_metric(dims: usize, metric: Metric<'_>) -> Result<()> {
 }
 
 pub(crate) fn validate_disk<'a>(dims: usize, disk: &Disk<'a>) -> Result<DiskSpec<'a>> {
-    validate_vector(dims, disk.center, "disk center")?;
+    validate_vector(dims, disk.center, "disk center", RingDbError::InvalidQuery)?;
     validate_metric(dims, disk.metric)?;
-    if !disk.radius.is_finite() || disk.radius < 0.0 {
+    // A squared radius of infinity would contain the rows whose squared
+    // distance overflows, however far they are.
+    let radius_sq = disk.radius * disk.radius;
+    if !radius_sq.is_finite() || disk.radius < 0.0 {
         return Err(RingDbError::InvalidQuery(format!(
-            "disk radius must be finite and non-negative, got {}",
+            "disk radius must be non-negative and its square finite, got {}",
             disk.radius
         )));
     }
     Ok(DiskSpec {
         center: disk.center,
         weights: disk.metric.weights(),
-        radius_sq: disk.radius * disk.radius,
+        radius_sq,
     })
 }

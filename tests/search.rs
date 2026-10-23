@@ -222,7 +222,10 @@ fn malformed_queries_are_rejected() {
     let origin = [0.0, 0.0];
     let short = [1.0];
     let schemaless = Db::in_memory(Schema::new(2), Options::default()).unwrap();
-    invalid(schemaless.add(Record::new([f32::NAN, 0.0])));
+    assert!(matches!(
+        schemaless.add(Record::new([f32::NAN, 0.0])),
+        Err(RingDbError::InvalidRecord(_))
+    ));
     mismatch(schemaless.add(Record::new([0.0])), 2, 1);
     mismatch(db.search(Knn::new(&[0.0; 3], 1)), 2, 3);
     mismatch(
@@ -236,6 +239,8 @@ fn malformed_queries_are_rejected() {
     invalid(db.search(Disk::new(&origin, -1.0)));
     invalid(db.search(Disk::new(&origin, f32::INFINITY)));
     invalid(db.search(Disk::new(&origin, f32::NAN)));
+    // Its square overflows, so it would contain rows at any distance.
+    invalid(db.search(Disk::new(&origin, 1e20)));
     // Later disks are validated too.
     let later = Disk::new(&origin, 1.0);
     mismatch(db.search(later.and(Disk::new(&[0.0; 3], 1.0))), 2, 3);

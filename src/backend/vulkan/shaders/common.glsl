@@ -16,6 +16,7 @@ layout(push_constant) uniform Params {
     uint64_t output_address;
     uint64_t reduce_src; // UINT64_MAX means the initial distance slots
     uint64_t reduce_dst;
+    uint64_t taken;      // scratch word holding the slot of the last KNN hit
     uint dims;
     uint rows;
     uint work_count;
@@ -26,6 +27,8 @@ layout(push_constant) uniform Params {
     uint output_index;
     uint row_offset; // first row of the chunk within its segment
     uint row_base;   // added to region output rows
+    uint reduce_shift; // 0: reduce every group; else only the group of `taken`
+    uint reserved;
 } p;
 const uint INVALID = 0xffffffffu;
 const uint MAX_DISKS = 16u;

@@ -30,6 +30,7 @@ struct Params {
     output_address: u64,
     reduce_src: u64,
     reduce_dst: u64,
+    taken: u64,
     dims: u32,
     rows: u32,
     work_count: u32,
@@ -42,6 +43,8 @@ struct Params {
     row_offset: u32,
     /// Added to region output rows: the segment's first row in a snapshot.
     row_base: u32,
+    reduce_shift: u32,
+    reserved: u32,
 }
 
 struct Chunk {
@@ -421,11 +424,23 @@ impl VulkanDevice {
         query.params.mode = KNN;
         let work = query.params.work_count;
         let host_selection = k.saturating_mul(64) >= work as usize;
-        let groups = work.div_ceil(WORKGROUP_SIZE);
         let distance_words = work as usize * 2;
-        let scratch_words = distance_words
-            .checked_add(groups as usize * 2)
-            .ok_or_else(size_error)?;
+        // A tournament tree over the distance slots: each level holds the best
+        // slot of every 128 entries of the level below, up to one root entry.
+        let mut levels = Vec::new();
+        let (mut entries, mut offset) = (work, distance_words);
+        loop {
+            entries = entries.div_ceil(WORKGROUP_SIZE);
+            levels.push((offset as u64, entries));
+            offset += entries as usize;
+            if entries == 1 {
+                break;
+            }
+        }
+        // One more word holds the slot of the last hit.
+        let taken = offset;
+        let scratch_words = taken + 1;
+        debug_assert!(scratch_words <= distance_words + 2 * work.div_ceil(WORKGROUP_SIZE) as usize);
         let mut state = self.execution()?;
         let (execution, buffers) = state.buffers(&self.context)?;
         buffers.scratch.grow(word_bytes(scratch_words)?)?;
@@ -439,6 +454,7 @@ impl VulkanDevice {
         query.params.inputs = buffers.inputs.address;
         query.params.scratch = buffers.scratch.address;
         query.params.output_address = buffers.output.address;
+        query.params.taken = taken as u64;
         execution.run("knn", |cmd| {
             self.dispatch(
                 cmd,
@@ -450,29 +466,34 @@ impl VulkanDevice {
                 return;
             }
             compute_barrier(&self.context, cmd);
+            // Reduce level `level` of the tree from the level below. With
+            // `repair`, rebuild only the entry above the slot last taken.
+            let reduce = |level: usize, repair: bool| {
+                let mut params = query.params;
+                (params.reduce_src, params.reduce_count) = match level {
+                    0 => (u64::MAX, work),
+                    _ => levels[level - 1],
+                };
+                params.reduce_dst = levels[level].0;
+                let threads = if repair {
+                    params.reduce_shift = WORKGROUP_SIZE.trailing_zeros() * (level as u32 + 1);
+                    WORKGROUP_SIZE
+                } else {
+                    params.reduce_count
+                };
+                self.dispatch(cmd, self.pipelines.reduce, &params, threads);
+                compute_barrier(&self.context, cmd);
+            };
+            (0..levels.len()).for_each(|level| reduce(level, false));
             for index in 0..k {
                 let mut params = query.params;
-                params.reduce_count = work;
-                params.reduce_src = u64::MAX;
-                params.reduce_dst = distance_words as u64;
+                params.reduce_dst = levels[levels.len() - 1].0;
                 params.output_index = index as u32;
-                loop {
-                    self.dispatch(cmd, self.pipelines.reduce, &params, params.reduce_count);
-                    compute_barrier(&self.context, cmd);
-                    let remaining = params.reduce_count.div_ceil(WORKGROUP_SIZE);
-                    if remaining == 1 {
-                        break;
-                    }
-                    params.reduce_src = params.reduce_dst;
-                    params.reduce_dst = if params.reduce_dst == distance_words as u64 {
-                        distance_words as u64 + u64::from(groups)
-                    } else {
-                        distance_words as u64
-                    };
-                    params.reduce_count = remaining;
-                }
                 self.dispatch(cmd, self.pipelines.take, &params, 1);
                 compute_barrier(&self.context, cmd);
+                if index + 1 < k {
+                    (0..levels.len()).for_each(|level| reduce(level, true));
+                }
             }
         })?;
         let (source, count) = if host_selection {

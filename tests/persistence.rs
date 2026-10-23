@@ -316,6 +316,23 @@ fn leftover_files_are_removed_on_open() {
 }
 
 #[test]
+fn a_crash_while_creating_a_database_leaves_it_creatable() {
+    let dir = tempfile::tempdir().unwrap();
+    // The files that a crash before the first MANIFEST rename can leave.
+    fs::write(dir.path().join("LOCK"), b"").unwrap();
+    fs::write(dir.path().join("MANIFEST.tmp"), b"partial").unwrap();
+    let db = open(dir.path());
+    let key = db.add(record(1)).unwrap();
+    drop(db);
+    assert_eq!(
+        files(dir.path()).len(),
+        4,
+        "LOCK, MANIFEST, a log, a segment"
+    );
+    assert!(open(dir.path()).get(key).is_ok());
+}
+
+#[test]
 fn backups_open_as_independent_databases() {
     let dir = tempfile::tempdir().unwrap();
     let copy = tempfile::tempdir().unwrap();

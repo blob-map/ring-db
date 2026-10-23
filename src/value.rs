@@ -8,8 +8,9 @@ use crate::schema::{FieldType, Schema};
 
 /// The value of one field.
 ///
-/// Integer values convert to any integer field type that can hold them, so
-/// `record.set("rooms", 3)` works for a `U32` field.
+/// Integer values convert to any numeric field type that holds them exactly,
+/// so `record.set("rooms", 3)` works for a `U32` field and
+/// `record.set("surface", 70)` for an `F32` field.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     U32(u32),
@@ -89,6 +90,11 @@ impl Value {
             (FieldType::U64, _) => int?.try_into().ok().map(Self::U64),
             (FieldType::I64, _) => int?.try_into().ok().map(Self::I64),
             (FieldType::F32, Self::F32(v)) => v.is_finite().then_some(Self::F32(v)),
+            (FieldType::F32, _) => {
+                let int = int?;
+                let float = int as f32;
+                (float as i128 == int).then_some(Self::F32(float))
+            }
             (FieldType::Bool, v @ Self::Bool(_))
             | (FieldType::Keyword | FieldType::Text, v @ Self::Text(_))
             | (FieldType::Keywords | FieldType::TextList, v @ Self::TextList(_))
@@ -209,7 +215,8 @@ impl Record {
 
     /// Check this record against `schema` and order its values by field.
     pub(crate) fn validate(self, schema: &Schema, max_bytes: usize) -> Result<Row> {
-        crate::query::validate_vector(schema.dims(), &self.vector, "vector")?;
+        let dims = schema.dims();
+        crate::query::validate_vector(dims, &self.vector, "vector", RingDbError::InvalidRecord)?;
         let mut values = vec![None; schema.len()];
         let mut size = self.vector.len() * 4;
         for (name, value) in self.values {
@@ -321,7 +328,11 @@ impl Row {
                     FieldType::U32 => Value::U32(d.u32()?),
                     FieldType::U64 => Value::U64(d.u64()?),
                     FieldType::I64 => Value::I64(d.u64()? as i64),
-                    FieldType::F32 => Value::F32(f32::from_bits(d.u32()?)),
+                    FieldType::F32 => Value::F32(
+                        Some(f32::from_bits(d.u32()?))
+                            .filter(|v| v.is_finite())
+                            .ok_or_else(|| corrupt("logged f32 value is not finite"))?,
+                    ),
                     FieldType::Bool => Value::Bool(d.u8()? != 0),
                     FieldType::Keyword | FieldType::Text => Value::Text(d.string()?),
                     FieldType::Keywords | FieldType::TextList => {

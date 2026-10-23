@@ -73,10 +73,12 @@ impl Options {
         self
     }
 
-    /// With [`BackendPreference::Vulkan`], search segments with fewer rows on the
-    /// CPU. One GPU dispatch costs about as much as a CPU scan of 16384
-    /// coordinates, and each commit adds a small segment. The default is 16384
-    /// divided by the dimension count; 0 puts every segment on the GPU.
+    /// With [`BackendPreference::Vulkan`], search a segment on the CPU when
+    /// fewer of its rows than this pass the filter, and keep segments with
+    /// fewer rows on the CPU only. A GPU search has a fixed cost of about
+    /// 100 µs, the time that a CPU takes to scan about six million
+    /// coordinates. The default is 6 Mi divided by the dimension count, for
+    /// example 98304 rows of 64 dimensions; 0 puts every search on the GPU.
     #[must_use]
     pub fn vulkan_min_rows(mut self, rows: usize) -> Self {
         self.vulkan_min_rows = Some(rows);
@@ -84,6 +86,7 @@ impl Options {
     }
 
     pub(crate) fn vulkan_min_rows_for(&self, dims: usize) -> usize {
-        self.vulkan_min_rows.unwrap_or(16 * 1024 / dims.max(1))
+        self.vulkan_min_rows
+            .unwrap_or(6 * 1024 * 1024 / dims.max(1))
     }
 }

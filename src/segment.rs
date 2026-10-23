@@ -1,11 +1,12 @@
 //! Immutable blocks of records, the unit of search, storage, and upload.
 use std::sync::Arc;
 
-use crate::backend::{DiskSpec, Mask, RowHit, VulkanDevice, VulkanSegment, cpu};
+use crate::backend::{DiskSpec, RowHit, VulkanDevice, VulkanSegment, cpu};
 use crate::codec::{Decoder, Encoder, corrupt};
 use crate::column::{Column, ColumnBuilder};
 use crate::error::Result;
 use crate::query::Key;
+use crate::rows::RowSet;
 use crate::schema::Schema;
 use crate::value::Row;
 
@@ -20,7 +21,15 @@ pub(crate) struct Segment {
     pub(crate) keys: Arc<[Key]>,
     pub(crate) vectors: Vec<f32>,
     pub(crate) columns: Vec<Column>,
-    gpu: Option<(Arc<VulkanDevice>, VulkanSegment)>,
+    gpu: Option<Resident>,
+}
+
+/// The copy of a segment's vectors on a GPU.
+struct Resident {
+    device: Arc<VulkanDevice>,
+    vectors: VulkanSegment,
+    /// Searches of fewer rows run on the CPU.
+    min_rows: usize,
 }
 
 impl Segment {
@@ -31,8 +40,7 @@ impl Segment {
     /// The segment file contents, ending with a CRC-32.
     pub(crate) fn encode(&self) -> Vec<u8> {
         let mut e = Encoder::default();
-        e.bytes.extend_from_slice(MAGIC);
-        e.u32(VERSION);
+        e.header(MAGIC, VERSION);
         e.u64(self.id);
         e.u32(self.dims as u32);
         e.u32(self.columns.len() as u32);
@@ -48,10 +56,7 @@ impl Segment {
     pub(crate) fn decode(bytes: &[u8], schema: &Schema, id: u64) -> Result<Self> {
         let what = format!("segment {id}");
         let mut d = Decoder::with_crc(bytes, &what)?;
-        let header = (0..8).map(|_| d.u8()).collect::<Result<Vec<u8>>>()?;
-        if header != MAGIC || d.u32()? != VERSION {
-            return Err(corrupt(format!("{what} has an unknown format")));
-        }
+        d.header(MAGIC, VERSION, &what)?;
         let (stored_id, dims, columns) = (d.u64()?, d.u32()? as usize, d.u32()? as usize);
         if stored_id != id || dims != schema.dims() || columns != schema.len() {
             return Err(corrupt(format!("{what} does not match the manifest")));
@@ -85,10 +90,20 @@ impl Segment {
         self.gpu.is_some()
     }
 
-    /// Keep a resident copy of the vectors on `device`.
-    pub(crate) fn upload(&mut self, device: &Arc<VulkanDevice>) -> Result<()> {
-        self.gpu = Some((device.clone(), device.upload(self.dims, &self.vectors)?));
+    /// Keep a copy of the vectors on `device` for searches of at least
+    /// `min_rows` rows.
+    pub(crate) fn upload(&mut self, device: &Arc<VulkanDevice>, min_rows: usize) -> Result<()> {
+        self.gpu = Some(Resident {
+            device: device.clone(),
+            vectors: device.upload(self.dims, &self.vectors)?,
+            min_rows,
+        });
         Ok(())
+    }
+
+    /// The GPU copy, if a search of `rows` uses it.
+    fn gpu(&self, rows: &RowSet) -> Option<&Resident> {
+        self.gpu.as_ref().filter(|gpu| rows.len() >= gpu.min_rows)
     }
 
     /// The row holding `key`.
@@ -108,29 +123,36 @@ impl Segment {
         }
     }
 
+    /// The `k` best of `rows` by `(dist_sq, row)`, sorted.
     pub(crate) fn knn(
         &self,
         query: &[f32],
         weights: Option<&[f32]>,
         k: usize,
-        mask: Mask<'_>,
+        rows: &RowSet,
     ) -> Result<Vec<RowHit>> {
-        match &self.gpu {
-            Some((device, gpu)) => device.knn(gpu, query, weights, k, mask),
+        let Some(mask) = rows.mask() else {
+            return Ok(Vec::new());
+        };
+        match self.gpu(rows) {
+            Some(gpu) => gpu.device.knn(&gpu.vectors, query, weights, k, mask),
             None => Ok(cpu::knn(&self.vectors, self.dims, query, weights, k, mask)),
         }
     }
 
-    /// Append region records with rows offset by `base`.
+    /// Append the region records of `rows`, with rows offset by `base`.
     pub(crate) fn region(
         &self,
         base: u32,
         disks: &[DiskSpec<'_>],
-        mask: Mask<'_>,
+        rows: &RowSet,
         records: &mut Vec<u32>,
     ) -> Result<()> {
-        match &self.gpu {
-            Some((device, gpu)) => device.region(gpu, base, disks, mask, records),
+        let Some(mask) = rows.mask() else {
+            return Ok(());
+        };
+        match self.gpu(rows) {
+            Some(gpu) => gpu.device.region(&gpu.vectors, base, disks, mask, records),
             None => {
                 cpu::region(&self.vectors, self.dims, base, disks, mask, records);
                 Ok(())

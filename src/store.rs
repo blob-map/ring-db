@@ -96,7 +96,8 @@ pub(crate) struct Store {
     _lock: File,
     wal: File,
     wal_seq: u64,
-    /// Set when a log write fails: the log end is then unknown.
+    /// Set when a log write fails: the log end is then unknown, so writes
+    /// wait for a new log.
     failed: bool,
 }
 
@@ -128,8 +129,7 @@ fn write_atomic(dir: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
 
 fn encode_manifest(schema: &Schema, manifest: &Manifest, wal_seq: u64) -> Vec<u8> {
     let mut e = Encoder::default();
-    e.bytes.extend_from_slice(MANIFEST_MAGIC);
-    e.u32(VERSION);
+    e.header(MANIFEST_MAGIC, VERSION);
     e.u32(schema.dims() as u32);
     e.u32(schema.len() as u32);
     for (name, ty) in schema.fields() {
@@ -152,10 +152,7 @@ fn encode_manifest(schema: &Schema, manifest: &Manifest, wal_seq: u64) -> Vec<u8
 
 fn decode_manifest(bytes: &[u8]) -> Result<(Schema, Manifest, u64)> {
     let mut d = Decoder::with_crc(bytes, "MANIFEST")?;
-    let header = (0..8).map(|_| d.u8()).collect::<Result<Vec<u8>>>()?;
-    if header != MANIFEST_MAGIC || d.u32()? != VERSION {
-        return Err(corrupt("MANIFEST has an unknown format"));
-    }
+    d.header(MANIFEST_MAGIC, VERSION, "MANIFEST")?;
     let mut schema = Schema::new(d.u32()? as usize);
     for _ in 0..d.u32()? {
         let name = d.string()?;
@@ -195,17 +192,11 @@ fn replay(path: &Path, schema: &Schema) -> Result<Vec<Change>> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error.into()),
     };
-    if bytes.len() < WAL_HEADER_LEN as usize
-        || &bytes[..8] != WAL_MAGIC
-        || bytes[8..12] != VERSION.to_le_bytes()
-    {
+    let Some(header) = bytes.get(..WAL_HEADER_LEN as usize) else {
         // A crash while the log was created leaves a short header.
-        return if bytes.len() < WAL_HEADER_LEN as usize {
-            Ok(Vec::new())
-        } else {
-            Err(corrupt(format!("{} has an unknown format", path.display())))
-        };
-    }
+        return Ok(Vec::new());
+    };
+    Decoder::new(header).header(WAL_MAGIC, VERSION, &path.display().to_string())?;
     let mut changes = Vec::new();
     let mut at = WAL_HEADER_LEN as usize;
     while let Some(header) = bytes.get(at..at + 8) {
@@ -238,8 +229,9 @@ fn create_wal(dir: &Path, seq: u64) -> io::Result<File> {
         .truncate(true)
         .write(true)
         .open(wal_path(dir, seq))?;
-    file.write_all(WAL_MAGIC)?;
-    file.write_all(&VERSION.to_le_bytes())?;
+    let mut header = Encoder::default();
+    header.header(WAL_MAGIC, VERSION);
+    file.write_all(header.as_bytes())?;
     file.sync_all()?;
     sync_dir(dir)?;
     Ok(file)
@@ -330,7 +322,8 @@ impl Store {
         ))
     }
 
-    /// Write the manifest and log of an empty database into `dir`.
+    /// Write the manifest of an empty database into `dir`. Its log is created
+    /// like a missing log, so a crash here leaves no file but `MANIFEST.tmp`.
     fn initialize(dir: &Path, schema: &Schema) -> Result<(Manifest, u64)> {
         let unexpected = fs::read_dir(dir)?
             .map(|entry| entry.map(|e| e.file_name()))
@@ -349,7 +342,6 @@ impl Store {
             next_segment: 0,
             parts: Vec::new(),
         };
-        create_wal(dir, 0)?;
         write_atomic(
             dir,
             &manifest_path(dir),
@@ -382,10 +374,10 @@ impl Store {
     pub(crate) fn log(&mut self, frame: &LogFrame) -> Result<()> {
         if self.failed {
             return Err(RingDbError::Io(io::Error::other(
-                "an earlier log write failed; reopen the database",
+                "an earlier log write failed; the next commit starts a new log",
             )));
         }
-        let payload = &frame.0.bytes;
+        let payload = frame.0.as_bytes();
         let len = u32::try_from(payload.len())
             .map_err(|_| RingDbError::InvalidRecord("a batch must be smaller than 4 GiB".into()))?;
         let mut bytes = Vec::with_capacity(8 + payload.len());
@@ -400,6 +392,16 @@ impl Store {
             self.failed = true;
         }
         Ok(result?)
+    }
+
+    /// Whether writes wait for a commit to start a new log.
+    pub(crate) fn needs_new_log(&self) -> bool {
+        self.failed
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail(&mut self) {
+        self.failed = true;
     }
 
     /// Make `manifest` current. With `new_log`, also start a new log, so the
@@ -437,11 +439,11 @@ impl Store {
         let _ = fs::remove_file(segment_path(&self.dir, id));
     }
 
-    /// Copy the current files into `dest`, which must not exist or be empty.
     pub(crate) fn dir(&self) -> &Path {
         &self.dir
     }
 
+    /// Copy the current files into `dest`, which must not exist or be empty.
     pub(crate) fn backup(&self, dest: &Path, segments: &[u64]) -> Result<()> {
         fs::create_dir_all(dest)?;
         if fs::read_dir(dest)?.next().is_some() {

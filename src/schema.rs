@@ -16,11 +16,12 @@ pub enum FieldType {
     Bool,
     /// One exact-match string, such as a city or a category.
     Keyword,
-    /// Zero or more exact-match strings, such as amenities.
+    /// A set of exact-match strings, such as amenities. Duplicates are
+    /// removed, and an empty set is the same as no value.
     Keywords,
     /// Stored UTF-8 text.
     Text,
-    /// Stored list of UTF-8 strings.
+    /// Stored list of UTF-8 strings. An empty list is the same as no value.
     TextList,
     /// Stored bytes.
     Bytes,

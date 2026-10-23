@@ -58,7 +58,8 @@ Keep release versions and commands consistent with `Cargo.toml` and the CLI.
 src/
 ├── lib.rs             public exports
 ├── config.rs          Options and BackendPreference
-├── db.rs              Db handle, Snapshot, and multi-segment search
+├── db.rs              Db handle, Batch, write path, commits, merges
+├── snapshot.rs        Snapshot, its Parts, and multi-segment search
 ├── schema.rs          Schema and FieldType
 ├── value.rs           Value, Record, validated Row, Document
 ├── filter.rs          public Filter tree and its schema-checked Compiled form
@@ -103,9 +104,9 @@ let doc = db.get(key)?;
 ```
 
 Every field is optional. `Record::validate` checks names and coerces each `Value` to
-its field's canonical variant: any integer variant fits any integer type that can
-hold it, and `Text` becomes a one-item list for list fields. It rejects non-finite
-`F32`, duplicate fields, and records over `Options::max_record_bytes` (64 KiB by
+its field's canonical variant: any integer variant fits any numeric type that holds
+it exactly, and `Text` becomes a one-item list for list fields. It rejects non-finite
+vectors and `F32` values (as `InvalidRecord`), duplicate fields, and records over `Options::max_record_bytes` (64 KiB by
 default). Keys come from a monotonic `u64` counter, only after validation succeeds.
 
 `Db` methods take `&self`. Shared state is behind an `Arc` so the commit thread can
@@ -123,7 +124,8 @@ on a snapshot clone without locks. Uncommitted changes are invisible.
 
 A segment that fails to upload stays in `Writer::unpublished` and is retried at the
 next commit, so no record is lost. The commit thread ignores errors; `flush` repeats
-the commit and reports them.
+the commit and reports them. A commit holds the writer lock while it builds, writes,
+and uploads its segment: writes wait, which bounds the backlog; searches do not.
 
 A snapshot `Part` is an `Arc<Segment>` plus its sorted deleted rows and a cached live
 `RowSet` (`None` when nothing is deleted, which keeps the unfiltered `Mask::All` path).
@@ -233,9 +235,11 @@ owns Vulkan resources and synchronous submissions; its execution mutex serialize
 the queue, command pool, and reusable query buffers shared by
 region and KNN queries.
 Each segment uploads its vectors when it is built, unless it has fewer rows than
-`Options::vulkan_min_rows_for(dims)` (default 16384 coordinates): one dispatch and
-fence wait costs about 50 µs, and segments that stay on the host use the CPU
-kernels. Tests set `vulkan_min_rows(0)` through `common::manual`. Region scans write a count word
+`Options::vulkan_min_rows_for(dims)` (default 6 Mi coordinates). A search of a
+segment also runs on the CPU when fewer rows than that pass its filter
+(`Segment::gpu`): a GPU search costs about 115 µs before any work (measured on
+an RTX 4080 at 64 dims), as long as a CPU scan of about 100K rows. Tests set
+`vulkan_min_rows(0)` through `common::manual`. Region scans write a count word
 followed by `[row, d0..dN-1]` records; readback appends them directly to the owned
 `RegionResult` records. Buffer capacities grow on demand and remain allocated
 until the backend is dropped; never expose references to this reusable storage.
@@ -255,9 +259,13 @@ counts fit the device's allocation limit for vectors, output, and KNN scratch.
 Sparse candidates are sliced by segment row;
 dense candidates retain their bit offset when a chunk starts inside a word.
 KNN merges each chunk's best results and preserves exact `(dist_sq, row)` ordering.
-The three scan pipelines specialize All/Sparse/Dense candidate handling. Small-K
-selection uses GPU reductions without 64-bit atomics or subgroup requirements.
-Large-K queries may select on the host. Preserve deterministic `(dist_sq, row)` order
+The three scan pipelines specialize All/Sparse/Dense candidate handling. GPU KNN
+selection is a tournament tree without 64-bit atomics or subgroup requirements:
+`reduce` builds every level once (each entry is the best slot of 128 below it),
+then each `take` removes the root's slot, and `reduce` with `reduce_shift` rebuilds
+only the one entry per level above it. A query costs one scan plus about
+`levels × k` single-workgroup dispatches. When `k × 64` reaches the candidate
+count, the host selects from all distances instead. Preserve deterministic `(dist_sq, row)` order
 and zero-weight handling before coordinate subtraction.
 
 `RINGDB_VULKAN_TIMINGS=1` enables optional GPU timestamps around each submission.
@@ -301,17 +309,22 @@ write is serialized by the writer mutex. Directory files:
 
 Each `apply` (and so `add`/`add_all`/`delete`) appends one frame and calls
 `sync_data` before returning, so recovery keeps a whole batch or none of it. An
-I/O error poisons the store so later writes fail. A commit writes and syncs the new
+I/O error on the log leaves its end unknown, so later writes fail until the next
+commit starts a new log (`Store::needs_new_log`; a commit runs for this even with
+nothing pending). A commit writes and syncs the new
 segment files, then the manifest naming them and a new WAL sequence, then deletes the
 old WAL. If the manifest write fails, the segments stay unpublished for the retry.
 Merges write their segment file before `publish_merge` writes the manifest, and
 remove replaced files after.
 
-`Store::open` locks, reads or creates the manifest, rejects a different schema,
+`Store::open` locks, reads or creates the manifest (a new database writes only
+the manifest, so a crash during creation leaves at most `MANIFEST.tmp`; a missing
+log is created like an empty one), rejects a different schema,
 loads and checks every named segment, replays the WAL up to the first torn or
 corrupt frame (truncating it there), and removes unnamed files. `Db::open` then
 re-applies the recovered changes and commits. `Drop` commits durable databases.
-`backup` commits, then copies the manifest and named segments under the writer lock.
+`backup` commits, then copies the manifest, the named segments, and the current
+WAL under the writer lock.
 All decoding goes through `codec::Decoder`, which returns `Corrupt`, never panics.
 
 ## Errors

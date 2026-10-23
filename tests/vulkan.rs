@@ -192,14 +192,16 @@ fn vulkan_knn_reduction_preserves_ties_infinity_and_zero_weights() {
         return;
     }
     // More than 128² rows exercises three reduction levels. Equal distances
-    // across workgroups exercise ID tie-breaking and winner invalidation.
+    // across workgroups exercise ID tie-breaking, winner invalidation, and
+    // the repair of the tree above each winner. Up to k = 200 is selected on
+    // the GPU; larger k are selected on the host.
     let vectors: Vec<Vec<f32>> = (0..16_513).map(|id| vec![(id % 7) as f32]).collect();
     let cpu = build(&vectors, BackendPreference::Cpu);
     let gpu = build(&vectors, BackendPreference::Vulkan);
     let sparse = keys((0..gpu.len() as u64).step_by(33));
     let dense = keys((0..gpu.len() as u64).step_by(2));
     for filter in [None, Some(&sparse), Some(&dense)] {
-        for k in [1, 5, 17, 300, 20_000] {
+        for k in [1, 5, 17, 200, 300, 20_000] {
             parity_knn(&cpu, &gpu, knn(&[0.0], k, None, filter));
         }
     }

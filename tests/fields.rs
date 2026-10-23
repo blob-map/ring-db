@@ -228,7 +228,8 @@ fn records_are_validated_against_the_schema() {
     invalid(base().set("rooms", u64::MAX));
     invalid(base().set("rooms", 1.5f32));
     invalid(base().set("surface", f32::NAN));
-    invalid(base().set("surface", 3));
+    // An integer must convert to f32 exactly.
+    invalid(base().set("surface", 16_777_217));
     invalid(base().set("garden", "yes"));
     invalid(base().set("city", ["a", "b"]));
     invalid(base().set("thumbnail", "text"));
@@ -248,6 +249,9 @@ fn records_are_validated_against_the_schema() {
     );
     // Failed adds do not use keys.
     assert_eq!(key, Key::new(1));
+    let key = db.add(base().set("surface", 70)).unwrap();
+    db.flush().unwrap();
+    assert_eq!(db.get(key).unwrap().get("surface"), Some(&Value::F32(70.0)));
 
     for schema in [
         Schema::new(0),

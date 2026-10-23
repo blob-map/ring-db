@@ -1,5 +1,4 @@
-//! The database handle, its commits and merges, and consistent read views.
-use std::borrow::Cow;
+//! The database handle, its writes, commits, and merges.
 use std::collections::BTreeSet;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -8,20 +7,14 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use smallvec::SmallVec;
-
-use crate::backend::{DiskSpec, VulkanDevice};
+use crate::backend::VulkanDevice;
 use crate::codec::corrupt;
 use crate::config::{BackendPreference, Options};
 use crate::error::{Result, RingDbError};
-use crate::filter::Filter;
-use crate::query::{
-    Hit, Key, KeyLookup, Knn, MAX_DISKS, Query, Region, RegionResult, validate_disk,
-    validate_metric, validate_vector,
-};
-use crate::rows::RowSet;
+use crate::query::{Key, Query};
 use crate::schema::Schema;
 use crate::segment::{Segment, SegmentBuilder};
+use crate::snapshot::{Part, Snapshot};
 use crate::store::{self, Change, LogFrame, Manifest, Store};
 use crate::value::{Document, Record, Row};
 
@@ -101,6 +94,26 @@ impl Writer {
                         || visible.contains(key))
             }
         }
+    }
+
+    /// Make the changes recovered from the log again, as pending changes.
+    fn replay(&mut self, changes: Vec<Change>, visible: &Snapshot) -> Result<()> {
+        for change in changes {
+            match change {
+                Change::Add(key, row) => {
+                    if key.0 < self.next_key {
+                        return Err(corrupt(format!("log adds key {} twice", key.0)));
+                    }
+                    self.next_key = key.0 + 1;
+                    self.pending.push(key, row);
+                }
+                // Replaying a delete of a missing record has no effect.
+                Change::Delete(key) => {
+                    self.delete(key, visible);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Record a delete of `key` and report whether it was live.
@@ -215,21 +228,7 @@ impl Db {
             writer.store = Some(store);
         }
         let current = Snapshot::new(schema.clone(), parts);
-        for change in changes {
-            match change {
-                Change::Add(key, row) => {
-                    if key.0 < writer.next_key {
-                        return Err(corrupt(format!("log adds key {} twice", key.0)));
-                    }
-                    writer.next_key = key.0 + 1;
-                    writer.pending.push(key, row);
-                }
-                // Replaying a delete of a missing record has no effect.
-                Change::Delete(key) => {
-                    writer.delete(key, &current);
-                }
-            }
-        }
+        writer.replay(changes, &current)?;
         let shared = Arc::new(Shared {
             writer: Mutex::new(writer),
             current: RwLock::new(current),
@@ -327,11 +326,7 @@ impl Db {
     /// Commit every change now. With [`Options::auto_merge`], then merge
     /// segments as the merge policy asks.
     pub fn flush(&self) -> Result<()> {
-        self.shared.commit()?;
-        if self.shared.options.auto_merge {
-            self.shared.merge(merge_range)?;
-        }
-        Ok(())
+        self.shared.flush()
     }
 
     /// Commit, then merge all segments into one without deleted rows. Searches
@@ -346,19 +341,20 @@ impl Db {
 
     /// Commit, then copy the database files into `dest`, which must not exist
     /// or be empty. Open the copy with [`Db::open`]. Changes wait while the
-    /// files are copied.
+    /// files are copied. An in-memory database returns an [`RingDbError::Io`]
+    /// error of kind `Unsupported`.
     pub fn backup(&self, dest: impl AsRef<Path>) -> Result<()> {
         self.shared.commit()?;
         let writer = lock(&self.shared.writer);
         let Some(store) = &writer.store else {
-            return Err(RingDbError::InvalidQuery(
-                "an in-memory database has no files to back up".to_string(),
-            ));
+            return Err(RingDbError::Io(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "an in-memory database has no files to back up",
+            )));
         };
         let ids: Vec<u64> = self
             .snapshot()
-            .0
-            .parts
+            .parts()
             .iter()
             .map(|p| p.segment.id)
             .collect();
@@ -370,7 +366,7 @@ impl Db {
         self.shared.snapshot()
     }
 
-    /// Run a [`Knn`], [`Disk`](crate::Disk), or [`Region`] search.
+    /// Run a [`Knn`](crate::Knn), [`Disk`](crate::Disk), or [`Region`](crate::Region) search.
     pub fn search<Q: Query>(&self, query: Q) -> Result<Q::Output> {
         self.snapshot().search(query)
     }
@@ -442,12 +438,22 @@ impl Shared {
         }
     }
 
+    /// Commit, then merge as the merge policy asks if `auto_merge` is set.
+    fn flush(&self) -> Result<()> {
+        self.commit()?;
+        if self.options.auto_merge {
+            self.merge(merge_range)?;
+        }
+        Ok(())
+    }
+
     /// Publish pending records and deletes in one new snapshot. On failure the
-    /// changes stay pending, and the next commit retries them.
+    /// changes stay pending, and the next commit retries them. A commit also
+    /// starts a new log after a failed log write.
     fn commit(&self) -> Result<()> {
         let mut guard = lock(&self.writer);
         let writer = &mut *guard;
-        if writer.is_empty() {
+        if writer.is_empty() && !writer.store.as_ref().is_some_and(Store::needs_new_log) {
             return Ok(());
         }
         if !writer.pending.is_empty() {
@@ -461,7 +467,7 @@ impl Shared {
         for segment in &mut writer.unpublished {
             self.prepare(segment)?;
         }
-        let mut parts = self.snapshot().0.parts.clone();
+        let mut parts = self.snapshot().parts().to_vec();
         let added = writer.unpublished.len();
         let segments = std::mem::take(&mut writer.unpublished);
         parts.extend(
@@ -496,10 +502,10 @@ impl Shared {
         let _merging = lock(&self.merging);
         loop {
             let snapshot = self.snapshot();
-            let Some(range) = policy(&snapshot.0.parts) else {
+            let Some(range) = policy(snapshot.parts()) else {
                 return Ok(());
             };
-            let inputs = &snapshot.0.parts[range];
+            let inputs = &snapshot.parts()[range];
             let merged = self.build_merge(inputs)?;
             self.publish_merge(inputs, merged)?;
         }
@@ -529,7 +535,7 @@ impl Shared {
     /// were read deleted.
     fn publish_merge(&self, inputs: &[Part], merged: Option<Segment>) -> Result<()> {
         let mut writer = lock(&self.writer);
-        let mut parts = self.snapshot().0.parts.clone();
+        let mut parts = self.snapshot().parts().to_vec();
         let start = parts
             .iter()
             .position(|part| Arc::ptr_eq(&part.segment, &inputs[0].segment))
@@ -571,18 +577,16 @@ impl Shared {
 }
 
 /// Keep the vectors of `segment` on the device, unless it is small enough that
-/// a CPU scan is faster than a dispatch.
+/// every search of it runs on the CPU.
 fn upload(
     device: Option<&Arc<VulkanDevice>>,
     options: &Options,
     segment: &mut Segment,
 ) -> Result<()> {
+    let min_rows = options.vulkan_min_rows_for(segment.dims);
     match device {
-        Some(device)
-            if segment.len() >= options.vulkan_min_rows_for(segment.dims)
-                && !segment.is_uploaded() =>
-        {
-            segment.upload(device)
+        Some(device) if segment.len() >= min_rows && !segment.is_uploaded() => {
+            segment.upload(device, min_rows)
         }
         _ => Ok(()),
     }
@@ -648,12 +652,7 @@ impl Committer {
                         drop(stopped);
                         // A failure leaves the changes pending; the next
                         // commit or `flush` retries and reports it.
-                        let _ = shared.commit().and_then(|()| {
-                            if shared.options.auto_merge {
-                                shared.merge(merge_range)?;
-                            }
-                            Ok(())
-                        });
+                        let _ = shared.flush();
                         stopped = lock(&signal.0);
                     }
                 }
@@ -666,197 +665,6 @@ impl Committer {
         *lock(&self.stop.0) = true;
         self.stop.1.notify_all();
         let _ = self.thread.join();
-    }
-}
-
-/// One segment as seen by a snapshot: its deleted rows and the live rest.
-#[derive(Clone)]
-struct Part {
-    segment: Arc<Segment>,
-    /// Sorted rows.
-    deleted: Arc<[u32]>,
-    /// The complement of `deleted`, or `None` when nothing is deleted.
-    live: Option<Arc<RowSet>>,
-}
-
-impl Part {
-    fn new(segment: Arc<Segment>, deleted: Vec<u32>) -> Self {
-        let n = segment.len();
-        let live = (!deleted.is_empty())
-            .then(|| Arc::new(RowSet::from_sorted(n, deleted.clone()).complement()));
-        Self {
-            segment,
-            deleted: deleted.into(),
-            live,
-        }
-    }
-
-    fn live(&self) -> usize {
-        self.segment.len() - self.deleted.len()
-    }
-
-    fn is_deleted(&self, row: u32) -> bool {
-        self.deleted.binary_search(&row).is_ok()
-    }
-}
-
-/// A read-only view of a database at one point in time.
-///
-/// Cloning is cheap. Searches on one snapshot always see the same records.
-#[derive(Clone)]
-pub struct Snapshot(Arc<View>);
-
-struct View {
-    schema: Arc<Schema>,
-    /// Ordered by key; their key ranges do not overlap.
-    parts: Vec<Part>,
-    keys: KeyLookup,
-    len: usize,
-    rows: usize,
-}
-
-impl Snapshot {
-    fn new(schema: Arc<Schema>, parts: Vec<Part>) -> Self {
-        let mut base = 0u32;
-        let keys = parts
-            .iter()
-            .map(|part| {
-                let entry = (base, part.segment.keys.clone());
-                base += part.segment.len() as u32;
-                entry
-            })
-            .collect();
-        let len = parts.iter().map(Part::live).sum();
-        Self(Arc::new(View {
-            schema,
-            parts,
-            keys: KeyLookup(keys),
-            len,
-            rows: base as usize,
-        }))
-    }
-
-    /// Run a [`Knn`], [`Disk`](crate::Disk), or [`Region`] search.
-    pub fn search<Q: Query>(&self, query: Q) -> Result<Q::Output> {
-        query.execute(self)
-    }
-
-    pub fn get(&self, key: Key) -> Result<Document> {
-        let (part, row) = self.find(key).ok_or(RingDbError::KeyNotFound(key.0))?;
-        Ok(Document {
-            key,
-            schema: self.0.schema.clone(),
-            row: part.segment.read(&self.0.schema, row as usize),
-        })
-    }
-
-    pub fn len(&self) -> usize {
-        self.0.len
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.0.len == 0
-    }
-
-    /// Number of segments. Commits add segments and merges combine them.
-    pub fn segments(&self) -> usize {
-        self.0.parts.len()
-    }
-
-    fn rows(&self) -> usize {
-        self.0.rows
-    }
-
-    fn contains(&self, key: Key) -> bool {
-        self.find(key).is_some()
-    }
-
-    /// The part and row of a live record.
-    fn find(&self, key: Key) -> Option<(&Part, u32)> {
-        let parts = &self.0.parts;
-        let index = parts.partition_point(|part| part.segment.keys[0] <= key);
-        let part = &parts[index.checked_sub(1)?];
-        let row = part.segment.row(key)?;
-        (!part.is_deleted(row)).then_some((part, row))
-    }
-
-    /// The live rows of each segment that pass `filter`, with each segment's
-    /// base row.
-    fn eligible(&self, filter: Option<&Filter>) -> Result<Vec<(u32, &Segment, Cow<'_, RowSet>)>> {
-        let filter = filter.map(|f| f.compile(&self.0.schema)).transpose()?;
-        let mut base = 0;
-        Ok(self
-            .0
-            .parts
-            .iter()
-            .map(|part| {
-                let segment = &*part.segment;
-                let rows = match (&filter, &part.live) {
-                    (None, None) => Cow::Owned(RowSet::all(segment.len())),
-                    (None, Some(live)) => Cow::Borrowed(&**live),
-                    (Some(filter), None) => Cow::Owned(filter.rows(segment)),
-                    (Some(filter), Some(live)) => {
-                        Cow::Owned(filter.rows(segment).intersection(live))
-                    }
-                };
-                let entry = (base, segment, rows);
-                base += segment.len() as u32;
-                entry
-            })
-            .collect())
-    }
-
-    pub(crate) fn knn(&self, query: &Knn<'_>) -> Result<Vec<Hit>> {
-        let dims = self.0.schema.dims();
-        validate_vector(dims, query.query, "query")?;
-        validate_metric(dims, query.metric)?;
-        let eligible = self.eligible(query.filter)?;
-        if query.k == 0 {
-            return Ok(Vec::new());
-        }
-        let weights = query.metric.weights();
-        let mut hits = Vec::new();
-        for (_, segment, rows) in &eligible {
-            let Some(mask) = rows.mask() else { continue };
-            let found = segment.knn(query.query, weights, query.k, mask)?;
-            hits.extend(found.into_iter().map(|hit| Hit {
-                key: segment.keys[hit.row as usize],
-                dist_sq: hit.dist_sq,
-            }));
-        }
-        if eligible.len() > 1 {
-            // Within a segment, row order is key order; restore it across them.
-            hits.sort_unstable_by(|a, b| {
-                a.dist_sq
-                    .total_cmp(&b.dist_sq)
-                    .then_with(|| a.key.cmp(&b.key))
-            });
-            hits.truncate(query.k);
-        }
-        Ok(hits)
-    }
-
-    pub(crate) fn region(&self, region: &Region<'_>) -> Result<RegionResult> {
-        if region.disks.len() > MAX_DISKS {
-            return Err(RingDbError::InvalidQuery(format!(
-                "a region can contain at most {MAX_DISKS} disks, got {}",
-                region.disks.len()
-            )));
-        }
-        let dims = self.0.schema.dims();
-        let disks: SmallVec<[DiskSpec<'_>; 1]> = region
-            .disks
-            .iter()
-            .map(|disk| validate_disk(dims, disk))
-            .collect::<Result<_>>()?;
-        let eligible = self.eligible(region.filter)?;
-        let mut out = RegionResult::new(disks.len(), self.0.keys.clone());
-        for (base, segment, rows) in &eligible {
-            if let Some(mask) = rows.mask() {
-                segment.region(*base, &disks, mask, &mut out.records)?;
-            }
-        }
-        Ok(out)
     }
 }
 
@@ -897,7 +705,7 @@ mod tests {
         db.flush().unwrap();
         let shared = &db.shared;
         let before = shared.snapshot();
-        let inputs = &before.0.parts[0..2];
+        let inputs = &before.parts()[0..2];
         let merged = shared.build_merge(inputs).unwrap();
         // While the merge builds: delete from both inputs and the third part.
         for key in [2, 5, 9] {
@@ -908,8 +716,8 @@ mod tests {
 
         let after = db.snapshot();
         assert_eq!(after.segments(), 2);
-        assert_eq!(after.0.parts[0].segment.len(), 7, "key 1 was purged");
-        assert_eq!(&*after.0.parts[0].deleted, [1, 4], "keys 2 and 5, remapped");
+        assert_eq!(after.parts()[0].segment.len(), 7, "key 1 was purged");
+        assert_eq!(&*after.parts()[0].deleted, [1, 4], "keys 2 and 5, remapped");
         assert_eq!(keys(&db), [0, 3, 4, 6, 7, 8, 10, 11]);
         assert!(matches!(
             db.delete(Key(5)),
@@ -920,6 +728,27 @@ mod tests {
             db.get(Key(6)).unwrap().get("n").and_then(|v| v.as_u32()),
             Some(2)
         );
+    }
+
+    #[test]
+    fn a_commit_starts_a_new_log_after_a_failed_log_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = Options::default().commit_interval(None);
+        let db = Db::open(dir.path(), Schema::new(1), options.clone()).unwrap();
+        let kept = db.add(Record::new([1.0])).unwrap();
+        db.flush().unwrap();
+        lock(&db.shared.writer).store.as_mut().unwrap().fail();
+        assert!(matches!(
+            db.add(Record::new([2.0])),
+            Err(RingDbError::Io(_))
+        ));
+        // Nothing is pending, but the commit must still replace the log.
+        db.flush().unwrap();
+        let added = db.add(Record::new([3.0])).unwrap();
+        drop(db);
+        let db = Db::open(dir.path(), Schema::new(1), options).unwrap();
+        assert_eq!(db.len(), 2);
+        assert!(db.get(kept).is_ok() && db.get(added).is_ok());
     }
 
     #[test]

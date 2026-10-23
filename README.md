@@ -125,13 +125,14 @@ All vectors must have this number of dimensions.
 | `F32` | Finite numbers | Equality and ranges |
 | `Bool` | `true` or `false` | Equality |
 | `Keyword` | One string, for example a city | Equality |
-| `Keywords` | Zero or more strings, for example amenities | Equality with one of the strings |
+| `Keywords` | A set of strings, for example amenities | Equality with one of the strings |
 | `Text` | One string, for example a title | No filter. ring-db only keeps the value. |
 | `TextList` | A list of strings, for example photo URLs | No filter. ring-db only keeps the value. |
 | `Bytes` | Bytes | No filter. ring-db only keeps the value. |
 
 All fields are optional.
 A record has no value for a field that you do not set.
+An empty `Keywords` or `TextList` value is the same as no value.
 
 ### 2. Add records
 
@@ -145,8 +146,8 @@ ring-db examines each record before it adds it.
 It returns an error for an unknown field, a value of an incorrect type, or a field that you set two times.
 If one record is not correct, `add_all` adds no records.
 
-An integer goes into all integer fields that can hold it.
-For example, `.set("rooms", 3)` is correct for a `U32` field.
+An integer goes into all numeric fields that can hold it exactly.
+For example, `.set("rooms", 3)` is correct for a `U32` field, and `.set("surface", 70)` is correct for an `F32` field.
 For a `Keywords` or `TextList` field, set one string or a list, for example `["balcony", "lift"]`.
 
 A record must not be larger than 64 KiB, with its vector and its values.
@@ -408,7 +409,8 @@ ring-db does not change to the CPU automatically.
 
 ring-db copies the vectors to the GPU one time and keeps them there.
 All vectors must fit in the GPU memory.
-ring-db searches small segments on the CPU, because the CPU is faster for them.
+A GPU search has a fixed cost of about 0.1 ms.
+Thus ring-db uses the CPU when a segment has few rows that pass the filter, because the CPU is faster for them.
 To change this limit, use `Options::vulkan_min_rows`.
 
 ## Reference
@@ -421,16 +423,16 @@ To change this limit, use `Options::vulkan_min_rows`.
 | `commit_interval(interval)` | One second | Sets the time between background commits. `None` stops them. |
 | `auto_merge(enabled)` | `true` | Merges small segments after each commit. |
 | `max_record_bytes(bytes)` | 64 KiB | Sets the largest size of one record. |
-| `vulkan_min_rows(rows)` | 16384 values divided by the dimensions | Sets the smallest segment that Vulkan searches. `0` sends all segments to the GPU. |
+| `vulkan_min_rows(rows)` | 6 Mi values divided by the dimensions, for example 98304 rows of 64 dimensions | Sets the smallest number of rows that Vulkan searches in a segment, after the filter. Smaller searches use the CPU. `0` sends all searches to the GPU. |
 
 ### Errors
 
 | Error | Cause |
 |---|---|
 | `DimensionMismatch` | A vector, a point, or a weight array has an incorrect number of dimensions. |
-| `InvalidRecord` | A record has an incorrect value, or it is too large. |
+| `InvalidRecord` | A record has an incorrect value, for example a coordinate that is not finite, or it is too large. |
 | `UnknownField` | A record or a filter uses a field that is not in the schema. |
-| `InvalidQuery` | A search, a filter, or a vector is not correct, for example a coordinate that is not finite, or a filter on a `Text` field. |
+| `InvalidQuery` | A search or a filter is not correct, for example a point that is not finite, or a filter on a `Text` field. |
 | `KeyNotFound` | No record has this key, or the record is deleted. |
 | `InvalidSchema` | The schema is not correct, or it is different from the schema on the disk. |
 | `Io` | A file operation failed, or a different `Db` has the directory open. |
@@ -441,14 +443,15 @@ To change this limit, use `Options::vulkan_min_rows`.
 ### Limits
 
 - Vector coordinates, points, and centers must be finite numbers.
-- Weights and radii must be finite and zero or more.
+- Weights must be finite and zero or more.
+- Radii must be zero or more, and less than about 1.8 × 10¹⁹, so that the square of the radius is finite.
 - A region has 1 to 16 disks (`MAX_DISKS`).
 - A database has fewer than 4 294 967 295 rows. Deleted rows count until a merge removes them.
 
 ### Tips for speed
 
 - After a large import, call `db.compact()`. A search on one segment is the fastest.
-- To add many records, use `add_all`, which writes to the disk one time.
+- To add many records, use `add_all` or `apply`, which write to the disk one time. Each write call waits for the disk, and write calls run one at a time, so many small calls are slow on a durable database.
 - Keyword filters and narrow ranges are fast. A filter that selects few records makes the search faster.
 - All methods take `&self`. To use one database from many threads, put it in an `Arc`.
 
