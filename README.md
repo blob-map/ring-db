@@ -507,28 +507,29 @@ sh src/backend/vulkan/shaders/compile.sh
 These are the median times of one search on 10 million random vectors in one segment.
 
 - Computer: AMD Ryzen 9 7900X3D (12 cores, 24 threads), 62 GiB of memory, NVIDIA GeForce RTX 4080, Linux.
-- Software: ring-db at commit `ca7f32a`, Rust 1.98, release build, no `target-cpu` option.
+- Software: ring-db at commit `8ebf77b`, Rust 1.98, release build, no `target-cpu` option.
 - Command: `RINGDB_BENCH_N=10000000 cargo bench --bench query_backends`.
 
 **Closest records, 64 dimensions**
 
 | Search | CPU | Vulkan |
 |---|---|---|
-| KNN, `k` = 1 | 45.6 ms | 4.2 ms |
-| KNN, `k` = 10 | 45.5 ms | 5.5 ms |
-| KNN, `k` = 100 | 45.8 ms | 18.2 ms |
-| Weighted KNN, `k` = 10 | 45.6 ms | 5.5 ms |
-| KNN, `k` = 10, keyword filter, 10% of records | 12.5 ms | 6.2 ms |
-| KNN, `k` = 10, keyword filter, 1% of records | 0.61 ms | 0.95 ms |
-| KNN, `k` = 10, keyword filter, 0.1% of records | 0.084 ms | 0.21 ms |
-| KNN, `k` = 10, range filter, 10% of records | 5.6 ms | 3.4 ms |
-| KNN, `k` = 10, range filter, 1% of records | 0.23 ms | 0.21 ms |
-| KNN, `k` = 10, range filter, 0.1% of records | 0.066 ms | 0.13 ms |
+| KNN, `k` = 1 | 46.5 ms | 4.3 ms |
+| KNN, `k` = 10 | 46.6 ms | 4.4 ms |
+| KNN, `k` = 100 | 48.9 ms | 5.6 ms |
+| Weighted KNN, `k` = 10 | 47.2 ms | 4.4 ms |
+| KNN, `k` = 10, keyword filter, 10% of records | 13.7 ms | 5.3 ms |
+| KNN, `k` = 10, keyword filter, 1% of records | 0.70 ms | 1.02 ms |
+| KNN, `k` = 10, keyword filter, 0.1% of records | 0.089 ms | 0.092 ms |
+| KNN, `k` = 10, range filter, 10% of records | 6.2 ms | 2.6 ms |
+| KNN, `k` = 10, range filter, 1% of records | 0.26 ms | 0.23 ms |
+| KNN, `k` = 10, range filter, 0.1% of records | 0.070 ms | 0.072 ms |
 
 The range filter selects records that are adjacent in memory.
 The keyword filter selects records that are spread out.
 Thus, the range filter is faster in this benchmark.
-With a filter that selects few records, the CPU can be faster than Vulkan.
+With the Vulkan backend, ring-db searches on the CPU when fewer than 98304 records pass the filter.
+Thus, the two backends have almost the same time for 0.1% of the records.
 
 **Records in an area**
 
@@ -538,10 +539,10 @@ Most of the time is for the results, not for the distances.
 
 | Search | 16 dimensions | 32 dimensions | 64 dimensions | 128 dimensions |
 |---|---|---|---|---|
-| Disk, CPU | 14.7 ms | 27.6 ms | 51.6 ms | 97.6 ms |
-| Disk, Vulkan | 3.0 ms | 4.0 ms | 5.9 ms | 9.7 ms |
-| 3 disks, CPU | 30.4 ms | 43.8 ms | 68.8 ms | 118 ms |
-| 3 disks, Vulkan | 7.5 ms | 8.0 ms | 10.3 ms | 13.8 ms |
+| Disk, CPU | 14.8 ms | 27.8 ms | 51.2 ms | 98.3 ms |
+| Disk, Vulkan | 3.4 ms | 4.4 ms | 6.5 ms | 10.5 ms |
+| 3 disks, CPU | 32.7 ms | 45.2 ms | 71.2 ms | 120 ms |
+| 3 disks, Vulkan | 6.1 ms | 8.6 ms | 10.8 ms | 14.7 ms |
 
 Weights do not make these searches slower.
 
