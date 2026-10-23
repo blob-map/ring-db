@@ -150,9 +150,15 @@ macro_rules! dispatch {
     }};
 }
 
-#[inline(always)]
-fn dense_contains(words: &[u64], row: usize) -> bool {
-    words[row / 64] & (1_u64 << (row % 64)) != 0
+/// The set bits of `word`, as rows offset by `base`.
+fn set_bits(base: usize, mut word: u64) -> impl Iterator<Item = usize> {
+    std::iter::from_fn(move || {
+        (word != 0).then(|| {
+            let bit = word.trailing_zeros() as usize;
+            word &= word - 1;
+            base + bit
+        })
+    })
 }
 
 /// Coordinates per Rayon job at least. Waking idle workers costs more than
@@ -167,19 +173,27 @@ fn rows<'a>(
     mask: Mask<'a>,
 ) -> impl ParallelIterator<Item = (usize, &'a [f32])> + 'a {
     let min_rows = MIN_JOB_VALUES.div_ceil(dims);
-    let all = vectors
-        .par_chunks_exact(dims)
-        .with_min_len(min_rows)
-        .enumerate();
+    let vector = move |row: usize| (row, &vectors[row * dims..(row + 1) * dims]);
     match mask {
-        Mask::All => Either::Left(Either::Left(all)),
-        Mask::Dense(words) => Either::Left(Either::Right(
-            all.filter(move |(row, _)| dense_contains(words, *row)),
+        Mask::All => Either::Left(Either::Left(
+            vectors
+                .par_chunks_exact(dims)
+                .with_min_len(min_rows)
+                .enumerate(),
         )),
-        Mask::Sparse(ids) => Either::Right(ids.par_iter().with_min_len(min_rows).map(move |&id| {
-            let row = id as usize;
-            (row, &vectors[row * dims..(row + 1) * dims])
-        })),
+        // Visit set bits only, so a clear bit costs nothing.
+        Mask::Dense(words) => Either::Left(Either::Right(
+            words
+                .par_iter()
+                .with_min_len(min_rows.div_ceil(64))
+                .enumerate()
+                .flat_map_iter(move |(index, &word)| set_bits(index * 64, word).map(vector)),
+        )),
+        Mask::Sparse(ids) => Either::Right(
+            ids.par_iter()
+                .with_min_len(min_rows)
+                .map(move |&id| vector(id as usize)),
+        ),
     }
 }
 

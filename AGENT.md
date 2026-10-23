@@ -144,6 +144,10 @@ segment by binary search on first keys, then a row by binary search on keys. Mer
 must combine adjacent segments only, to keep this property.
 
 - Scalars: `Vec<T>` plus a presence bitmap, omitted when every row has a value.
+  Numeric scalars also keep `order`, the present rows sorted by value, rebuilt when
+  a segment is built or decoded (not stored). `select_range` binary-searches it:
+  under 1/64 of rows it sorts the matches, under 1/32 it sets bitmap bits, else it
+  scans the column. Bool columns scan.
 - Keyword and Keywords: a sorted per-segment dictionary, per-row sorted term ids,
   and a CSR inverted index (term → sorted rows). There is no global dictionary,
   so each segment is self-contained.
@@ -206,7 +210,7 @@ The CPU backend is the correctness reference.
   job, so a small segment scans on one thread instead of waking the pool.
 - `All` retains the existing scan with no candidate branch per row.
 - `Sparse` iterates rows directly.
-- `Dense` tests its bit before distance calculation.
+- `Dense` visits set bits word by word (`set_bits`), so clear bits cost nothing.
 - KNN keeps a bounded max-heap per Rayon fold and deterministically merges/sorts the
   finalists.
 

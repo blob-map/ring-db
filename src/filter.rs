@@ -1,5 +1,5 @@
 //! Typed filters over record fields.
-use std::ops::{BitAnd, BitOr, Bound, Not, RangeBounds, RangeInclusive};
+use std::ops::{BitAnd, BitOr, Bound, Not, RangeBounds};
 
 use crate::column::Column;
 use crate::error::{Result, RingDbError};
@@ -273,15 +273,15 @@ impl Compiled {
         match self {
             Self::Int { field, low, high } => match &segment.columns[*field] {
                 Column::U32(c) => int_range(*low, *high, u32::MIN, u32::MAX)
-                    .map_or_else(|| RowSet::empty(n), |r| c.select(|v| r.contains(&v))),
+                    .map_or_else(|| RowSet::empty(n), |(l, h)| c.select_range(l, h)),
                 Column::U64(c) => int_range(*low, *high, u64::MIN, u64::MAX)
-                    .map_or_else(|| RowSet::empty(n), |r| c.select(|v| r.contains(&v))),
+                    .map_or_else(|| RowSet::empty(n), |(l, h)| c.select_range(l, h)),
                 Column::I64(c) => int_range(*low, *high, i64::MIN, i64::MAX)
-                    .map_or_else(|| RowSet::empty(n), |r| c.select(|v| r.contains(&v))),
+                    .map_or_else(|| RowSet::empty(n), |(l, h)| c.select_range(l, h)),
                 _ => unreachable!("integer filters apply to integer columns"),
             },
             Self::Float { field, low, high } => match &segment.columns[*field] {
-                Column::F32(c) => c.select(|v| (*low, *high).contains(&v)),
+                Column::F32(c) => c.select_range(*low, *high),
                 _ => unreachable!("float filters apply to float columns"),
             },
             Self::Bool { field, value } => match &segment.columns[*field] {
@@ -322,11 +322,11 @@ impl Compiled {
 }
 
 /// The inclusive `low..=high` range clamped to `T`, or `None` if it is empty.
-fn int_range<T>(low: i128, high: i128, min: T, max: T) -> Option<RangeInclusive<T>>
+fn int_range<T>(low: i128, high: i128, min: T, max: T) -> Option<(Bound<T>, Bound<T>)>
 where
     T: Copy + Into<i128> + TryFrom<i128>,
 {
     let low = T::try_from(low.max(min.into())).ok()?;
     let high = T::try_from(high.min(max.into())).ok()?;
-    (low.into() <= high.into()).then_some(low..=high)
+    (low.into() <= high.into()).then_some((Bound::Included(low), Bound::Included(high)))
 }

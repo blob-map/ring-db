@@ -1,9 +1,12 @@
 //! Typed field storage of one segment, and its incremental builders.
 //!
 //! Every column has one entry per row. Missing scalar values are tracked by a
-//! presence bitmap, which is omitted when every row has a value. Keyword
-//! columns keep a sorted per-segment dictionary and an inverted index.
+//! presence bitmap, which is omitted when every row has a value. Numeric
+//! columns keep their rows sorted by value for range filters. Keyword columns
+//! keep a sorted per-segment dictionary and an inverted index.
+use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::ops::{Bound, RangeBounds};
 
 use bytemuck::Pod;
 use rayon::prelude::*;
@@ -76,7 +79,15 @@ fn present(presence: &Presence, row: usize) -> bool {
 pub(crate) struct Scalars<T> {
     values: Vec<T>,
     present: Presence,
+    /// Rows with a value, sorted by value; empty for bool columns. Built, not
+    /// stored, so segment files do not change.
+    order: Vec<u32>,
 }
+
+/// A range filter uses `order` while it matches at most one row in this many:
+/// setting one bit per match costs about as much as testing 32 values in a
+/// parallel scan.
+const RANGE_SCAN_RATIO: usize = 32;
 
 impl<T: Copy + Send + Sync> Scalars<T> {
     fn get(&self, row: usize) -> Option<T> {
@@ -102,6 +113,52 @@ impl<T: Copy + Send + Sync> Scalars<T> {
                 .for_each(|(word, p)| *word &= p);
         }
         RowSet::from_words(self.values.len(), words)
+    }
+}
+
+impl<T: Copy + PartialOrd + Send + Sync> Scalars<T> {
+    /// Build `order`. Values must not be NaN.
+    fn indexed(mut self) -> Self {
+        let mut pairs: Vec<(T, u32)> = (0..self.values.len())
+            .filter(|&row| present(&self.present, row))
+            .map(|row| (self.values[row], row as u32))
+            .collect();
+        pairs.par_sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+        self.order = pairs.into_iter().map(|(_, row)| row).collect();
+        self
+    }
+
+    /// Rows with a value in `low..high`.
+    pub(crate) fn select_range(&self, low: Bound<T>, high: Bound<T>) -> RowSet {
+        let n = self.values.len();
+        let below = |v: T| match low {
+            Bound::Included(l) => v < l,
+            Bound::Excluded(l) => v <= l,
+            Bound::Unbounded => false,
+        };
+        let above = |v: T| match high {
+            Bound::Included(h) => v > h,
+            Bound::Excluded(h) => v >= h,
+            Bound::Unbounded => false,
+        };
+        let value = |&row: &u32| self.values[row as usize];
+        let start = self.order.partition_point(|row| below(value(row)));
+        let len = self.order[start..].partition_point(|row| !above(value(row)));
+        let rows = &self.order[start..start + len];
+        if len * RANGE_SCAN_RATIO > n {
+            return self.select(|v| (low, high).contains(&v));
+        }
+        if len * 64 < n {
+            // Fewer rows than bitmap words: sorting them is cheaper.
+            let mut rows = rows.to_vec();
+            rows.sort_unstable();
+            return RowSet::from_sorted(n, rows);
+        }
+        let mut words = vec![0; crate::rows::word_count(n)];
+        for &row in rows {
+            words[row as usize / 64] |= 1 << (row % 64);
+        }
+        RowSet::from_words(n, words)
     }
 }
 
@@ -304,10 +361,10 @@ impl ColumnBuilder {
 
     pub(crate) fn finish(self) -> Column {
         match self {
-            Self::U32(b) => Column::U32(b.finish()),
-            Self::U64(b) => Column::U64(b.finish()),
-            Self::I64(b) => Column::I64(b.finish()),
-            Self::F32(b) => Column::F32(b.finish()),
+            Self::U32(b) => Column::U32(b.finish().indexed()),
+            Self::U64(b) => Column::U64(b.finish().indexed()),
+            Self::I64(b) => Column::I64(b.finish().indexed()),
+            Self::F32(b) => Column::F32(b.finish().indexed()),
             Self::Bool(b) => Column::Bool(b.finish()),
             Self::Keywords {
                 local,
@@ -417,6 +474,7 @@ impl<T: Default> ScalarsBuilder<T> {
         Scalars {
             present: self.present.finish(self.values.len()),
             values: self.values,
+            order: Vec::new(),
         }
     }
 }
@@ -472,6 +530,7 @@ impl<T: Pod + ToLe> Scalars<T> {
         Ok(Self {
             values,
             present: decode_presence(d, rows)?,
+            order: Vec::new(),
         })
     }
 }
@@ -529,10 +588,16 @@ impl Column {
     /// Decode a column of `rows` rows and check its internal references.
     pub(crate) fn decode(d: &mut Decoder<'_>, ty: FieldType, rows: usize) -> Result<Self> {
         Ok(match ty {
-            FieldType::U32 => Self::U32(Scalars::decode(d, rows)?),
-            FieldType::U64 => Self::U64(Scalars::decode(d, rows)?),
-            FieldType::I64 => Self::I64(Scalars::decode(d, rows)?),
-            FieldType::F32 => Self::F32(Scalars::decode(d, rows)?),
+            FieldType::U32 => Self::U32(Scalars::decode(d, rows)?.indexed()),
+            FieldType::U64 => Self::U64(Scalars::decode(d, rows)?.indexed()),
+            FieldType::I64 => Self::I64(Scalars::decode(d, rows)?.indexed()),
+            FieldType::F32 => {
+                let column = Scalars::<f32>::decode(d, rows)?;
+                if column.values.iter().any(|v| !v.is_finite()) {
+                    return Err(corrupt("f32 column holds a value that is not finite"));
+                }
+                Self::F32(column.indexed())
+            }
             FieldType::Bool => {
                 let bytes = Scalars::<u8>::decode(d, rows)?;
                 if bytes.values.iter().any(|&b| b > 1) {
@@ -541,6 +606,7 @@ impl Column {
                 Self::Bool(Scalars {
                     values: bytes.values.iter().map(|&b| b == 1).collect(),
                     present: bytes.present,
+                    order: Vec::new(),
                 })
             }
             FieldType::Keyword | FieldType::Keywords => {
@@ -585,5 +651,75 @@ impl Column {
                 })
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn expected<T: Copy + PartialOrd>(values: &[Option<T>], range: (Bound<T>, Bound<T>)) -> RowSet {
+        let rows = (0..values.len() as u32)
+            .filter(|&row| values[row as usize].is_some_and(|v| range.contains(&v)))
+            .collect();
+        RowSet::from_sorted(values.len(), rows)
+    }
+
+    #[test]
+    fn range_selection_matches_a_scan_on_every_path() {
+        let mut x = 7u64;
+        let mut next = |n: u64| {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (x >> 33) % n
+        };
+        let n = 10_000;
+        let values: Vec<Option<i64>> = (0..n)
+            .map(|_| (next(10) != 0).then(|| next(2000) as i64 - 1000))
+            .collect();
+        let mut builder = ScalarsBuilder::default();
+        values.iter().for_each(|&v| builder.push(v));
+        let column = builder.finish().indexed();
+        // Widths from a few rows (sorted rows) to most rows (scan).
+        for width in [0, 1, 5, 20, 40, 60, 100, 2000] {
+            for _ in 0..20 {
+                let low = next(2200) as i64 - 1100;
+                for range in [
+                    (Bound::Included(low), Bound::Included(low + width)),
+                    (Bound::Excluded(low), Bound::Excluded(low + width)),
+                    (Bound::Unbounded, Bound::Excluded(low)),
+                    (Bound::Included(low), Bound::Unbounded),
+                ] {
+                    assert_eq!(
+                        column.select_range(range.0, range.1),
+                        expected(&values, range)
+                    );
+                }
+            }
+        }
+
+        let floats = [
+            Some(-0.0f32),
+            Some(0.0),
+            None,
+            Some(1.5),
+            Some(-2.0),
+            Some(0.0),
+        ];
+        let mut builder = ScalarsBuilder::default();
+        floats.iter().for_each(|&v| builder.push(v));
+        let column = builder.finish().indexed();
+        for range in [
+            (Bound::Included(0.0), Bound::Included(0.0)),
+            (Bound::Excluded(-0.0), Bound::Unbounded),
+            (Bound::Unbounded, Bound::Excluded(0.0)),
+            (Bound::Included(-2.0), Bound::Excluded(1.5)),
+        ] {
+            assert_eq!(
+                column.select_range(range.0, range.1),
+                expected(&floats, range)
+            );
+        }
     }
 }
