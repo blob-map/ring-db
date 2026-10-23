@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 /// Which compute backend to use for vector searches.
 ///
 /// Both backends are included in every build; selection happens at runtime.
@@ -22,6 +24,8 @@ pub enum BackendPreference {
 pub struct Options {
     pub(crate) backend: BackendPreference,
     pub(crate) max_record_bytes: usize,
+    pub(crate) commit_interval: Option<Duration>,
+    pub(crate) auto_merge: bool,
 }
 
 impl Default for Options {
@@ -29,6 +33,8 @@ impl Default for Options {
         Self {
             backend: BackendPreference::Cpu,
             max_record_bytes: 64 * 1024,
+            commit_interval: Some(Duration::from_secs(1)),
+            auto_merge: true,
         }
     }
 }
@@ -46,6 +52,22 @@ impl Options {
     #[must_use]
     pub fn max_record_bytes(mut self, bytes: usize) -> Self {
         self.max_record_bytes = bytes;
+        self
+    }
+
+    /// Commit changes in the background at this interval, or only on
+    /// [`Db::flush`](crate::Db::flush) with `None`. The default is one second.
+    #[must_use]
+    pub fn commit_interval(mut self, interval: Option<Duration>) -> Self {
+        self.commit_interval = interval;
+        self
+    }
+
+    /// Merge segments after each commit (the default). Without it, segments
+    /// merge only on [`Db::compact`](crate::Db::compact).
+    #[must_use]
+    pub fn auto_merge(mut self, enabled: bool) -> Self {
+        self.auto_merge = enabled;
         self
     }
 }

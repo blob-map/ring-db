@@ -12,11 +12,12 @@ ring-db is a Rust 2024 exact vector database. It supports:
 - a fixed `Schema` of typed, optional fields per record;
 - typed `Filter`s over numeric, bool, and keyword fields;
 - stored-only text, text-list, and byte fields read back with `get`;
-- generated, never-reused `Key`s;
+- generated, never-reused `Key`s, `delete`, and atomic commits;
+- background commits and size-tiered merges of immutable segments;
 - CPU and Vulkan backends selected at runtime.
 
-ring-db is meant to be the source of truth for its records. Deletion, background
-commits, and merges (phase 3) and durable storage (phase 4) are not implemented yet:
+ring-db is meant to be the source of truth for its records. Records are added and
+deleted, never changed in place. Durable storage (phase 4) is not implemented yet:
 the database is in memory only.
 
 ## Engineering priorities
@@ -76,6 +77,7 @@ tests/
 ├── search.rs          analytical search semantics
 ├── randomized.rs      comparison with an f64 reference
 ├── fields.rs          schemas, records, typed filters, segments, get
+├── mutation.rs        deletes, commits, merges, concurrency against a model
 └── vulkan.rs          CPU/Vulkan parity
 
 examples/cli.rs        filtered weighted-KNN example
@@ -103,17 +105,38 @@ hold it, and `Text` becomes a one-item list for list fields. It rejects non-fini
 `F32`, duplicate fields, and records over `Options::max_record_bytes` (64 KiB by
 default). Keys come from a monotonic `u64` counter, only after validation succeeds.
 
-`Db` methods take `&self`. A writer mutex holds the next key and a pending
-`SegmentBuilder`; `flush` freezes it into a new `Segment` and publishes a new
-`Snapshot` (an `Arc` replaced under an `RwLock`). Searches and `get` run on a
-snapshot clone without holding locks. Unflushed records are invisible.
+`Db` methods take `&self`. Shared state is behind an `Arc` so the commit thread can
+hold it; `Drop` stops and joins that thread.
+
+## Commits, deletes, and merges
+
+The writer mutex holds the next key, the pending `SegmentBuilder`, deleted pending
+rows, and visible keys to delete. A commit freezes the builder into a `Segment`,
+uploads it, and publishes adds and deletes in one new `Snapshot` (an `Arc` replaced
+under an `RwLock`). Lock `writer` before `current`, always. Searches and `get` run
+on a snapshot clone without locks. Uncommitted changes are invisible.
+
+A segment that fails to upload stays in `Writer::unpublished` and is retried at the
+next commit, so no record is lost. The commit thread ignores errors; `flush` repeats
+the commit and reports them.
+
+A snapshot `Part` is an `Arc<Segment>` plus its sorted deleted rows and a cached live
+`RowSet` (`None` when nothing is deleted, which keeps the unfiltered `Mask::All` path).
+Deletes are copy-on-write per part.
+
+Merges run after commits (`Options::auto_merge`) and on `compact`, one at a time
+under `Shared::merging`. `merge_range` selects adjacent parts only: first a part with
+at least 25% deleted rows, else the newest run whose older neighbor has less than
+twice its live rows. `build_merge` copies live rows without the writer lock;
+`publish_merge` then takes it, remaps rows deleted meanwhile into the new segment,
+and replaces the inputs. Only merges remove parts, so the inputs are still contiguous.
 
 ## Segments, columns, and filters
 
 A segment holds rows sorted by key, row-major vectors, and one `Column` per field.
 Segments in a snapshot are ordered by key with disjoint key ranges, so `get` finds a
 segment by binary search on first keys, then a row by binary search on keys. Merges
-(phase 3) must combine adjacent segments only, to keep this property.
+must combine adjacent segments only, to keep this property.
 
 - Scalars: `Vec<T>` plus a presence bitmap, omitted when every row has a value.
 - Keyword and Keywords: a sorted per-segment dictionary, per-row sorted term ids,

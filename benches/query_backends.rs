@@ -61,7 +61,8 @@ fn build(dims: usize, n: usize, backend: BackendPreference) -> Db {
     let schema = Schema::new(dims)
         .field("id", FieldType::U64)
         .field("tags", FieldType::Keywords);
-    let db = Db::in_memory(schema, Options::default().backend(backend)).unwrap();
+    let options = Options::default().backend(backend).commit_interval(None);
+    let db = Db::in_memory(schema, options).unwrap();
     for id in 0..n as u64 {
         for x in &mut row {
             *x = rng.random_range(-1.0f32..1.0);

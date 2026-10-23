@@ -48,15 +48,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 `add` returns a new `Key` for each record.
-ring-db does not use a key again.
+ring-db does not use a key again, also after you delete its record.
 `key.get()` returns the key as a `u64` value, and `Key::new` makes a key from this value.
 
-Searches and `get` find a record after `flush`.
-`flush` makes all added records visible.
+Searches and `get` find a record after the next commit.
+`flush` commits all changes immediately.
 
 The database stays in memory and is not saved to disk.
 All methods take `&self`.
 To use a database from more than one thread, put it in an `Arc`.
+
+## Delete and change records
+
+`db.delete(key)` deletes one record.
+It returns `KeyNotFound` if the record does not exist or is already deleted.
+You cannot change a record.
+To change a record, delete it and add the new version, which gets a new key.
+
+ring-db collects changes and applies them in a commit.
+A commit makes all changes since the previous commit visible at the same time.
+A background thread makes a commit at each `Options::commit_interval`, one second by default.
+`db.flush()` makes a commit immediately.
+To make commits only with `flush`, set `commit_interval(None)`.
+
+A delete and an add are visible at the same time if no commit occurs between them.
+Thus, to change a record without a commit between the two operations, use `commit_interval(None)` and `flush`.
+
+Each commit adds a segment that contains the new records.
+After a commit, ring-db merges small segments into larger segments in the background.
+A merge also removes deleted records from storage.
+Searches do not stop during a merge.
+To stop automatic merges, set `auto_merge(false)`.
+
+`db.compact()` merges all segments into one segment.
+A search on one segment is the fastest.
+Use `compact` after you add many records, for example after an import.
 
 ## Select CPU or Vulkan
 
@@ -97,8 +123,6 @@ Subgroup extensions and 64-bit shader atomics are not necessary.
 If Vulkan is unavailable, database creation returns `BackendUnavailable`.
 ring-db does not automatically change the backend to CPU.
 
-ring-db keeps records in groups called segments.
-Each `flush` makes one new segment from the added records.
 The Vulkan backend uploads the vectors of each segment one time and keeps them in device memory.
 It executes queries on one database in sequence.
 It keeps query buffers for subsequent queries until you drop the database.

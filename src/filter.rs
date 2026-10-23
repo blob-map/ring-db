@@ -308,7 +308,7 @@ impl Compiled {
                     if rows.len() == 0 {
                         break;
                     }
-                    rows = rows.intersection(node.rows(segment));
+                    rows = rows.intersection(&node.rows(segment));
                 }
                 rows
             }

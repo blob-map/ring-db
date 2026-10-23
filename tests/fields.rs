@@ -265,7 +265,7 @@ fn records_are_validated_against_the_schema() {
 
 #[test]
 fn records_become_visible_after_flush_in_new_segments() {
-    let db = Db::in_memory(common::schema(1), Options::default()).unwrap();
+    let db = Db::in_memory(common::schema(1), common::manual(Default::default())).unwrap();
     let origin = [0.0];
     let add = |x: f32, group: u32| db.add(Record::new([x]).set("group", group)).unwrap();
     // Equal distances in different segments still sort by key.
@@ -281,6 +281,7 @@ fn records_become_visible_after_flush_in_new_segments() {
     let third = [add(0.5, 1)];
     db.flush().unwrap();
     assert_eq!(db.len(), 6);
+    assert_eq!(db.snapshot().segments(), 3);
     assert!(snapshot.is_empty(), "snapshots do not change");
 
     let hits = db.search(Knn::new(&origin, 4)).unwrap();

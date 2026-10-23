@@ -22,6 +22,16 @@ impl Segment {
         self.keys.len()
     }
 
+    pub(crate) fn is_uploaded(&self) -> bool {
+        self.gpu.is_some()
+    }
+
+    /// Keep a resident copy of the vectors on `device`.
+    pub(crate) fn upload(&mut self, device: &Arc<VulkanDevice>) -> Result<()> {
+        self.gpu = Some((device.clone(), device.upload(self.dims, &self.vectors)?));
+        Ok(())
+    }
+
     /// The row holding `key`.
     pub(crate) fn row(&self, key: Key) -> Option<u32> {
         self.keys.binary_search(&key).ok().map(|row| row as u32)
@@ -99,6 +109,11 @@ impl SegmentBuilder {
         self.keys.is_empty()
     }
 
+    /// The row holding `key`.
+    pub(crate) fn row(&self, key: Key) -> Option<u32> {
+        self.keys.binary_search(&key).ok().map(|row| row as u32)
+    }
+
     /// Append a validated row. Keys must increase.
     pub(crate) fn push(&mut self, key: Key, row: Row) {
         debug_assert!(self.keys.last().is_none_or(|&last| last < key));
@@ -109,13 +124,9 @@ impl SegmentBuilder {
         }
     }
 
-    /// Freeze the records, uploading their vectors to `device` if any.
-    pub(crate) fn finish(self, device: Option<&Arc<VulkanDevice>>) -> Result<Segment> {
-        let gpu = match device {
-            Some(device) => Some((device.clone(), device.upload(self.dims, &self.vectors)?)),
-            None => None,
-        };
-        Ok(Segment {
+    /// Freeze the records. Upload them separately.
+    pub(crate) fn finish(self) -> Segment {
+        Segment {
             dims: self.dims,
             keys: self.keys.into(),
             vectors: self.vectors,
@@ -124,7 +135,7 @@ impl SegmentBuilder {
                 .into_iter()
                 .map(ColumnBuilder::finish)
                 .collect(),
-            gpu,
-        })
+            gpu: None,
+        }
     }
 }

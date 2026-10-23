@@ -119,31 +119,33 @@ impl RowSet {
         }
     }
 
-    pub(crate) fn intersection(self, other: Self) -> Self {
+    /// Rows in both sets. Only `self` is consumed, so `other` can be shared.
+    pub(crate) fn intersection(self, other: &Self) -> Self {
         debug_assert_eq!(self.universe, other.universe);
         let universe = self.universe;
-        match (self.repr, other.repr) {
+        let bit = |words: &[u64], row: u32| words[row as usize / 64] & (1 << (row % 64)) != 0;
+        match (self.repr, &other.repr) {
             (Repr::Empty, _) | (_, Repr::Empty) => Self::empty(universe),
-            (Repr::All, repr) | (repr, Repr::All) => Self { universe, repr },
+            (repr, Repr::All) => Self { universe, repr },
+            (Repr::All, _) => other.clone(),
             (Repr::Sparse(left), Repr::Sparse(right)) => {
-                Self::from_sorted(universe, merge(&left, &right, true))
+                Self::from_sorted(universe, merge(&left, right, true))
             }
-            (Repr::Sparse(rows), Repr::Dense { words, .. })
-            | (Repr::Dense { words, .. }, Repr::Sparse(rows)) => {
+            (Repr::Sparse(mut rows), Repr::Dense { words, .. }) => {
+                rows.retain(|&row| bit(words, row));
+                Self::from_sorted(universe, rows)
+            }
+            (Repr::Dense { words, .. }, Repr::Sparse(rows)) => {
                 let kept = rows
-                    .into_iter()
-                    .filter(|&row| words[row as usize / 64] & (1 << (row % 64)) != 0)
+                    .iter()
+                    .copied()
+                    .filter(|&row| bit(&words, row))
                     .collect();
                 Self::from_sorted(universe, kept)
             }
-            (
-                Repr::Dense {
-                    words: mut left, ..
-                },
-                Repr::Dense { words: right, .. },
-            ) => {
-                left.iter_mut().zip(&right).for_each(|(a, b)| *a &= b);
-                Self::from_words(universe, left)
+            (Repr::Dense { mut words, .. }, Repr::Dense { words: right, .. }) => {
+                words.iter_mut().zip(right).for_each(|(a, b)| *a &= b);
+                Self::from_words(universe, words)
             }
         }
     }
@@ -290,7 +292,7 @@ mod tests {
         assert_eq!(dense.len(), 500);
         assert!(RowSet::from_sorted(n, (0..n as u32).collect()).is_all());
         // A dense set that thins out becomes sparse.
-        let thin = dense.intersection(RowSet::from_sorted(n, vec![0, 1, 2]));
+        let thin = dense.intersection(&RowSet::from_sorted(n, vec![0, 1, 2]));
         assert!(matches!(thin.repr, Repr::Sparse(_)));
         assert_eq!(rows(&thin), [0, 2]);
     }
@@ -316,11 +318,7 @@ mod tests {
                 let mut or: Vec<u32> = l.iter().chain(&r).copied().collect();
                 or.sort_unstable();
                 or.dedup();
-                assert_eq!(
-                    rows(&set.clone().intersection(right.clone())),
-                    and,
-                    "{i}&{j}"
-                );
+                assert_eq!(rows(&set.clone().intersection(&right)), and, "{i}&{j}");
                 assert_eq!(rows(&set.clone().union(right)), or, "{i}|{j}");
             }
             let expected: Vec<u32> = (0..n as u32).filter(|x| !set.contains(*x)).collect();

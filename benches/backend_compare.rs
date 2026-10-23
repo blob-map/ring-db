@@ -208,7 +208,9 @@ impl Output {
 
 fn build(args: &Args, backend: BackendPreference) -> BenchResult<(Db, Duration, Duration)> {
     let schema = Schema::new(args.dims).field("bucket", FieldType::Keyword);
-    let db = Db::in_memory(schema, Options::default().backend(backend))?;
+    // One explicit commit at the end: the measured data is a single segment.
+    let options = Options::default().backend(backend).commit_interval(None);
+    let db = Db::in_memory(schema, options)?;
     let mut rng = rand::rngs::SmallRng::seed_from_u64(args.seed);
     let mut row = vec![0.0; args.dims];
     let started = Instant::now();

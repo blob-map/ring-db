@@ -16,8 +16,16 @@ pub fn build(vectors: &[Vec<f32>], backend: BackendPreference) -> Db {
     build_dims(vectors[0].len(), vectors, backend)
 }
 
+/// Options with explicit commits and merges, so tests control segments.
+pub fn manual(backend: BackendPreference) -> Options {
+    Options::default()
+        .backend(backend)
+        .commit_interval(None)
+        .auto_merge(false)
+}
+
 pub fn build_dims(dims: usize, vectors: &[Vec<f32>], backend: BackendPreference) -> Db {
-    let db = Db::in_memory(schema(dims), Options::default().backend(backend)).unwrap();
+    let db = Db::in_memory(schema(dims), manual(backend)).unwrap();
     for (id, vector) in vectors.iter().enumerate() {
         let record = Record::new(vector.as_slice())
             .set("group", (id % 3) as u32)

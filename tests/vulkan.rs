@@ -336,11 +336,7 @@ fn vulkan_reads_large_results_from_concurrent_rayon_callers() {
 
 /// The same records on `backend`, split into segments after each of `cuts`.
 fn segmented(vectors: &[Vec<f32>], cuts: &[usize], backend: BackendPreference) -> Db {
-    let db = Db::in_memory(
-        common::schema(vectors[0].len()),
-        Options::default().backend(backend),
-    )
-    .unwrap();
+    let db = Db::in_memory(common::schema(vectors[0].len()), common::manual(backend)).unwrap();
     for (id, vector) in vectors.iter().enumerate() {
         let record = Record::new(vector.as_slice())
             .set("group", (id % 3) as u32)
@@ -351,6 +347,7 @@ fn segmented(vectors: &[Vec<f32>], cuts: &[usize], backend: BackendPreference) -
         }
     }
     db.flush().unwrap();
+    assert_eq!(db.snapshot().segments(), cuts.len() + 1);
     db
 }
 
@@ -387,6 +384,53 @@ fn vulkan_searches_segments_and_supports_concurrent_queries() {
             });
         }
     });
+}
+
+#[test]
+fn vulkan_matches_cpu_after_deletes_and_merges() {
+    if !requested() {
+        return;
+    }
+    let schema = || common::schema(4);
+    let cpu = Db::in_memory(schema(), common::manual(BackendPreference::Cpu)).unwrap();
+    let gpu = Db::in_memory(schema(), common::manual(BackendPreference::Vulkan)).unwrap();
+    let mut rng = rand::rngs::SmallRng::seed_from_u64(7);
+    let mut live = Vec::new();
+    for batch in 0..12 {
+        for _ in 0..97 {
+            let vector: Vec<f32> = (0..4).map(|_| rng.random_range(-2.0f32..2.0)).collect();
+            let record = || Record::new(vector.as_slice()).set("group", live.len() as u32 % 3);
+            let key = cpu.add(record()).unwrap();
+            assert_eq!(gpu.add(record()).unwrap(), key);
+            live.push(key);
+        }
+        for _ in 0..40 {
+            let key = live.swap_remove(rng.random_range(0..live.len()));
+            cpu.delete(key).unwrap();
+            gpu.delete(key).unwrap();
+        }
+        for db in [&cpu, &gpu] {
+            if batch % 4 == 3 {
+                db.compact().unwrap();
+            } else {
+                db.flush().unwrap();
+            }
+        }
+        let filter = common::group(1);
+        let origin = [0.0; 4];
+        for k in [1, 10, 500] {
+            parity_knn(&cpu, &gpu, Knn::new(&origin, k));
+            parity_knn(&cpu, &gpu, Knn::new(&origin, k).filter(&filter));
+        }
+        parity_region(&cpu, &gpu, Disk::new(&origin, 2.5).into());
+        parity_region(
+            &cpu,
+            &gpu,
+            Disk::new(&origin, 3.0).and(Disk::new(&[1.0; 4], 2.0)),
+        );
+        parity_region(&cpu, &gpu, Disk::new(&origin, 9.0).filter(&filter));
+        assert_eq!(gpu.len(), live.len());
+    }
 }
 
 #[test]
