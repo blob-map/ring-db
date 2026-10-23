@@ -73,12 +73,81 @@ fn weighted_delta_mul_add(a: f32, b: f32, weight: f32, sum: f32) -> f32 {
     weight.mul_add(delta * delta, sum)
 }
 
-#[inline(always)]
-fn distance(row: &[f32], disk: &DiskSpec<'_>) -> f32 {
-    match disk.weights {
-        None => l2_sq(row, disk.center),
-        Some(weights) => weighted_l2_sq(row, disk.center, weights),
+/// The distance functions of one instruction set. Every implementation fuses
+/// each `mul_add`, so all of them return the same bits.
+trait Distance: Copy + Send + Sync {
+    fn l2_sq(self, a: &[f32], b: &[f32]) -> f32;
+    fn weighted_l2_sq(self, a: &[f32], b: &[f32], weights: &[f32]) -> f32;
+
+    #[inline(always)]
+    fn disk(self, row: &[f32], disk: &DiskSpec<'_>) -> f32 {
+        match disk.weights {
+            None => self.l2_sq(row, disk.center),
+            Some(weights) => self.weighted_l2_sq(row, disk.center, weights),
+        }
     }
+}
+
+/// Inlined distances for the build target. Without a target FMA feature, each
+/// `mul_add` is a call to the C library.
+#[derive(Clone, Copy)]
+struct Portable;
+
+impl Distance for Portable {
+    #[inline(always)]
+    fn l2_sq(self, a: &[f32], b: &[f32]) -> f32 {
+        l2_sq(a, b)
+    }
+
+    #[inline(always)]
+    fn weighted_l2_sq(self, a: &[f32], b: &[f32], weights: &[f32]) -> f32 {
+        weighted_l2_sq(a, b, weights)
+    }
+}
+
+/// Distances with hardware FMA, for builds whose target does not enable it.
+/// Only [`fma_detected`] makes a value.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy)]
+struct Fma(());
+
+#[cfg(target_arch = "x86_64")]
+fn fma_detected() -> Option<Fma> {
+    (!cfg!(target_feature = "fma") && std::is_x86_feature_detected!("fma")).then_some(Fma(()))
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Distance for Fma {
+    #[inline]
+    fn l2_sq(self, a: &[f32], b: &[f32]) -> f32 {
+        #[target_feature(enable = "fma")]
+        fn l2_sq_fma(a: &[f32], b: &[f32]) -> f32 {
+            l2_sq(a, b)
+        }
+        // SAFETY: an `Fma` exists only when the CPU supports FMA.
+        unsafe { l2_sq_fma(a, b) }
+    }
+
+    #[inline]
+    fn weighted_l2_sq(self, a: &[f32], b: &[f32], weights: &[f32]) -> f32 {
+        #[target_feature(enable = "fma")]
+        fn weighted_l2_sq_fma(a: &[f32], b: &[f32], weights: &[f32]) -> f32 {
+            weighted_l2_sq(a, b, weights)
+        }
+        // SAFETY: an `Fma` exists only when the CPU supports FMA.
+        unsafe { weighted_l2_sq_fma(a, b, weights) }
+    }
+}
+
+/// Call `$kernel` with the fastest [`Distance`] that the CPU supports.
+macro_rules! dispatch {
+    ($kernel:ident($($arg:expr),* $(,)?)) => {{
+        #[cfg(target_arch = "x86_64")]
+        if let Some(fma) = fma_detected() {
+            return $kernel(fma, $($arg),*);
+        }
+        $kernel(Portable, $($arg),*)
+    }};
 }
 
 #[inline(always)]
@@ -174,6 +243,18 @@ pub(crate) fn knn(
     k: usize,
     mask: Mask<'_>,
 ) -> Vec<RowHit> {
+    dispatch!(knn_with(vectors, dims, query, weights, k, mask))
+}
+
+fn knn_with(
+    d: impl Distance,
+    vectors: &[f32],
+    dims: usize,
+    query: &[f32],
+    weights: Option<&[f32]>,
+    k: usize,
+    mask: Mask<'_>,
+) -> Vec<RowHit> {
     if k == 0 || vectors.is_empty() {
         return Vec::new();
     }
@@ -183,9 +264,9 @@ pub(crate) fn knn(
     };
     let rows = rows(vectors, dims, mask);
     match weights {
-        None => collect_top_k(rows.map(|(row, v)| hit(row, l2_sq(v, query))), k),
+        None => collect_top_k(rows.map(|(row, v)| hit(row, d.l2_sq(v, query))), k),
         Some(w) => collect_top_k(
-            rows.map(|(row, v)| hit(row, weighted_l2_sq(v, query, w))),
+            rows.map(|(row, v)| hit(row, d.weighted_l2_sq(v, query, w))),
             k,
         ),
     }
@@ -218,24 +299,36 @@ pub(crate) fn region(
     mask: Mask<'_>,
     records: &mut Vec<u32>,
 ) {
+    dispatch!(region_with(vectors, dims, base, disks, mask, records))
+}
+
+fn region_with(
+    d: impl Distance,
+    vectors: &[f32],
+    dims: usize,
+    base: u32,
+    disks: &[DiskSpec<'_>],
+    mask: Mask<'_>,
+    records: &mut Vec<u32>,
+) {
     if vectors.is_empty() {
         return;
     }
     let rows = rows(vectors, dims, mask);
     let found = match disks {
         [disk] if disk.weights.is_none() => single_disk(rows, base, |v| {
-            let dist_sq = l2_sq(v, disk.center);
+            let dist_sq = d.l2_sq(v, disk.center);
             (dist_sq <= disk.radius_sq).then_some(dist_sq)
         }),
         [disk] => single_disk(rows, base, |v| {
-            let dist_sq = distance(v, disk);
+            let dist_sq = d.disk(v, disk);
             (dist_sq <= disk.radius_sq).then_some(dist_sq)
         }),
         disks => rows
             .fold(Vec::new, |mut part: Vec<u32>, (row, v)| {
                 let mut dists = [0u32; MAX_DISKS];
                 let inside = disks.iter().zip(&mut dists).all(|(disk, slot)| {
-                    let dist_sq = distance(v, disk);
+                    let dist_sq = d.disk(v, disk);
                     *slot = dist_sq.to_bits();
                     dist_sq <= disk.radius_sq
                 });
@@ -332,6 +425,34 @@ mod tests {
         let weighted = knn(&VECTORS, DIMS, &origin, Some(&[0.0, 1.0]), 3, Mask::All);
         assert_eq!(rows_of(&weighted), [0, 1, 2]);
         assert!(knn(&VECTORS, DIMS, &origin, None, 0, Mask::All).is_empty());
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn fma_distances_have_the_portable_bits() {
+        let Some(fma) = fma_detected() else { return };
+        let mut x = 0x2545_F491_u32;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            f32::from_bits(x % 0x4F00_0000) - 1e3
+        };
+        for dims in [1, 3, 4, 7, 64, 129] {
+            for _ in 0..200 {
+                let mut values = || (0..dims).map(|_| next()).collect::<Vec<f32>>();
+                let (a, b) = (values(), values());
+                let w: Vec<f32> = values().iter().map(|v| v.abs()).collect();
+                assert_eq!(
+                    fma.l2_sq(&a, &b).to_bits(),
+                    Portable.l2_sq(&a, &b).to_bits()
+                );
+                assert_eq!(
+                    fma.weighted_l2_sq(&a, &b, &w).to_bits(),
+                    Portable.weighted_l2_sq(&a, &b, &w).to_bits()
+                );
+            }
+        }
     }
 
     #[test]

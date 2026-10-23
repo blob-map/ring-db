@@ -197,6 +197,11 @@ The CPU backend is the correctness reference.
 - Ordinary searches use direct coordinate deltas with four independent accumulators.
 - Unweighted KNN accumulates coordinate deltas directly to avoid cancellation.
 - Weighted distance has its own four-accumulator loop.
+- `Distance` selects the kernels' distance functions once per call: on x86-64
+  builds without the `fma` target feature, `Fma` wraps them in
+  `#[target_feature(enable = "fma")]` when the CPU has FMA. Otherwise each
+  `mul_add` is a libm call, 2–10× slower. All paths fuse every `mul_add`, so their
+  bits are identical (`fma_distances_have_the_portable_bits`).
 - Rayon partitions vector or candidate work, at least `MIN_JOB_VALUES` coordinates per
   job, so a small segment scans on one thread instead of waking the pool.
 - `All` retains the existing scan with no candidate branch per row.
