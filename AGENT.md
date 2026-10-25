@@ -151,9 +151,16 @@ must combine adjacent segments only, to keep this property.
   a segment is built or decoded (not stored). `select_range` binary-searches it:
   under 1/64 of rows it sorts the matches, under 1/32 it sets bitmap bits, else it
   scans the column. Bool columns scan.
-- Keyword and Keywords: a sorted per-segment dictionary, per-row sorted term ids,
-  and a CSR inverted index (term → sorted rows). There is no global dictionary,
-  so each segment is self-contained.
+- Keyword and Keywords: a sorted per-segment dictionary, term ids in 1, 2, or 4
+  bytes (the narrowest that holds the dictionary), and an inverted index. When no
+  row has two terms, `ids` has one entry per row (0 = no term, else id + 1) and
+  no offsets; otherwise per-row offsets give each row's sorted ids. Postings are
+  sorted row lists, except terms in more than 1/32 of rows, which are bitmaps
+  (`rows::prefer_dense`). There is no global dictionary, so each segment is
+  self-contained.
+- Offsets (strings, lists, keyword rows, postings) are `u32` until a value needs
+  `u64`. Segment format 2 stores these; format 1 (0.10) is still decoded, with
+  its postings rebuilt, and `compact` rewrites it.
 - Text and Bytes: packed bytes with offsets plus presence; TextList: nested offsets.
 
 `Filter::compile` checks a filter against the schema once per search. The compiled

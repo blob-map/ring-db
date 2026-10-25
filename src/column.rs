@@ -3,17 +3,18 @@
 //! Every column has one entry per row. Missing scalar values are tracked by a
 //! presence bitmap, which is omitted when every row has a value. Numeric
 //! columns keep their rows sorted by value for range filters. Keyword columns
-//! keep a sorted per-segment dictionary and an inverted index.
+//! keep a sorted per-segment dictionary, the term ids of each row in 1, 2 or 4
+//! bytes, and an inverted index whose frequent terms are bitmaps.
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::ops::{Bound, RangeBounds};
+use std::ops::{Bound, Range, RangeBounds};
 
 use bytemuck::Pod;
 use rayon::prelude::*;
 
 use crate::codec::{Decoder, Encoder, ToLe, corrupt};
 use crate::error::Result;
-use crate::rows::RowSet;
+use crate::rows::{RowSet, prefer_dense, word_count};
 use crate::schema::FieldType;
 use crate::value::Value;
 
@@ -154,7 +155,7 @@ impl<T: Copy + PartialOrd + Send + Sync> Scalars<T> {
             rows.sort_unstable();
             return RowSet::from_sorted(n, rows);
         }
-        let mut words = vec![0; crate::rows::word_count(n)];
+        let mut words = vec![0; word_count(n)];
         for &row in rows {
             words[row as usize / 64] |= 1 << (row % 64);
         }
@@ -162,32 +163,114 @@ impl<T: Copy + PartialOrd + Send + Sync> Scalars<T> {
     }
 }
 
+/// Non-decreasing positions, held as `u32` while they fit.
+pub(crate) enum Offsets {
+    U32(Vec<u32>),
+    U64(Vec<u64>),
+}
+
+impl Offsets {
+    /// The offsets of no range: a single zero.
+    fn new() -> Self {
+        Self::U32(vec![0])
+    }
+
+    fn push(&mut self, offset: usize) {
+        match self {
+            Self::U32(offsets) => match u32::try_from(offset) {
+                Ok(offset) => offsets.push(offset),
+                Err(_) => {
+                    let mut wide: Vec<u64> = offsets.iter().map(|&o| u64::from(o)).collect();
+                    wide.push(offset as u64);
+                    *self = Self::U64(wide);
+                }
+            },
+            Self::U64(offsets) => offsets.push(offset as u64),
+        }
+    }
+
+    /// Number of ranges, one less than the number of offsets.
+    fn count(&self) -> usize {
+        match self {
+            Self::U32(offsets) => offsets.len() - 1,
+            Self::U64(offsets) => offsets.len() - 1,
+        }
+    }
+
+    fn get(&self, index: usize) -> usize {
+        match self {
+            Self::U32(offsets) => offsets[index] as usize,
+            Self::U64(offsets) => offsets[index] as usize,
+        }
+    }
+
+    fn range(&self, index: usize) -> Range<usize> {
+        self.get(index)..self.get(index + 1)
+    }
+}
+
+/// Unsigned integers in the narrowest of 1, 2 and 4 bytes that holds them.
+pub(crate) enum Ids {
+    U8(Vec<u8>),
+    U16(Vec<u16>),
+    U32(Vec<u32>),
+}
+
+impl Ids {
+    /// `values`, none of them above `max`.
+    fn new(values: Vec<u32>, max: u32) -> Self {
+        if u8::try_from(max).is_ok() {
+            Self::U8(values.iter().map(|&v| v as u8).collect())
+        } else if u16::try_from(max).is_ok() {
+            Self::U16(values.iter().map(|&v| v as u16).collect())
+        } else {
+            Self::U32(values)
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::U8(ids) => ids.len(),
+            Self::U16(ids) => ids.len(),
+            Self::U32(ids) => ids.len(),
+        }
+    }
+
+    fn get(&self, index: usize) -> u32 {
+        match self {
+            Self::U8(ids) => u32::from(ids[index]),
+            Self::U16(ids) => u32::from(ids[index]),
+            Self::U32(ids) => ids[index],
+        }
+    }
+}
+
 /// Byte strings packed end to end.
 pub(crate) struct Strings {
     /// `len() + 1` offsets into `data`, starting at zero.
-    offsets: Vec<u64>,
+    offsets: Offsets,
     data: Vec<u8>,
 }
 
 impl Strings {
     fn new() -> Self {
         Self {
-            offsets: vec![0],
+            offsets: Offsets::new(),
             data: Vec::new(),
         }
     }
 
     fn push(&mut self, bytes: &[u8]) {
         self.data.extend_from_slice(bytes);
-        self.offsets.push(self.data.len() as u64);
+        self.offsets.push(self.data.len());
     }
 
     fn len(&self) -> usize {
-        self.offsets.len() - 1
+        self.offsets.count()
     }
 
     fn get(&self, index: usize) -> &[u8] {
-        &self.data[self.offsets[index] as usize..self.offsets[index + 1] as usize]
+        &self.data[self.offsets.range(index)]
     }
 
     /// Position of `item` in a sorted list.
@@ -206,35 +289,170 @@ impl Strings {
 }
 
 pub(crate) struct Keywords {
+    rows: usize,
     /// Sorted, unique terms of this segment.
     dict: Strings,
-    /// Per row, a sorted range of `ids`.
-    row_offsets: Vec<u64>,
-    ids: Vec<u32>,
-    /// Per term, a range of `postings` holding its sorted rows.
-    posting_offsets: Vec<u64>,
-    postings: Vec<u32>,
+    /// Term ids. With `offsets`, a sorted range of them per row. Without, one
+    /// per row: zero for no term, and otherwise the term id plus one.
+    ids: Ids,
+    offsets: Option<Offsets>,
+    postings: Postings,
 }
 
 impl Keywords {
+    /// Index the sorted, unique term ids of each row, which refer to `dict`.
+    fn new(dict: Strings, offsets: Offsets, ids: Vec<u32>) -> Self {
+        let rows = offsets.count();
+        let terms = dict.len() as u32;
+        let postings = Postings::new(rows, dict.len(), &offsets, &ids);
+        let (ids, offsets) = if (0..rows).all(|row| offsets.range(row).len() <= 1) {
+            let single = (0..rows)
+                .map(|row| offsets.range(row).next().map_or(0, |index| ids[index] + 1))
+                .collect();
+            (Ids::new(single, terms), None)
+        } else {
+            (Ids::new(ids, terms.saturating_sub(1)), Some(offsets))
+        };
+        Self {
+            rows,
+            dict,
+            ids,
+            offsets,
+            postings,
+        }
+    }
+
+    fn term_ids(&self, row: usize) -> impl Iterator<Item = u32> {
+        let (range, shift) = match &self.offsets {
+            Some(offsets) => (offsets.range(row), 0),
+            None => (row..row + usize::from(self.ids.get(row) != 0), 1),
+        };
+        range.map(move |index| self.ids.get(index) - shift)
+    }
+
     fn terms(&self, row: usize) -> impl Iterator<Item = &str> {
-        let ids = &self.ids[self.row_offsets[row] as usize..self.row_offsets[row + 1] as usize];
-        ids.iter().map(|&id| utf8(self.dict.get(id as usize)))
+        self.term_ids(row)
+            .map(|id| utf8(self.dict.get(id as usize)))
     }
 
     /// Rows holding at least one of `terms`.
     pub(crate) fn select(&self, terms: &[String]) -> RowSet {
-        let universe = self.row_offsets.len() - 1;
-        terms
+        let universe = self.rows;
+        let postings: Vec<Posting<'_>> = terms
             .iter()
             .filter_map(|term| self.dict.find(term.as_bytes()))
-            .map(|id| {
-                let range =
-                    self.posting_offsets[id] as usize..self.posting_offsets[id + 1] as usize;
-                RowSet::from_sorted(universe, self.postings[range].to_vec())
-            })
-            .reduce(RowSet::union)
-            .unwrap_or_else(|| RowSet::empty(universe))
+            .map(|id| self.postings.get(id, universe))
+            .collect();
+        match postings[..] {
+            [] => RowSet::empty(universe),
+            [Posting::Sparse(rows)] => RowSet::from_sorted(universe, rows.to_vec()),
+            [Posting::Dense(words)] => RowSet::from_words(universe, words.to_vec()),
+            _ => {
+                let sparse: usize = postings
+                    .iter()
+                    .map(|posting| match posting {
+                        Posting::Sparse(rows) => rows.len(),
+                        Posting::Dense(_) => 0,
+                    })
+                    .sum();
+                let any_dense = postings.iter().any(|p| matches!(p, Posting::Dense(_)));
+                if any_dense || prefer_dense(universe, sparse) {
+                    let mut words = vec![0; word_count(universe)];
+                    for posting in postings {
+                        match posting {
+                            Posting::Sparse(rows) => rows
+                                .iter()
+                                .for_each(|&row| words[row as usize / 64] |= 1 << (row % 64)),
+                            Posting::Dense(bits) => {
+                                words.iter_mut().zip(bits).for_each(|(a, b)| *a |= b);
+                            }
+                        }
+                    }
+                    RowSet::from_words(universe, words)
+                } else {
+                    let mut rows: Vec<u32> = postings
+                        .iter()
+                        .flat_map(|posting| match posting {
+                            Posting::Sparse(rows) => rows.iter().copied(),
+                            Posting::Dense(_) => [].iter().copied(),
+                        })
+                        .collect();
+                    rows.sort_unstable();
+                    rows.dedup();
+                    RowSet::from_sorted(universe, rows)
+                }
+            }
+        }
+    }
+}
+
+/// The sorted rows of each term: a list, or a bitmap for a term in more than
+/// one row in 32, where a bitmap is smaller.
+struct Postings {
+    /// Per term, a range of `rows`; empty for the terms in `dense`.
+    offsets: Offsets,
+    rows: Vec<u32>,
+    /// Sorted ids of the terms held as bitmaps, with `word_count(rows)` words
+    /// each in `words`.
+    dense: Vec<u32>,
+    words: Vec<u64>,
+}
+
+#[derive(Clone, Copy)]
+enum Posting<'a> {
+    Sparse(&'a [u32]),
+    Dense(&'a [u64]),
+}
+
+impl Postings {
+    fn new(rows: usize, terms: usize, offsets: &Offsets, ids: &[u32]) -> Self {
+        let mut counts = vec![0usize; terms];
+        ids.iter().for_each(|&id| counts[id as usize] += 1);
+        let width = word_count(rows);
+        // Per term, its next position in the list, or the index of its bitmap.
+        let mut slots = Vec::with_capacity(terms);
+        let mut dense = Vec::new();
+        let mut posting_offsets = Offsets::new();
+        let mut listed = 0;
+        for (id, &count) in counts.iter().enumerate() {
+            if prefer_dense(rows, count) {
+                slots.push(Err(dense.len()));
+                dense.push(id as u32);
+            } else {
+                slots.push(Ok(listed));
+                listed += count;
+            }
+            posting_offsets.push(listed);
+        }
+        let mut list = vec![0u32; listed];
+        let mut words = vec![0u64; dense.len() * width];
+        for row in 0..rows {
+            for &id in &ids[offsets.range(row)] {
+                match &mut slots[id as usize] {
+                    Ok(next) => {
+                        list[*next] = row as u32;
+                        *next += 1;
+                    }
+                    Err(bitmap) => words[*bitmap * width + row / 64] |= 1 << (row % 64),
+                }
+            }
+        }
+        Self {
+            offsets: posting_offsets,
+            rows: list,
+            dense,
+            words,
+        }
+    }
+
+    fn get(&self, id: usize, rows: usize) -> Posting<'_> {
+        match self.dense.binary_search(&(id as u32)) {
+            Ok(bitmap) => {
+                let width = word_count(rows);
+                Posting::Dense(&self.words[bitmap * width..(bitmap + 1) * width])
+            }
+            Err(_) => Posting::Sparse(&self.rows[self.offsets.range(id)]),
+        }
     }
 }
 
@@ -251,13 +469,14 @@ impl Blobs {
 
 pub(crate) struct Lists {
     /// Per row, a range of `items`.
-    row_offsets: Vec<u64>,
+    row_offsets: Offsets,
     items: Strings,
 }
 
 impl Lists {
     fn get(&self, row: usize) -> impl Iterator<Item = &[u8]> {
-        (self.row_offsets[row] as usize..self.row_offsets[row + 1] as usize)
+        self.row_offsets
+            .range(row)
             .map(|index| self.items.get(index))
     }
 }
@@ -271,7 +490,7 @@ pub(crate) enum ColumnBuilder {
     Bool(ScalarsBuilder<bool>),
     Keywords {
         local: HashMap<String, u32>,
-        row_offsets: Vec<u64>,
+        row_offsets: Offsets,
         ids: Vec<u32>,
     },
     Blobs {
@@ -279,7 +498,7 @@ pub(crate) enum ColumnBuilder {
         present: PresenceBuilder,
     },
     TextList {
-        row_offsets: Vec<u64>,
+        row_offsets: Offsets,
         items: Strings,
     },
 }
@@ -294,7 +513,7 @@ impl ColumnBuilder {
             FieldType::Bool => Self::Bool(ScalarsBuilder::default()),
             FieldType::Keyword | FieldType::Keywords => Self::Keywords {
                 local: HashMap::new(),
-                row_offsets: vec![0],
+                row_offsets: Offsets::new(),
                 ids: Vec::new(),
             },
             FieldType::Text | FieldType::Bytes => Self::Blobs {
@@ -302,7 +521,7 @@ impl ColumnBuilder {
                 present: PresenceBuilder::default(),
             },
             FieldType::TextList => Self::TextList {
-                row_offsets: vec![0],
+                row_offsets: Offsets::new(),
                 items: Strings::new(),
             },
         }
@@ -339,7 +558,7 @@ impl ColumnBuilder {
                 row.sort_unstable();
                 row.dedup();
                 ids.extend(row);
-                row_offsets.push(ids.len() as u64);
+                row_offsets.push(ids.len());
             }
             (Self::Blobs { items, present }, value) => {
                 let bytes = match &value {
@@ -354,7 +573,7 @@ impl ColumnBuilder {
                 if let Some(Value::TextList(list)) = value {
                     list.iter().for_each(|item| items.push(item.as_bytes()));
                 }
-                row_offsets.push(items.len() as u64);
+                row_offsets.push(items.len());
             }
         }
     }
@@ -383,7 +602,7 @@ impl ColumnBuilder {
 /// Sort the dictionary, renumber the ids, and build the inverted index.
 fn finish_keywords(
     local: HashMap<String, u32>,
-    row_offsets: Vec<u64>,
+    row_offsets: Offsets,
     mut ids: Vec<u32>,
 ) -> Keywords {
     let mut terms: Vec<(String, u32)> = local.into_iter().collect();
@@ -394,34 +613,14 @@ fn finish_keywords(
         renumber[*id as usize] = sorted as u32;
         dict.push(term.as_bytes());
     }
-    let mut counts = vec![0u64; terms.len() + 1];
-    for range in row_offsets.windows(2) {
-        let row_ids = &mut ids[range[0] as usize..range[1] as usize];
+    for row in 0..row_offsets.count() {
+        let row_ids = &mut ids[row_offsets.range(row)];
         row_ids
             .iter_mut()
             .for_each(|id| *id = renumber[*id as usize]);
         row_ids.sort_unstable();
-        row_ids.iter().for_each(|&id| counts[id as usize + 1] += 1);
     }
-    for index in 1..counts.len() {
-        counts[index] += counts[index - 1];
-    }
-    let posting_offsets = counts.clone();
-    let mut postings = vec![0u32; ids.len()];
-    for (row, range) in row_offsets.windows(2).enumerate() {
-        for &id in &ids[range[0] as usize..range[1] as usize] {
-            let slot = &mut counts[id as usize];
-            postings[*slot as usize] = row as u32;
-            *slot += 1;
-        }
-    }
-    Keywords {
-        dict,
-        row_offsets,
-        ids,
-        posting_offsets,
-        postings,
-    }
+    Keywords::new(dict, row_offsets, ids)
 }
 
 #[derive(Default)]
@@ -494,7 +693,7 @@ fn decode_presence(d: &mut Decoder<'_>, rows: usize) -> Result<Presence> {
         0 => Ok(None),
         1 => {
             let words = d.slice::<u64>()?;
-            if words.len() != crate::rows::word_count(rows) {
+            if words.len() != word_count(rows) {
                 return Err(corrupt("presence bitmap has a wrong length"));
             }
             Ok(Some(words))
@@ -504,15 +703,85 @@ fn decode_presence(d: &mut Decoder<'_>, rows: usize) -> Result<Presence> {
 }
 
 /// `offsets` must start at zero, never decrease, and end at `end`.
-fn check_offsets(offsets: &[u64], count: usize, end: usize) -> Result<()> {
-    let valid = offsets.len() == count + 1
-        && offsets[0] == 0
-        && offsets.windows(2).all(|w| w[0] <= w[1])
-        && offsets[count] == end as u64;
-    if valid {
-        Ok(())
-    } else {
-        Err(corrupt("offsets are out of order or out of bounds"))
+fn valid_offsets<T: Copy + Into<u64>>(offsets: &[T], count: usize, end: usize) -> bool {
+    offsets.len().checked_sub(1) == Some(count)
+        && offsets[0].into() == 0
+        && offsets.windows(2).all(|w| w[0].into() <= w[1].into())
+        && offsets[count].into() == end as u64
+}
+
+impl Offsets {
+    fn encode(&self, e: &mut Encoder) {
+        match self {
+            Self::U32(offsets) => {
+                e.u8(4);
+                e.slice(offsets);
+            }
+            Self::U64(offsets) => {
+                e.u8(8);
+                e.slice(offsets);
+            }
+        }
+    }
+
+    /// Read offsets, then check them with [`Offsets::checked`]. Version 1 files
+    /// hold `u64` offsets only.
+    fn read(d: &mut Decoder<'_>, version: u32) -> Result<Self> {
+        let width = if version == 1 { 8 } else { d.u8()? };
+        match width {
+            4 => Ok(Self::U32(d.slice()?)),
+            8 => Ok(Self::U64(d.slice()?)),
+            _ => Err(corrupt("unknown offset width")),
+        }
+    }
+
+    /// These offsets if they hold `count` ranges ending at `end`, as `u32`
+    /// when they fit.
+    fn checked(self, count: usize, end: usize) -> Result<Self> {
+        let valid = match &self {
+            Self::U32(offsets) => valid_offsets(offsets, count, end),
+            Self::U64(offsets) => valid_offsets(offsets, count, end),
+        };
+        match self {
+            _ if !valid => Err(corrupt("offsets are out of order or out of bounds")),
+            Self::U64(offsets) if u32::try_from(end).is_ok() => {
+                Ok(Self::U32(offsets.into_iter().map(|o| o as u32).collect()))
+            }
+            offsets => Ok(offsets),
+        }
+    }
+}
+
+impl Ids {
+    fn encode(&self, e: &mut Encoder) {
+        match self {
+            Self::U8(ids) => {
+                e.u8(1);
+                e.slice(ids);
+            }
+            Self::U16(ids) => {
+                e.u8(2);
+                e.slice(ids);
+            }
+            Self::U32(ids) => {
+                e.u8(4);
+                e.slice(ids);
+            }
+        }
+    }
+
+    /// Decode ids that are all below `limit`.
+    fn decode(d: &mut Decoder<'_>, limit: u64) -> Result<Self> {
+        let ids = match d.u8()? {
+            1 => Self::U8(d.slice()?),
+            2 => Self::U16(d.slice()?),
+            4 => Self::U32(d.slice()?),
+            _ => return Err(corrupt("unknown id width")),
+        };
+        if (0..ids.len()).any(|index| u64::from(ids.get(index)) >= limit) {
+            return Err(corrupt("keyword index refers outside the segment"));
+        }
+        Ok(ids)
     }
 }
 
@@ -537,19 +806,128 @@ impl<T: Pod + ToLe> Scalars<T> {
 
 impl Strings {
     fn encode(&self, e: &mut Encoder) {
-        e.slice(&self.offsets);
+        self.offsets.encode(e);
         e.slice(&self.data);
     }
 
-    fn decode(d: &mut Decoder<'_>, count: usize, utf8: bool) -> Result<Self> {
-        let offsets = d.slice::<u64>()?;
+    fn decode(d: &mut Decoder<'_>, version: u32, count: usize, utf8: bool) -> Result<Self> {
+        let offsets = Offsets::read(d, version)?;
         let data = d.slice::<u8>()?;
-        check_offsets(&offsets, count, data.len())?;
-        let strings = Self { offsets, data };
+        let strings = Self {
+            offsets: offsets.checked(count, data.len())?,
+            data,
+        };
         if utf8 && (0..count).any(|i| std::str::from_utf8(strings.get(i)).is_err()) {
             return Err(corrupt("text is not UTF-8"));
         }
         Ok(strings)
+    }
+}
+
+impl Keywords {
+    fn encode(&self, e: &mut Encoder) {
+        e.u64(self.dict.len() as u64);
+        self.dict.encode(e);
+        e.u8(u8::from(self.offsets.is_some()));
+        self.ids.encode(e);
+        if let Some(offsets) = &self.offsets {
+            offsets.encode(e);
+        }
+        self.postings.encode(e);
+    }
+
+    fn decode(d: &mut Decoder<'_>, version: u32, rows: usize) -> Result<Self> {
+        let terms = usize::try_from(d.u64()?).map_err(|_| corrupt("too many terms"))?;
+        let dict = Strings::decode(d, version, terms, true)?;
+        if (1..terms).any(|i| dict.get(i - 1) >= dict.get(i)) {
+            return Err(corrupt("keyword dictionary is not sorted"));
+        }
+        if version == 1 {
+            return Self::decode_v1(d, dict, rows);
+        }
+        let multi = match d.u8()? {
+            0 => false,
+            1 => true,
+            _ => return Err(corrupt("unknown keyword layout")),
+        };
+        let ids = Ids::decode(d, terms as u64 + u64::from(!multi))?;
+        let offsets = if multi {
+            let offsets = Offsets::read(d, version)?.checked(rows, ids.len())?;
+            let sorted = (0..rows).all(|row| {
+                let range = offsets.range(row);
+                (range.start + 1..range.end).all(|i| ids.get(i - 1) < ids.get(i))
+            });
+            if !sorted {
+                return Err(corrupt("keyword ids of a row are not sorted"));
+            }
+            Some(offsets)
+        } else if ids.len() == rows {
+            None
+        } else {
+            return Err(corrupt("keyword column has a wrong length"));
+        };
+        Ok(Self {
+            rows,
+            dict,
+            ids,
+            offsets,
+            postings: Postings::decode(d, rows, terms)?,
+        })
+    }
+
+    /// The rest of a version 1 column, whose postings are rebuilt.
+    fn decode_v1(d: &mut Decoder<'_>, dict: Strings, rows: usize) -> Result<Self> {
+        let offsets = Offsets::read(d, 1)?;
+        let ids = d.slice::<u32>()?;
+        d.slice::<u64>()?;
+        d.slice::<u32>()?;
+        let offsets = offsets.checked(rows, ids.len())?;
+        let valid = (0..rows).all(|row| {
+            let row_ids = &ids[offsets.range(row)];
+            row_ids.windows(2).all(|w| w[0] < w[1])
+                && row_ids.last().is_none_or(|&id| (id as usize) < dict.len())
+        });
+        if !valid {
+            return Err(corrupt("keyword index refers outside the segment"));
+        }
+        Ok(Self::new(dict, offsets, ids))
+    }
+}
+
+impl Postings {
+    fn encode(&self, e: &mut Encoder) {
+        e.slice(&self.rows);
+        self.offsets.encode(e);
+        e.slice(&self.dense);
+        e.slice(&self.words);
+    }
+
+    fn decode(d: &mut Decoder<'_>, rows: usize, terms: usize) -> Result<Self> {
+        let list = d.slice::<u32>()?;
+        let offsets = Offsets::read(d, 2)?.checked(terms, list.len())?;
+        let dense = d.slice::<u32>()?;
+        let words = d.slice::<u64>()?;
+        let width = word_count(rows);
+        let used = rows % 64;
+        let valid = list.iter().all(|&row| (row as usize) < rows)
+            && (0..terms).all(|id| list[offsets.range(id)].windows(2).all(|w| w[0] < w[1]))
+            && dense.windows(2).all(|w| w[0] < w[1])
+            && dense
+                .iter()
+                .all(|&id| (id as usize) < terms && offsets.range(id as usize).is_empty())
+            && dense.len().checked_mul(width) == Some(words.len())
+            && (used == 0 || words.chunks(width).all(|bits| bits[width - 1] >> used == 0));
+        if !valid {
+            return Err(corrupt(
+                "keyword postings are out of order or out of bounds",
+            ));
+        }
+        Ok(Self {
+            offsets,
+            rows: list,
+            dense,
+            words,
+        })
     }
 }
 
@@ -565,28 +943,27 @@ impl Column {
                 e.slice(&bytes);
                 encode_presence(e, &c.present);
             }
-            Self::Keywords(c) => {
-                e.u64(c.dict.len() as u64);
-                c.dict.encode(e);
-                e.slice(&c.row_offsets);
-                e.slice(&c.ids);
-                e.slice(&c.posting_offsets);
-                e.slice(&c.postings);
-            }
+            Self::Keywords(c) => c.encode(e),
             Self::Blobs(c) => {
                 c.items.encode(e);
                 encode_presence(e, &c.present);
             }
             Self::TextList(c) => {
-                e.slice(&c.row_offsets);
+                c.row_offsets.encode(e);
                 e.u64(c.items.len() as u64);
                 c.items.encode(e);
             }
         }
     }
 
-    /// Decode a column of `rows` rows and check its internal references.
-    pub(crate) fn decode(d: &mut Decoder<'_>, ty: FieldType, rows: usize) -> Result<Self> {
+    /// Decode a column of `rows` rows, written in segment format `version`,
+    /// and check its internal references.
+    pub(crate) fn decode(
+        d: &mut Decoder<'_>,
+        ty: FieldType,
+        rows: usize,
+        version: u32,
+    ) -> Result<Self> {
         Ok(match ty {
             FieldType::U32 => Self::U32(Scalars::decode(d, rows)?.indexed()),
             FieldType::U64 => Self::U64(Scalars::decode(d, rows)?.indexed()),
@@ -610,44 +987,21 @@ impl Column {
                 })
             }
             FieldType::Keyword | FieldType::Keywords => {
-                let terms = usize::try_from(d.u64()?).map_err(|_| corrupt("too many terms"))?;
-                let dict = Strings::decode(d, terms, true)?;
-                if (1..terms).any(|i| dict.get(i - 1) >= dict.get(i)) {
-                    return Err(corrupt("keyword dictionary is not sorted"));
-                }
-                let row_offsets = d.slice::<u64>()?;
-                let ids = d.slice::<u32>()?;
-                let posting_offsets = d.slice::<u64>()?;
-                let postings = d.slice::<u32>()?;
-                check_offsets(&row_offsets, rows, ids.len())?;
-                check_offsets(&posting_offsets, terms, postings.len())?;
-                if ids.iter().any(|&id| id as usize >= terms)
-                    || postings.iter().any(|&row| row as usize >= rows)
-                {
-                    return Err(corrupt("keyword index refers outside the segment"));
-                }
-                Self::Keywords(Keywords {
-                    dict,
-                    row_offsets,
-                    ids,
-                    posting_offsets,
-                    postings,
-                })
+                Self::Keywords(Keywords::decode(d, version, rows)?)
             }
             FieldType::Text | FieldType::Bytes => {
-                let items = Strings::decode(d, rows, ty == FieldType::Text)?;
+                let items = Strings::decode(d, version, rows, ty == FieldType::Text)?;
                 Self::Blobs(Blobs {
                     items,
                     present: decode_presence(d, rows)?,
                 })
             }
             FieldType::TextList => {
-                let row_offsets = d.slice::<u64>()?;
+                let row_offsets = Offsets::read(d, version)?;
                 let count = usize::try_from(d.u64()?).map_err(|_| corrupt("too many items"))?;
-                check_offsets(&row_offsets, rows, count)?;
                 Self::TextList(Lists {
-                    row_offsets,
-                    items: Strings::decode(d, count, true)?,
+                    row_offsets: row_offsets.checked(rows, count)?,
+                    items: Strings::decode(d, version, count, true)?,
                 })
             }
         })
@@ -721,5 +1075,153 @@ mod tests {
                 expected(&floats, range)
             );
         }
+    }
+
+    /// `rows` rows, each holding the terms of `per_row` draws of `term`.
+    fn keyword_rows(
+        rows: usize,
+        per_row: u64,
+        mut term: impl FnMut(usize) -> Option<String>,
+    ) -> Vec<Vec<String>> {
+        (0..rows)
+            .map(|row| (0..per_row).filter_map(|_| term(row)).collect())
+            .collect()
+    }
+
+    #[test]
+    fn keyword_columns_match_a_scan_in_every_layout() {
+        let mut x = 11u64;
+        let mut next = move |n: u64| {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (x >> 33) % n
+        };
+        // About half of the values are `t0`, so `t0` is held as a bitmap.
+        let skewed = |terms: u64, missing: u64| {
+            move |_: usize| match next(10) {
+                n if n < missing => None,
+                n if n < 5 => Some("t0".to_string()),
+                _ => Some(format!("t{}", next(terms))),
+            }
+        };
+        let cases = [
+            (
+                FieldType::Keyword,
+                keyword_rows(1000, 1, skewed(3, 1)),
+                1,
+                false,
+            ),
+            (
+                FieldType::Keyword,
+                keyword_rows(5000, 1, skewed(400, 1)),
+                2,
+                false,
+            ),
+            (
+                FieldType::Keyword,
+                keyword_rows(70_000, 1, |row| Some(format!("r{row}"))),
+                4,
+                false,
+            ),
+            // A Keywords field with at most one term per row has one id per row.
+            (
+                FieldType::Keywords,
+                keyword_rows(1000, 1, skewed(5, 3)),
+                1,
+                false,
+            ),
+            (
+                FieldType::Keywords,
+                keyword_rows(3000, 4, skewed(40, 3)),
+                1,
+                true,
+            ),
+            (
+                FieldType::Keywords,
+                keyword_rows(2000, 3, skewed(400, 2)),
+                2,
+                true,
+            ),
+        ];
+        for (ty, values, width, multi) in cases {
+            let mut builder = ColumnBuilder::new(ty);
+            for terms in &values {
+                builder.push(match (ty, terms.first()) {
+                    (_, None) => None,
+                    (FieldType::Keyword, Some(term)) => Some(Value::Text(term.clone())),
+                    _ => Some(Value::TextList(terms.clone())),
+                });
+            }
+            let built = builder.finish();
+            let mut e = Encoder::default();
+            built.encode(&mut e);
+            let mut d = Decoder::new(e.as_bytes());
+            let decoded = Column::decode(&mut d, ty, values.len(), 2).unwrap();
+            assert!(d.is_empty());
+            let rows: Vec<Vec<String>> = values
+                .iter()
+                .map(|terms| {
+                    let mut terms = terms.clone();
+                    terms.sort();
+                    terms.dedup();
+                    terms
+                })
+                .collect();
+            let distinct = {
+                let mut all: Vec<&String> = rows.iter().flatten().collect();
+                all.sort();
+                all.dedup();
+                all
+            };
+            let queries: Vec<Vec<String>> = (0..40)
+                .map(|i| {
+                    // Many rare terms make a bitmap without a bitmap posting.
+                    let n = [1, 2, 3, 200][i % 4];
+                    (0..n)
+                        .map(|_| match next(8) {
+                            0 if n < 200 => "t0".to_string(),
+                            1 => "absent".to_string(),
+                            _ => distinct[next(distinct.len() as u64) as usize].clone(),
+                        })
+                        .collect()
+                })
+                .collect();
+            for column in [&built, &decoded] {
+                let Column::Keywords(c) = column else {
+                    panic!("a keyword column")
+                };
+                let actual_width = match c.ids {
+                    Ids::U8(_) => 1,
+                    Ids::U16(_) => 2,
+                    Ids::U32(_) => 4,
+                };
+                assert_eq!((actual_width, c.offsets.is_some()), (width, multi));
+                assert_eq!(c.postings.dense.is_empty(), width == 4);
+                for (row, terms) in rows.iter().enumerate() {
+                    assert!(c.terms(row).eq(terms.iter().map(String::as_str)));
+                }
+                for query in &queries {
+                    let expected = (0..rows.len() as u32)
+                        .filter(|&row| rows[row as usize].iter().any(|t| query.contains(t)))
+                        .collect();
+                    assert_eq!(c.select(query), RowSet::from_sorted(rows.len(), expected));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn offsets_widen_past_u32_and_narrow_when_read() {
+        let mut offsets = Offsets::new();
+        offsets.push(5);
+        offsets.push(1 << 33);
+        assert!(matches!(offsets, Offsets::U64(_)));
+        assert_eq!((offsets.count(), offsets.range(1)), (2, 5..1 << 33));
+        assert!(matches!(offsets.checked(2, 1 << 33), Ok(Offsets::U64(_))));
+        let narrow = Offsets::U64(vec![0, 3, 7]).checked(2, 7);
+        assert!(matches!(narrow, Ok(Offsets::U32(o)) if o == [0, 3, 7]));
+        assert!(Offsets::U64(vec![0, 8, 7]).checked(2, 7).is_err());
+        assert!(Offsets::U32(vec![0, 7]).checked(2, 7).is_err());
     }
 }

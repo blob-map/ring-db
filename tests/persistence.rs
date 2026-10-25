@@ -522,3 +522,47 @@ fn background_commit_errors_are_kept() {
     assert!(matches!(error, RingDbError::Io(_)), "{error}");
     assert!(matches!(db.flush(), Err(RingDbError::Io(_))));
 }
+
+/// The changes stored in `tests/data/v0.10`, a database written by ring-db 0.10.
+fn fill_v0_10(db: &Db) {
+    db.add_all((0..200).map(record)).unwrap();
+    db.flush().unwrap();
+    db.add_all((200..300).map(record)).unwrap();
+    db.add_all((300..305).map(|i| Record::new([i as f32, 0.0])))
+        .unwrap();
+    db.flush().unwrap();
+    for key in (0..305).step_by(11) {
+        db.delete(Key::new(key)).unwrap();
+    }
+    db.flush().unwrap();
+}
+
+#[test]
+fn databases_written_by_0_10_open() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/v0.10");
+    let reference = Db::in_memory(schema(), manual()).unwrap();
+    fill_v0_10(&reference);
+    let filters = [
+        Filter::eq("city", "Lyon"),
+        Filter::eq("city", "Paris") | Filter::eq("tags", "t3"),
+        !Filter::eq("tags", "t0") & Filter::range("rooms", 1..),
+        Filter::eq("tags", "t5") | Filter::eq("tags", "t1") | Filter::eq("tags", "t2"),
+    ];
+    let check = |db: &Db| {
+        assert_eq!(contents(db), contents(&reference));
+        for filter in &filters {
+            assert_eq!(db.count(filter).unwrap(), reference.count(filter).unwrap());
+        }
+    };
+    check(&Db::open_read_only(&fixture, schema(), manual()).unwrap());
+    // A compaction rewrites the files in the current format.
+    let dir = tempfile::tempdir().unwrap();
+    for name in files(&fixture) {
+        fs::copy(fixture.join(&name), dir.path().join(&name)).unwrap();
+    }
+    let db = open(dir.path());
+    check(&db);
+    db.compact().unwrap();
+    drop(db);
+    check(&open(dir.path()));
+}

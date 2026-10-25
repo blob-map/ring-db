@@ -95,10 +95,23 @@ impl<'a> Decoder<'a> {
 
     /// Check a header written by [`Encoder::header`].
     pub(crate) fn header(&mut self, magic: &[u8; 8], version: u32, what: &str) -> Result<()> {
-        if self.take(8)? != magic || self.u32()? != version {
+        self.header_versions(magic, version..=version, what)
+            .map(drop)
+    }
+
+    /// Check a header written by [`Encoder::header`] with one of `versions`,
+    /// and return its version.
+    pub(crate) fn header_versions(
+        &mut self,
+        magic: &[u8; 8],
+        versions: std::ops::RangeInclusive<u32>,
+        what: &str,
+    ) -> Result<u32> {
+        let (stored, version) = (self.take(8)?, self.u32()?);
+        if stored != magic || !versions.contains(&version) {
             return Err(corrupt(format!("{what} has an unknown format")));
         }
-        Ok(())
+        Ok(version)
     }
 
     fn take(&mut self, len: usize) -> Result<&'a [u8]> {
@@ -175,7 +188,7 @@ macro_rules! to_le {
     )*};
 }
 
-to_le!(u8, u32, u64, i64, f32);
+to_le!(u8, u16, u32, u64, i64, f32);
 
 impl ToLe for crate::query::Key {
     fn put_le(self, out: &mut Vec<u8>) {

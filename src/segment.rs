@@ -11,7 +11,9 @@ use crate::schema::Schema;
 use crate::value::Row;
 
 const MAGIC: &[u8; 8] = b"RDBSEG\0\0";
-const VERSION: u32 = 1;
+/// Version 2 has compact keyword columns and `u32` offsets. Version 1 files,
+/// written by ring-db 0.10, are still read.
+const VERSION: u32 = 2;
 
 /// Records sorted by key, with row-major vectors and one column per field.
 pub(crate) struct Segment {
@@ -56,7 +58,7 @@ impl Segment {
     pub(crate) fn decode(bytes: &[u8], schema: &Schema, id: u64) -> Result<Self> {
         let what = format!("segment {id}");
         let mut d = Decoder::with_crc(bytes, &what)?;
-        d.header(MAGIC, VERSION, &what)?;
+        let version = d.header_versions(MAGIC, 1..=VERSION, &what)?;
         let (stored_id, dims, columns) = (d.u64()?, d.u32()? as usize, d.u32()? as usize);
         if stored_id != id || dims != schema.dims() || columns != schema.len() {
             return Err(corrupt(format!("{what} does not match the manifest")));
@@ -71,7 +73,7 @@ impl Segment {
             return Err(corrupt(format!("{what} has invalid vectors")));
         }
         let columns = (0..columns)
-            .map(|field| Column::decode(&mut d, schema.ty(field), rows))
+            .map(|field| Column::decode(&mut d, schema.ty(field), rows, version))
             .collect::<Result<_>>()?;
         if !d.is_empty() {
             return Err(corrupt(format!("{what} has trailing data")));

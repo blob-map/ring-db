@@ -40,7 +40,7 @@ ring-db = "0.10"
 
 The crate name is `ring-db`, and the library name is `ringdb`.
 You do not need a GPU, a Vulkan SDK, or Cargo features to use the CPU.
-To update from version 0.9, read [MIGRATING.md](MIGRATING.md).
+To update from an earlier version, read [MIGRATING.md](MIGRATING.md).
 
 ## Quick start
 
