@@ -406,7 +406,7 @@ fn read_only_opens_need_an_existing_database() {
         db.add_all((0..5).map(record)).unwrap();
     }
     assert!(matches!(
-        Db::open_read_only(dir.path(), Schema::new(3), manual()),
+        retry(|| Db::open_read_only(dir.path(), Schema::new(3), manual())),
         Err(RingDbError::InvalidSchema(_))
     ));
     // A backup has no LOCK file.
