@@ -347,7 +347,9 @@ no anonymous copy; `is_mapped` stops a retry from rewriting a mapped file. After
 `Segment::upload`, `release_vectors` drops the mapped vector pages from the
 process (`MADV_DONTNEED`); CPU searches fault them back. The Vulkan upload stages
 `UPLOAD_STAGING_BYTES` of rows at a time and copies each dimension's run with
-one `copy_regions` submission, so host memory stays bounded. Removing a mapped file
+one `copy_regions` submission, so host memory stays bounded. Region searches
+read records in batches of slots (`slot_base` up to `work_count`) whose output
+fits `REGION_OUTPUT_BYTES`, so the output and readback buffers stay bounded. Removing a mapped file
 can fail on Windows; `remove_segment` ignores the error, and the next open
 removes the file.
 

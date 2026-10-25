@@ -49,8 +49,8 @@ float distance_sq(uint id, uint disk) {
 
 void main() {
     uint group = group_index();
-    if (group >= group_count(p.work_count)) return;
-    uint slot = group * 128u + gl_LocalInvocationID.x;
+    if (group >= group_count(p.work_count - p.slot_base)) return;
+    uint slot = p.slot_base + group * 128u + gl_LocalInvocationID.x;
     if (slot >= p.work_count) return;
     if (p.mode == 1u) {
         scratch_word(2ul * slot).value = INVALID;
