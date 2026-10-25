@@ -52,7 +52,8 @@ impl<'a> Metric<'a> {
 
 /// Exact k-nearest-neighbor search.
 ///
-/// Returns up to `k` records ordered by ascending `(dist_sq, key)`.
+/// Returns up to `k` records ordered by ascending `(dist_sq, key)`. A record
+/// whose squared distance overflows `f32` is never returned, as in a [`Region`].
 #[derive(Debug, Clone, Copy)]
 pub struct Knn<'a> {
     pub(crate) query: &'a [f32],

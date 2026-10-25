@@ -153,6 +153,9 @@ fn unweighted_distances_use_direct_differences() {
     let db = cpu(&[vec![f32::MAX], vec![-f32::MAX]]);
     let inside = db.search(Disk::new(&[f32::MAX], 0.0)).unwrap();
     assert_eq!(region_keys(&inside), [0]);
+    // The distance to key 1 overflows to infinity.
+    let hits = db.search(Knn::new(&[f32::MAX], 2)).unwrap();
+    assert_eq!(knn_keys(&hits), [0]);
 }
 
 #[test]

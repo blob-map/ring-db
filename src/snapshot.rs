@@ -178,10 +178,16 @@ impl Snapshot {
         let mut hits = Vec::new();
         for (_, segment, rows) in &eligible {
             let found = segment.knn(query.query, weights, query.k, rows)?;
-            hits.extend(found.into_iter().map(|hit| Hit {
-                key: segment.keys[hit.row as usize],
-                dist_sq: hit.dist_sq,
-            }));
+            // Overflowing distances rank last, so dropping them keeps the best.
+            hits.extend(
+                found
+                    .into_iter()
+                    .filter(|hit| hit.dist_sq.is_finite())
+                    .map(|hit| Hit {
+                        key: segment.keys[hit.row as usize],
+                        dist_sq: hit.dist_sq,
+                    }),
+            );
         }
         if eligible.len() > 1 {
             // Within a segment, row order is key order; restore it across them.
