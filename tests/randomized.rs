@@ -126,6 +126,10 @@ fn knn_and_regions_match_the_reference_for_every_filter_and_metric() {
             })
             .collect();
         for (filter, members) in filters(case.vectors.len() as u64) {
+            if let Some(filter) = &filter {
+                let expected = members.iter().filter(|m| **m).count();
+                assert_eq!(case.db.count(filter).unwrap(), expected);
+            }
             for weights in metrics {
                 for k in [0, 1, 7, 200] {
                     let mut query = Knn::new(&centers[0], k);
@@ -153,7 +157,7 @@ fn knn_and_regions_match_the_reference_for_every_filter_and_metric() {
                 if let Some(filter) = &filter {
                     region = region.filter(filter);
                 }
-                let result = case.db.search(region).unwrap();
+                let result = case.db.search(region.clone()).unwrap();
                 let expected: Vec<(u64, Vec<f64>)> = case
                     .vectors
                     .iter()
@@ -168,6 +172,7 @@ fn knn_and_regions_match_the_reference_for_every_filter_and_metric() {
                         inside.then_some((id as u64, dists))
                     })
                     .collect();
+                assert_eq!(case.db.search(region.count()).unwrap(), expected.len());
                 let actual = common::region_rows(&result);
                 assert_eq!(
                     actual.iter().map(|r| r.0).collect::<Vec<_>>(),

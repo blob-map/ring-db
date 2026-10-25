@@ -26,6 +26,10 @@ pub enum RingDbError {
     #[error("no record has key {0}")]
     KeyNotFound(u64),
 
+    /// A write to a database opened with [`Db::open_read_only`](crate::Db::open_read_only).
+    #[error("the database is open read-only")]
+    ReadOnly,
+
     #[error("backend unavailable: {0}")]
     BackendUnavailable(String),
 

@@ -1,18 +1,20 @@
 //! Consistent read views of a database, and the searches that run on them.
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use smallvec::SmallVec;
 
 use crate::backend::DiskSpec;
+use crate::column::Column;
 use crate::error::{Result, RingDbError};
 use crate::filter::Filter;
 use crate::query::{
-    Hit, Key, KeyLookup, Knn, MAX_DISKS, Query, Region, RegionResult, validate_disk,
+    Facets, Hit, Key, KeyLookup, Knn, MAX_DISKS, Query, Region, RegionResult, validate_disk,
     validate_metric, validate_vector,
 };
 use crate::rows::RowSet;
-use crate::schema::Schema;
+use crate::schema::{FieldType, Schema};
 use crate::segment::Segment;
 use crate::value::Document;
 
@@ -73,18 +75,19 @@ impl Snapshot {
                 base += part.segment.len() as u32;
                 entry
             })
-            .collect();
+            .collect::<Vec<_>>();
         let len = parts.iter().map(Part::live).sum();
         Self(Arc::new(View {
             schema,
             parts,
-            keys: KeyLookup(keys),
+            keys: KeyLookup::new(keys),
             len,
             rows: base as usize,
         }))
     }
 
-    /// Run a [`Knn`], [`Disk`](crate::Disk), or [`Region`] search.
+    /// Run a [`Knn`], [`Disk`](crate::Disk), [`Region`],
+    /// [`Count`](crate::Count), or [`Facets`] search.
     pub fn search<Q: Query>(&self, query: Q) -> Result<Q::Output> {
         query.execute(self)
     }
@@ -100,6 +103,12 @@ impl Snapshot {
 
     pub fn len(&self) -> usize {
         self.0.len
+    }
+
+    /// Number of records that pass `filter`. No vector is read.
+    pub fn count(&self, filter: &Filter) -> Result<usize> {
+        let eligible = self.eligible(Some(filter))?;
+        Ok(eligible.iter().map(|(_, _, rows)| rows.len()).sum())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -171,10 +180,16 @@ impl Snapshot {
         let mut hits = Vec::new();
         for (_, segment, rows) in &eligible {
             let found = segment.knn(query.query, weights, query.k, rows)?;
-            hits.extend(found.into_iter().map(|hit| Hit {
-                key: segment.keys[hit.row as usize],
-                dist_sq: hit.dist_sq,
-            }));
+            // Overflowing distances rank last, so dropping them keeps the best.
+            hits.extend(
+                found
+                    .into_iter()
+                    .filter(|hit| hit.dist_sq.is_finite())
+                    .map(|hit| Hit {
+                        key: segment.keys[hit.row as usize],
+                        dist_sq: hit.dist_sq,
+                    }),
+            );
         }
         if eligible.len() > 1 {
             // Within a segment, row order is key order; restore it across them.
@@ -188,7 +203,7 @@ impl Snapshot {
         Ok(hits)
     }
 
-    pub(crate) fn region(&self, region: &Region<'_>) -> Result<RegionResult> {
+    fn disks<'a>(&self, region: &Region<'a>) -> Result<SmallVec<[DiskSpec<'a>; 1]>> {
         if region.disks.len() > MAX_DISKS {
             return Err(RingDbError::InvalidQuery(format!(
                 "a region can contain at most {MAX_DISKS} disks, got {}",
@@ -196,16 +211,90 @@ impl Snapshot {
             )));
         }
         let dims = self.0.schema.dims();
-        let disks: SmallVec<[DiskSpec<'_>; 1]> = region
+        region
             .disks
             .iter()
             .map(|disk| validate_disk(dims, disk))
-            .collect::<Result<_>>()?;
+            .collect()
+    }
+
+    pub(crate) fn region(&self, region: &Region<'_>) -> Result<RegionResult> {
+        let disks = self.disks(region)?;
         let eligible = self.eligible(region.filter)?;
         let mut out = RegionResult::new(disks.len(), self.0.keys.clone());
         for (base, segment, rows) in &eligible {
             segment.region(*base, &disks, rows, &mut out.records)?;
         }
         Ok(out)
+    }
+
+    pub(crate) fn region_count(&self, region: &Region<'_>) -> Result<usize> {
+        let disks = self.disks(region)?;
+        let mut count = 0;
+        for (_, segment, rows) in &self.eligible(region.filter)? {
+            count += segment.region_count(&disks, rows)?;
+        }
+        Ok(count)
+    }
+
+    pub(crate) fn facets(&self, query: &Facets<'_>) -> Result<Vec<Vec<(String, usize)>>> {
+        let fields = query
+            .fields
+            .iter()
+            .map(|name| match self.0.schema.lookup(name)? {
+                (field, FieldType::Keyword | FieldType::Keywords) => Ok(field),
+                _ => Err(RingDbError::InvalidQuery(format!(
+                    "facets need a Keyword or Keywords field, and '{name}' is not one"
+                ))),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let disks = query
+            .region
+            .as_ref()
+            .map(|region| self.disks(region))
+            .transpose()?;
+        let mut totals: Vec<HashMap<&str, usize>> = vec![HashMap::new(); fields.len()];
+        let mut records = Vec::new();
+        for (_, segment, rows) in &self.eligible(query.filter)? {
+            let hits: Vec<u32> = match &disks {
+                None => Vec::new(),
+                Some(disks) => {
+                    records.clear();
+                    segment.region(0, disks, rows, &mut records)?;
+                    records.iter().step_by(1 + disks.len()).copied().collect()
+                }
+            };
+            for (&field, total) in fields.iter().zip(&mut totals) {
+                let Column::Keywords(column) = &segment.columns[field] else {
+                    unreachable!("keyword fields have keyword columns")
+                };
+                let counts = match (&disks, rows.mask()) {
+                    (Some(_), _) => column.count_rows(&hits),
+                    (None, Some(mask)) => column.term_counts(mask),
+                    (None, None) => continue,
+                };
+                for (id, &count) in counts.iter().enumerate().filter(|(_, c)| **c > 0) {
+                    *total.entry(column.term(id)).or_default() += count as usize;
+                }
+            }
+        }
+        Ok(totals
+            .into_iter()
+            .map(|total| {
+                let mut values: Vec<(&str, usize)> = total.into_iter().collect();
+                let order = |a: &(&str, usize), b: &(&str, usize)| b.1.cmp(&a.1).then(a.0.cmp(b.0));
+                if let Some(n) = query.top.filter(|&n| n < values.len()) {
+                    if n > 0 {
+                        values.select_nth_unstable_by(n - 1, order);
+                    }
+                    values.truncate(n);
+                }
+                values.sort_unstable_by(order);
+                values
+                    .into_iter()
+                    .map(|(value, count)| (value.to_string(), count))
+                    .collect()
+            })
+            .collect())
     }
 }

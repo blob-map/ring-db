@@ -11,6 +11,7 @@ use crate::backend::VulkanDevice;
 use crate::codec::corrupt;
 use crate::config::{BackendPreference, Options};
 use crate::error::{Result, RingDbError};
+use crate::filter::Filter;
 use crate::query::{Key, Query};
 use crate::schema::Schema;
 use crate::segment::{Segment, SegmentBuilder};
@@ -52,13 +53,17 @@ struct Shared {
     schema: Arc<Schema>,
     options: Options,
     device: Option<Arc<VulkanDevice>>,
-    /// The database directory, or `None` in memory.
+    /// The database directory, or `None` in memory or read-only.
     dir: Option<PathBuf>,
+    /// Set when the database is open read-only.
+    read_only: Option<store::ReadLock>,
     next_segment: AtomicU64,
     writer: Mutex<Writer>,
     current: RwLock<Snapshot>,
     /// Held while a merge builds, so that only one merge runs at a time.
     merging: Mutex<()>,
+    /// The last error of the commit thread, not yet taken.
+    background_error: Mutex<Option<RingDbError>>,
 }
 
 /// Changes since the last commit. Lock `writer` before `current`.
@@ -181,19 +186,74 @@ impl Db {
     /// Open the durable database in directory `path`, or create it there.
     ///
     /// An existing database must have exactly `schema`; otherwise this returns
-    /// [`RingDbError::InvalidSchema`]. Only one `Db` can have a directory open:
-    /// a second open returns an [`RingDbError::Io`] error. Opening recovers the
-    /// changes that were synced but not yet committed and commits them.
+    /// [`RingDbError::InvalidSchema`]. Only one `Db` can have a directory open
+    /// for writing: another open returns an [`RingDbError::Io`] error. Opening
+    /// recovers the changes that were synced but not yet committed and commits
+    /// them.
     pub fn open(path: impl AsRef<Path>, schema: Schema, options: Options) -> Result<Self> {
         schema.validate()?;
         let (store, recovered) = Store::open(path.as_ref(), &schema)?;
-        Self::start(schema, options, Some((store, recovered)))
+        Self::start(schema, options, Some((Opened::Write(store), recovered)))
+    }
+
+    /// Open the durable database in directory `path` without changing any of
+    /// its files, for example on a read-only mount.
+    ///
+    /// The database must exist and have exactly `schema`. Changes that are
+    /// logged but not committed are visible, and kept in memory only. Every
+    /// write, including [`flush`](Self::flush), [`compact`](Self::compact), and
+    /// [`backup`](Self::backup), returns [`RingDbError::ReadOnly`]. Several
+    /// read-only `Db`s can share a directory, but not with a `Db` that writes.
+    pub fn open_read_only(
+        path: impl AsRef<Path>,
+        schema: Schema,
+        options: Options,
+    ) -> Result<Self> {
+        schema.validate()?;
+        let (lock, recovered) = store::open_read_only(path.as_ref(), &schema)?;
+        Self::start(schema, options, Some((Opened::Read(lock), recovered)))
+    }
+
+    /// Create a durable database in directory `path` that holds `records`.
+    ///
+    /// This is faster than adding the records to an open database, and needs
+    /// less memory: ring-db writes the records to one segment file, and not
+    /// to the log. `path` must not exist or must be empty. The records get the
+    /// keys 0, 1, 2, and so on, in order. Of `options`, only the record size
+    /// limit applies. Returns the number of records.
+    ///
+    /// Open the database after with [`Db::open`] or [`Db::open_read_only`].
+    /// If the import fails, delete the directory before you try again.
+    pub fn import(
+        path: impl AsRef<Path>,
+        schema: Schema,
+        options: Options,
+        records: impl IntoIterator<Item = Record>,
+    ) -> Result<usize> {
+        schema.validate()?;
+        let import = store::Import::start(path.as_ref())?;
+        let mut builder = SegmentBuilder::new(&schema);
+        for (key, record) in (0..).zip(records) {
+            if builder.len() + 1 >= u32::MAX as usize {
+                return Err(RingDbError::InvalidRecord(
+                    "a database holds at most u32::MAX - 1 rows".to_string(),
+                ));
+            }
+            builder.push(
+                Key(key),
+                record.validate(&schema, options.max_record_bytes)?,
+            );
+        }
+        let count = builder.len();
+        let segment = (!builder.is_empty()).then(|| builder.finish(0));
+        import.finish(&schema, segment.as_ref(), count as u64)?;
+        Ok(count)
     }
 
     fn start(
         schema: Schema,
         options: Options,
-        storage: Option<(Store, store::Recovered)>,
+        storage: Option<(Opened, store::Recovered)>,
     ) -> Result<Self> {
         let device = match options.backend {
             BackendPreference::Cpu => None,
@@ -212,7 +272,8 @@ impl Db {
         let mut next_segment = 0;
         let mut changes = Vec::new();
         let mut dir = None;
-        if let Some((store, recovered)) = storage {
+        let mut read_only = None;
+        if let Some((opened, recovered)) = storage {
             let manifest = recovered.manifest;
             for (mut segment, (_, deleted)) in recovered.segments.into_iter().zip(manifest.parts) {
                 if segment.id >= manifest.next_segment {
@@ -224,8 +285,13 @@ impl Db {
             writer.next_key = manifest.next_key;
             next_segment = manifest.next_segment;
             changes = recovered.changes;
-            dir = Some(store.dir().to_path_buf());
-            writer.store = Some(store);
+            match opened {
+                Opened::Write(store) => {
+                    dir = Some(store.dir().to_path_buf());
+                    writer.store = Some(store);
+                }
+                Opened::Read(lock) => read_only = Some(lock),
+            }
         }
         let current = Snapshot::new(schema.clone(), parts);
         writer.replay(changes, &current)?;
@@ -233,8 +299,10 @@ impl Db {
             writer: Mutex::new(writer),
             current: RwLock::new(current),
             merging: Mutex::new(()),
+            background_error: Mutex::new(None),
             next_segment: AtomicU64::new(next_segment),
             dir,
+            read_only,
             schema,
             options,
             device,
@@ -243,6 +311,7 @@ impl Db {
         let committer = shared
             .options
             .commit_interval
+            .filter(|_| shared.read_only.is_none())
             .map(|interval| Committer::start(shared.clone(), interval));
         Ok(Self { shared, committer })
     }
@@ -281,6 +350,7 @@ impl Db {
     /// returns an error and makes no change.
     pub fn apply(&self, batch: Batch) -> Result<Vec<Key>> {
         let shared = &self.shared;
+        shared.writable()?;
         let rows = batch
             .adds
             .into_iter()
@@ -326,12 +396,14 @@ impl Db {
     /// Commit every change now. With [`Options::auto_merge`], then merge
     /// segments as the merge policy asks.
     pub fn flush(&self) -> Result<()> {
+        self.shared.writable()?;
         self.shared.flush()
     }
 
     /// Commit, then merge all segments into one without deleted rows. Searches
     /// are fastest on a single segment, for example after a bulk import.
     pub fn compact(&self) -> Result<()> {
+        self.shared.writable()?;
         self.shared.commit()?;
         self.shared.merge(|parts| {
             (parts.len() > 1 || parts.iter().any(|p| !p.deleted.is_empty()))
@@ -344,6 +416,7 @@ impl Db {
     /// files are copied. An in-memory database returns an [`RingDbError::Io`]
     /// error of kind `Unsupported`.
     pub fn backup(&self, dest: impl AsRef<Path>) -> Result<()> {
+        self.shared.writable()?;
         self.shared.commit()?;
         let writer = lock(&self.shared.writer);
         let Some(store) = &writer.store else {
@@ -366,13 +439,19 @@ impl Db {
         self.shared.snapshot()
     }
 
-    /// Run a [`Knn`](crate::Knn), [`Disk`](crate::Disk), or [`Region`](crate::Region) search.
+    /// Run a [`Knn`](crate::Knn), [`Disk`](crate::Disk), [`Region`](crate::Region),
+    /// or [`Count`](crate::Count) search.
     pub fn search<Q: Query>(&self, query: Q) -> Result<Q::Output> {
         self.snapshot().search(query)
     }
 
     pub fn get(&self, key: Key) -> Result<Document> {
         self.snapshot().get(key)
+    }
+
+    /// Number of visible records that pass `filter`. No vector is read.
+    pub fn count(&self, filter: &Filter) -> Result<usize> {
+        self.snapshot().count(filter)
     }
 
     /// Number of visible records.
@@ -390,6 +469,13 @@ impl Db {
 
     pub fn backend(&self) -> BackendPreference {
         self.shared.options.backend
+    }
+
+    /// Take the last error of a background commit or merge, if one failed
+    /// since the previous call. The changes of a failed commit stay pending,
+    /// and the next commit retries them.
+    pub fn take_background_error(&self) -> Option<RingDbError> {
+        lock(&self.shared.background_error).take()
     }
 }
 
@@ -414,17 +500,28 @@ impl Shared {
             .clone()
     }
 
+    fn writable(&self) -> Result<()> {
+        match self.read_only {
+            Some(_) => Err(RingDbError::ReadOnly),
+            None => Ok(()),
+        }
+    }
+
     fn segment_id(&self) -> u64 {
         self.next_segment.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Upload `segment` and write its file, as configured.
+    /// Write the file of `segment` and upload it, as configured. A written
+    /// segment is then read from its mapped file, so that the kernel can evict
+    /// its pages.
     fn prepare(&self, segment: &mut Segment) -> Result<()> {
-        upload(self.device.as_ref(), &self.options, segment)?;
-        if let Some(dir) = &self.dir {
+        if let Some(dir) = &self.dir
+            && !segment.is_mapped()
+        {
             store::write_segment(dir, segment)?;
+            *segment = store::read_segment(dir, &self.schema, segment.id)?;
         }
-        Ok(())
+        upload(self.device.as_ref(), &self.options, segment)
     }
 
     fn manifest(&self, writer: &Writer, parts: &[Part]) -> Manifest {
@@ -516,12 +613,11 @@ impl Shared {
     fn build_merge(&self, inputs: &[Part]) -> Result<Option<Segment>> {
         let mut builder = SegmentBuilder::new(&self.schema);
         for part in inputs {
-            for row in 0..part.segment.len() as u32 {
-                if !part.is_deleted(row) {
-                    let key = part.segment.keys[row as usize];
-                    builder.push(key, part.segment.read(&self.schema, row as usize));
-                }
-            }
+            let mut deleted = part.deleted.iter().peekable();
+            let live: Vec<u32> = (0..part.segment.len() as u32)
+                .filter(|row| deleted.next_if_eq(&row).is_none())
+                .collect();
+            builder.extend_from(&part.segment, &live);
         }
         if builder.is_empty() {
             return Ok(None);
@@ -628,6 +724,12 @@ fn merge_range(parts: &[Part]) -> Option<Range<usize>> {
     (start < last).then_some(start..last + 1)
 }
 
+/// How [`Db::start`] reaches the files of a durable database.
+enum Opened {
+    Write(Store),
+    Read(store::ReadLock),
+}
+
 /// Commits in the background every `interval` until stopped.
 struct Committer {
     stop: Arc<(Mutex<bool>, Condvar)>,
@@ -650,9 +752,11 @@ impl Committer {
                         .0;
                     if !*stopped {
                         drop(stopped);
-                        // A failure leaves the changes pending; the next
-                        // commit or `flush` retries and reports it.
-                        let _ = shared.flush();
+                        // A failure leaves the changes pending, and the
+                        // next commit retries them.
+                        if let Err(error) = shared.flush() {
+                            *lock(&shared.background_error) = Some(error);
+                        }
                         stopped = lock(&signal.0);
                     }
                 }

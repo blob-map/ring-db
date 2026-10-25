@@ -677,20 +677,44 @@ impl Execution {
 
     /// Copy `size` bytes from `offset` in `src` to the start of `dst`.
     pub fn copy(&mut self, src: &Buffer, offset: usize, dst: &Buffer, size: usize) -> Result<()> {
-        if offset > src.size || size > src.size - offset || size > dst.size {
+        self.copy_regions(src, dst, &[(offset, 0, size)])
+    }
+
+    /// Copy each `(src_offset, dst_offset, size)` region of `src` to `dst`, in
+    /// one submission.
+    pub fn copy_regions(
+        &mut self,
+        src: &Buffer,
+        dst: &Buffer,
+        regions: &[(usize, usize, usize)],
+    ) -> Result<()> {
+        let fits = |offset: usize, size: usize, buffer: &Buffer| {
+            offset <= buffer.size && size <= buffer.size - offset
+        };
+        if regions
+            .iter()
+            .any(|&(from, to, size)| !fits(from, size, src) || !fits(to, size, dst))
+        {
             return Err(backend_error("buffer copy exceeds allocation"));
         }
-        if size == 0 {
+        let regions: Vec<vk::BufferCopy> = regions
+            .iter()
+            .filter(|&&(_, _, size)| size > 0)
+            .map(|&(from, to, size)| {
+                vk::BufferCopy::default()
+                    .src_offset(from as u64)
+                    .dst_offset(to as u64)
+                    .size(size as u64)
+            })
+            .collect();
+        if regions.is_empty() {
             return Ok(());
         }
-        let region = vk::BufferCopy::default()
-            .src_offset(offset as u64)
-            .size(size as u64);
         let context = self.context.clone();
         self.run("copy", |cmd| unsafe {
             context
                 .device
-                .cmd_copy_buffer(cmd, src.raw, dst.raw, &[region]);
+                .cmd_copy_buffer(cmd, src.raw, dst.raw, &regions);
         })
     }
 }

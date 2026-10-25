@@ -4,6 +4,7 @@ use std::sync::Arc;
 use smallvec::SmallVec;
 
 use crate::backend::DiskSpec;
+use crate::buf::Buf;
 use crate::error::{Result, RingDbError};
 use crate::filter::Filter;
 use crate::snapshot::Snapshot;
@@ -52,7 +53,8 @@ impl<'a> Metric<'a> {
 
 /// Exact k-nearest-neighbor search.
 ///
-/// Returns up to `k` records ordered by ascending `(dist_sq, key)`.
+/// Returns up to `k` records ordered by ascending `(dist_sq, key)`. A record
+/// whose squared distance overflows `f32` is never returned, as in a [`Region`].
 #[derive(Debug, Clone, Copy)]
 pub struct Knn<'a> {
     pub(crate) query: &'a [f32],
@@ -120,6 +122,18 @@ impl<'a> Disk<'a> {
     pub fn filter(self, filter: &'a Filter) -> Region<'a> {
         Region::from(self).filter(filter)
     }
+
+    /// Count the records inside this disk.
+    #[must_use]
+    pub fn count(self) -> Count<'a> {
+        Region::from(self).count()
+    }
+
+    /// Count the values of keyword `fields` among the records inside this disk.
+    #[must_use]
+    pub fn facets(self, fields: &'a [&'a str]) -> Facets<'a> {
+        Region::from(self).facets(fields)
+    }
 }
 
 /// Every record inside all of its disks. It always contains at least one disk.
@@ -146,6 +160,99 @@ impl<'a> Region<'a> {
     pub fn disks(&self) -> &[Disk<'a>] {
         &self.disks
     }
+
+    /// Count the records inside this region, without returning them.
+    #[must_use]
+    pub fn count(self) -> Count<'a> {
+        Count(self)
+    }
+
+    /// Count the values of keyword `fields` among the records inside this
+    /// region.
+    #[must_use]
+    pub fn facets(self, fields: &'a [&'a str]) -> Facets<'a> {
+        Facets {
+            fields,
+            filter: self.filter,
+            region: Some(Self {
+                filter: None,
+                ..self
+            }),
+            top: None,
+        }
+    }
+}
+
+/// The number of records inside a [`Region`]. Faster than the length of a
+/// [`RegionResult`], because no record is returned.
+///
+/// ```
+/// use ringdb::{Db, Disk, Options, Record, Schema};
+///
+/// let db = Db::in_memory(Schema::new(1), Options::default()).unwrap();
+/// db.add_all([1.0, 2.0, 5.0].map(|x| Record::new([x]))).unwrap();
+/// db.flush().unwrap();
+/// assert_eq!(db.search(Disk::new(&[0.0], 2.0).count()).unwrap(), 2);
+/// ```
+#[derive(Debug, Clone)]
+pub struct Count<'a>(Region<'a>);
+
+/// The number of records with each value of `Keyword` and `Keywords` fields.
+///
+/// A facet search counts the records inside a region (see [`Region::facets`])
+/// or all records (see [`Facets::new`]), that pass the filter if one is set.
+/// The output has one list per field, in the order of the fields. A list has
+/// each value with its number of records, from the largest number to the
+/// smallest, then in the order of the values. A value without records is not
+/// in the list. A record with many values of a `Keywords` field counts one time
+/// for each of the values.
+///
+/// ```
+/// use ringdb::{Db, Disk, Facets, FieldType, Options, Record, Schema};
+///
+/// let schema = Schema::new(1).field("city", FieldType::Keyword);
+/// let db = Db::in_memory(schema, Options::default()).unwrap();
+/// let cities = [(1.0, "Lille"), (2.0, "Roubaix"), (3.0, "Lille"), (9.0, "Paris")];
+/// db.add_all(cities.map(|(x, city)| Record::new([x]).set("city", city))).unwrap();
+/// db.flush().unwrap();
+///
+/// let near = db.search(Disk::new(&[0.0], 5.0).facets(&["city"])).unwrap();
+/// assert_eq!(near[0], [("Lille".to_string(), 2), ("Roubaix".to_string(), 1)]);
+/// let all = db.search(Facets::new(&["city"]).top(1)).unwrap();
+/// assert_eq!(all[0], [("Lille".to_string(), 2)]);
+/// ```
+#[derive(Debug, Clone)]
+pub struct Facets<'a> {
+    pub(crate) fields: &'a [&'a str],
+    pub(crate) region: Option<Region<'a>>,
+    pub(crate) filter: Option<&'a Filter>,
+    pub(crate) top: Option<usize>,
+}
+
+impl<'a> Facets<'a> {
+    /// Count the values of `fields` among all records.
+    pub const fn new(fields: &'a [&'a str]) -> Self {
+        Self {
+            fields,
+            region: None,
+            filter: None,
+            top: None,
+        }
+    }
+
+    /// Count only the records that pass `filter`.
+    #[must_use]
+    pub const fn filter(mut self, filter: &'a Filter) -> Self {
+        self.filter = Some(filter);
+        self
+    }
+
+    /// Keep only the `n` values with the most records in each list.
+    #[must_use]
+    pub const fn top(mut self, n: usize) -> Self {
+        self.top = Some(n);
+        self
+    }
 }
 
 impl<'a> From<Disk<'a>> for Region<'a> {
@@ -170,13 +277,46 @@ pub struct Hit {
 /// Rows are numbered across the segments of a snapshot: each segment's keys
 /// start at its base row.
 #[derive(Debug, Clone)]
-pub(crate) struct KeyLookup(pub(crate) Arc<[(u32, Arc<[Key]>)]>);
+pub(crate) struct KeyLookup(Arc<[SegmentKeys]>);
+
+#[derive(Debug)]
+struct SegmentKeys {
+    base: u32,
+    keys: Buf<Key>,
+    /// Set when the keys have no gaps, so that a key is computed without
+    /// reading `keys`, as in a database that was only appended to.
+    contiguous: bool,
+}
 
 impl KeyLookup {
+    /// `segments` gives each segment's base row and its sorted keys.
+    pub(crate) fn new(segments: impl IntoIterator<Item = (u32, Buf<Key>)>) -> Self {
+        Self(
+            segments
+                .into_iter()
+                .map(|(base, keys)| SegmentKeys {
+                    base,
+                    contiguous: keys
+                        .last()
+                        .is_some_and(|last| last.0 - keys[0].0 == keys.len() as u64 - 1),
+                    keys,
+                })
+                .collect(),
+        )
+    }
+
     fn key(&self, row: u32) -> Key {
-        let part = self.0.partition_point(|(base, _)| *base <= row) - 1;
-        let (base, keys) = &self.0[part];
-        keys[(row - base) as usize]
+        let part = match &*self.0 {
+            [_] => 0,
+            parts => parts.partition_point(|part| part.base <= row) - 1,
+        };
+        let part = &self.0[part];
+        let index = row - part.base;
+        if part.contiguous {
+            Key(part.keys[0].0 + u64::from(index))
+        } else {
+            part.keys[index as usize]
+        }
     }
 }
 
@@ -221,18 +361,26 @@ impl RegionResult {
     pub fn get(&self, index: usize) -> Option<RegionHit<'_>> {
         let start = index.checked_mul(self.stride())?;
         let record = self.records.get(start..start.checked_add(self.stride())?)?;
-        Some(RegionHit {
+        Some(self.hit(record))
+    }
+
+    fn hit<'s>(&'s self, record: &'s [u32]) -> RegionHit<'s> {
+        RegionHit {
             key: self.keys.key(record[0]),
             dists_sq: bytemuck::cast_slice(&record[1..]),
-        })
+        }
     }
 
     pub fn iter(&self) -> impl ExactSizeIterator<Item = RegionHit<'_>> + '_ {
-        (0..self.len()).map(|index| self.get(index).expect("index is in bounds"))
+        self.records
+            .chunks_exact(self.stride())
+            .map(|record| self.hit(record))
     }
 
     pub fn keys(&self) -> impl ExactSizeIterator<Item = Key> + '_ {
-        self.iter().map(|hit| hit.key)
+        self.records
+            .chunks_exact(self.stride())
+            .map(|record| self.keys.key(record[0]))
     }
 }
 
@@ -264,7 +412,7 @@ mod sealed {
 }
 
 /// A search request accepted by `search`. Implemented by [`Knn`], [`Disk`],
-/// and [`Region`].
+/// [`Region`], [`Count`], and [`Facets`].
 pub trait Query: sealed::Sealed {
     type Output;
 
@@ -275,6 +423,8 @@ pub trait Query: sealed::Sealed {
 impl sealed::Sealed for Knn<'_> {}
 impl sealed::Sealed for Disk<'_> {}
 impl sealed::Sealed for Region<'_> {}
+impl sealed::Sealed for Count<'_> {}
+impl sealed::Sealed for Facets<'_> {}
 
 impl Query for Knn<'_> {
     type Output = Vec<Hit>;
@@ -289,6 +439,22 @@ impl Query for Region<'_> {
 
     fn execute(self, snapshot: &Snapshot) -> Result<RegionResult> {
         snapshot.region(&self)
+    }
+}
+
+impl Query for Count<'_> {
+    type Output = usize;
+
+    fn execute(self, snapshot: &Snapshot) -> Result<usize> {
+        snapshot.region_count(&self.0)
+    }
+}
+
+impl Query for Facets<'_> {
+    type Output = Vec<Vec<(String, usize)>>;
+
+    fn execute(self, snapshot: &Snapshot) -> Result<Self::Output> {
+        snapshot.facets(&self)
     }
 }
 
@@ -367,4 +533,21 @@ pub(crate) fn validate_disk<'a>(dims: usize, disk: &Disk<'a>) -> Result<DiskSpec
         weights: disk.metric.weights(),
         radius_sq,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keys_resolve_with_and_without_gaps() {
+        let keys = |values: &[u64]| -> Buf<Key> {
+            values.iter().copied().map(Key).collect::<Vec<_>>().into()
+        };
+        let lookup = KeyLookup::new([(0, keys(&[5, 6, 7])), (3, keys(&[9, 12])), (5, keys(&[20]))]);
+        let found: Vec<u64> = (0..6).map(|row| lookup.key(row).0).collect();
+        assert_eq!(found, [5, 6, 7, 9, 12, 20]);
+        let single = KeyLookup::new([(0, keys(&[3, 8]))]);
+        assert_eq!(single.key(1), Key(8));
+    }
 }

@@ -49,8 +49,8 @@ float distance_sq(uint id, uint disk) {
 
 void main() {
     uint group = group_index();
-    if (group >= group_count(p.work_count)) return;
-    uint slot = group * 128u + gl_LocalInvocationID.x;
+    if (group >= group_count(p.work_count - p.slot_base)) return;
+    uint slot = p.slot_base + group * 128u + gl_LocalInvocationID.x;
     if (slot >= p.work_count) return;
     if (p.mode == 1u) {
         scratch_word(2ul * slot).value = INVALID;
@@ -78,6 +78,7 @@ void main() {
     }
     // Output: the hit count, then per hit its row and disk_count distances.
     uint dst = atomicAdd(output_word(0).value, 1u);
+    if (p.mode == 2u) return;
     uint64_t record = 1ul + uint64_t(dst) * uint64_t(1u + p.disk_count);
     output_word(record).value = id + p.row_offset + p.row_base;
     for (uint disk = 0u; disk < p.disk_count; ++disk) {

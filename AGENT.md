@@ -63,13 +63,14 @@ src/
 ├── schema.rs          Schema and FieldType
 ├── value.rs           Value, Record, validated Row, Document
 ├── filter.rs          public Filter tree and its schema-checked Compiled form
-├── segment.rs         immutable Segment and SegmentBuilder
+├── segment.rs         immutable Segment and SegmentBuilder, mapped from files
 ├── column.rs          typed columns, keyword dictionaries, inverted indexes
+├── buf.rs             Buf: an immutable array, owned or borrowed from a mapping
 ├── rows.rs            adaptive RowSet (all, empty, sparse, dense)
 ├── store.rs           directory lock, WAL, MANIFEST, segment files, recovery
 ├── codec.rs           checked little-endian Encoder/Decoder with CRC-32
 ├── error.rs           RingDbError
-├── query.rs           Knn, Disk, Region, Metric, Key, Hit, RegionResult
+├── query.rs           Knn, Disk, Region, Count, Facets, Metric, Key, Hit, RegionResult
 └── backend/
     ├── mod.rs         kernel inputs: Mask, DiskSpec, RowHit
     ├── cpu.rs         Rayon-parallel exact reference backend
@@ -123,8 +124,9 @@ under an `RwLock`). Lock `writer` before `current`, always. Searches and `get` r
 on a snapshot clone without locks. Uncommitted changes are invisible.
 
 A segment that fails to upload stays in `Writer::unpublished` and is retried at the
-next commit, so no record is lost. The commit thread ignores errors; `flush` repeats
-the commit and reports them. A commit holds the writer lock while it builds, writes,
+next commit, so no record is lost. The commit thread keeps its last error in
+`Shared::background_error` for `Db::take_background_error`; `flush` repeats the
+commit and reports errors directly. A commit holds the writer lock while it builds, writes,
 and uploads its segment: writes wait, which bounds the backlog; searches do not.
 
 A snapshot `Part` is an `Arc<Segment>` plus its sorted deleted rows and a cached live
@@ -134,7 +136,9 @@ Deletes are copy-on-write per part.
 Merges run after commits (`Options::auto_merge`) and on `compact`, one at a time
 under `Shared::merging`. `merge_range` selects adjacent parts only: first a part with
 at least 25% deleted rows, else the newest run whose older neighbor has less than
-twice its live rows. `build_merge` copies live rows without the writer lock;
+twice its live rows. `build_merge` copies live rows without the writer lock,
+column by column (`SegmentBuilder::extend_from`; keyword ids are remapped once per
+source term, never through a `Row`);
 `publish_merge` then takes it, remaps rows deleted meanwhile into the new segment,
 and replaces the inputs. Only merges remove parts, so the inputs are still contiguous.
 
@@ -145,14 +149,26 @@ Segments in a snapshot are ordered by key with disjoint key ranges, so `get` fin
 segment by binary search on first keys, then a row by binary search on keys. Merges
 must combine adjacent segments only, to keep this property.
 
-- Scalars: `Vec<T>` plus a presence bitmap, omitted when every row has a value.
-  Numeric scalars also keep `order`, the present rows sorted by value, rebuilt when
-  a segment is built or decoded (not stored). `select_range` binary-searches it:
-  under 1/64 of rows it sorts the matches, under 1/32 it sets bitmap bits, else it
-  scans the column. Bool columns scan.
-- Keyword and Keywords: a sorted per-segment dictionary, per-row sorted term ids,
-  and a CSR inverted index (term → sorted rows). There is no global dictionary,
-  so each segment is self-contained.
+Every array of a segment and its columns is a `Buf<T>`: a `Vec<T>` for segments
+built in memory, or a view into the segment file's `Mmap`, which the `Buf` keeps
+alive. Builders hold `Vec`s and freeze into `Buf`s.
+
+- Scalars: `Buf<T>` plus a presence bitmap, omitted when every row has a value.
+  Numeric scalars also keep `order`, the present rows sorted by value, built
+  with the segment, stored in format 2, and rebuilt when format 1 is decoded.
+  `select_range` binary-searches it: under 1/64 of rows it sorts the matches,
+  under 1/32 it sets bitmap bits, else it scans the column. Bool columns (0 or 1
+  in a `u8`) scan.
+- Keyword and Keywords: a sorted per-segment dictionary, term ids in 1, 2, or 4
+  bytes (the narrowest that holds the dictionary), and an inverted index. When no
+  row has two terms, `ids` has one entry per row (0 = no term, else id + 1) and
+  no offsets; otherwise per-row offsets give each row's sorted ids. Postings are
+  sorted row lists, except terms in more than 1/32 of rows, which are bitmaps
+  (`rows::prefer_dense`). There is no global dictionary, so each segment is
+  self-contained.
+- Offsets (strings, lists, keyword rows, postings) are `u32` until a value needs
+  `u64`. Segment format 2 stores these; format 1 (0.10) is still decoded, with
+  its postings rebuilt, and `compact` rewrites it.
 - Text and Bytes: packed bytes with offsets plus presence; TextList: nested offsets.
 
 `Filter::compile` checks a filter against the schema once per search. The compiled
@@ -170,6 +186,18 @@ Every search goes through `Db::search` or `Snapshot::search`, which take a seale
 | `Knn` | `Vec<Hit>` | exact best `k`, ordered by `(dist_sq, key)` |
 | `Disk` | `RegionResult` | inclusive `dist_sq <= radius^2` |
 | `Region` | `RegionResult` | vector must satisfy every disk (1..=`MAX_DISKS`) |
+| `Count` | `usize` | number of records in a `Region` (`Region::count`, `Disk::count`) |
+| `Facets` | `Vec<Vec<(String, usize)>>` | per keyword field, record counts per value, by count desc then value |
+
+`Snapshot::count(&Filter)` (and `Db::count`) sums the eligible `RowSet` lengths
+without reading vectors. On Vulkan, `Count` runs the scan in mode 2, which only
+increments the output count word.
+
+`Snapshot::facets` checks that every field is `Keyword`/`Keywords`, then per
+segment takes the eligible rows (`Facets::new`) or the region hits (rows taken
+from the region records, any order) and counts term ids per thread
+(`Keywords::term_counts`; `Mask::All` reads posting lengths). Counts merge by
+string across segments; `top(n)` selects before the final sort.
 
 A disk is a one-disk region: `Disk::and` and `Disk::filter` return a `Region`.
 `Knn::metric` and `Disk::metric` take `Metric::L2` or `Metric::WeightedL2(&w)`.
@@ -177,12 +205,16 @@ Each search has at most one `&Filter`; there are no per-disk filters.
 
 `RegionResult` stores flat `u32` records `[row, d0..dN-1]` (distances as `f32`
 bits). Rows are numbered across the snapshot's segments; keys resolve lazily
-through per-segment `(base row, Arc<[Key]>)` parts. `RegionHit::dists_sq`
-returns every disk's squared distance in disk order; there is no combined score.
+through `KeyLookup`, one `SegmentKeys` (base row, `Buf<Key>`) per segment. A
+segment whose keys have no gaps computes `keys[0] + (row - base)` without reading
+`keys`: GPU hits come back in random row order, so reading the key array cost a
+cache miss per hit. `RegionHit::dists_sq` returns every disk's squared distance
+in disk order; there is no combined score.
 Do not split records into separate key and distance vectors: large fresh result
 allocations page-fault, and the extra bytes cost several percent on region scans.
 
 `k = 0` returns no hits. If fewer than `k` candidates exist, KNN returns all of them.
+KNN drops hits whose `dist_sq` overflowed to infinity, as regions do.
 Ties are deterministic by key: each segment returns its best `k` by `(dist_sq, row)`,
 which is key order within a segment, and the snapshot merges them by `(dist_sq, key)`.
 
@@ -300,12 +332,29 @@ Device tests also cover multi-segment databases.
 `Store` (only for `Db::open`) lives in `Writer`, so every log write and manifest
 write is serialized by the writer mutex. Directory files:
 
-- `LOCK`: held with `File::try_lock` while the `Db` is open;
+- `LOCK`: held with `File::try_lock` while a writing `Db` is open, and with
+  `try_lock_shared` by read-only ones;
 - `MANIFEST`: schema, `next_key`, `next_segment`, and each part's segment id and
   deleted rows, with a CRC; replaced by tmp file + rename + directory fsync;
 - `wal-{seq:016x}.log`: `[len u32][crc u32][payload]` frames. A payload is the
   `LogFrame` of one `Db::apply`: its deletes, then its adds (key + encoded `Row`);
-- `seg-{id:016x}.seg`: an encoded `Segment` with a trailing CRC.
+- `seg-{id:016x}.seg`: an encoded `Segment` with a trailing CRC. Format 2 uses
+  `Encoder::aligned`, which puts every slice at a multiple of 8 bytes, so
+  `Decoder::buf` borrows each array from the mapping (on little-endian targets;
+  otherwise it copies). Format 1 (0.10) is unaligned and mostly copied.
+
+Segment files are never changed after they are written, which makes mapping them
+sound. `Shared::prepare` writes a new segment's file, then replaces the built
+segment with the mapped file (`store::read_segment`), so durable databases hold
+no anonymous copy; `is_mapped` stops a retry from rewriting a mapped file. After
+`Segment::upload`, `release_vectors` drops the mapped vector pages from the
+process (`MADV_DONTNEED`); CPU searches fault them back. The Vulkan upload stages
+`UPLOAD_STAGING_BYTES` of rows at a time and copies each dimension's run with
+one `copy_regions` submission, so host memory stays bounded. Region searches
+read records in batches of slots (`slot_base` up to `work_count`) whose output
+fits `REGION_OUTPUT_BYTES`, so the output and readback buffers stay bounded.
+Removing a mapped file can fail on Windows; `remove_segment` ignores the error,
+and the next open removes the file.
 
 Each `apply` (and so `add`/`add_all`/`delete`) appends one frame and calls
 `sync_data` before returning, so recovery keeps a whole batch or none of it. An
@@ -315,14 +364,28 @@ nothing pending). A commit writes and syncs the new
 segment files, then the manifest naming them and a new WAL sequence, then deletes the
 old WAL. If the manifest write fails, the segments stay unpublished for the retry.
 Merges write their segment file before `publish_merge` writes the manifest, and
-remove replaced files after.
+remove replaced files after. Segment files are streamed (`Segment::write`,
+`Encoder::aligned_to`): large slices go to the file in place, so a write keeps no
+encoded copy in memory.
+
+`Db::import` locks a new, empty directory (`store::Import`), builds one segment
+from the records (keys from 0), writes it, an empty log, and the manifest. It
+never writes the log, and the directory is a normal database afterwards.
 
 `Store::open` locks, reads or creates the manifest (a new database writes only
 the manifest, so a crash during creation leaves at most `MANIFEST.tmp`; a missing
 log is created like an empty one), rejects a different schema,
 loads and checks every named segment, replays the WAL up to the first torn or
-corrupt frame (truncating it there), and removes unnamed files. `Db::open` then
-re-applies the recovered changes and commits. `Drop` commits durable databases.
+corrupt frame (truncating it there), and removes unnamed files: only
+`MANIFEST.tmp` and `seg-`/`wal-` names with 16 hex digits, never other files.
+`Db::open` then re-applies the recovered changes and commits. `Drop` commits
+durable databases.
+
+`store::open_read_only` shares the lock (a missing `LOCK`, as in a backup, means no
+lock), requires an existing manifest, and runs the same loading without truncating
+the log or removing files. The `Db` has no `Store` and no `dir`: replayed changes
+commit into memory only, no commit thread starts, and every write, `flush`,
+`compact`, and `backup` returns `ReadOnly` (`Shared::writable`).
 `backup` commits, then copies the manifest, the named segments, and the current
 WAL under the writer lock.
 All decoding goes through `codec::Decoder`, which returns `Corrupt`, never panics.
@@ -339,6 +402,7 @@ All decoding goes through `codec::Decoder`, which returns `Corrupt`, never panic
 - `InvalidRecord`;
 - `UnknownField`;
 - `KeyNotFound`;
+- `ReadOnly`;
 - `BackendUnavailable`;
 - `Backend`.
 

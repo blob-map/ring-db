@@ -32,12 +32,20 @@ fn open(dir: &Path) -> Db {
     open_with(dir, schema(), manual()).unwrap()
 }
 
+fn open_with(dir: &Path, schema: Schema, options: Options) -> Result<Db, RingDbError> {
+    retry(|| Db::open(dir, schema.clone(), options.clone()))
+}
+
+fn open_read_only(dir: &Path) -> Result<Db, RingDbError> {
+    retry(|| Db::open_read_only(dir, schema(), manual()))
+}
+
 /// Open, waiting while another test's child process briefly holds the lock: a
 /// process forked by any thread keeps a copy of every open file until it execs.
-fn open_with(dir: &Path, schema: Schema, options: Options) -> Result<Db, RingDbError> {
+fn retry(open: impl Fn() -> Result<Db, RingDbError>) -> Result<Db, RingDbError> {
     let started = std::time::Instant::now();
     loop {
-        match Db::open(dir, schema.clone(), options.clone()) {
+        match open() {
             Err(RingDbError::Io(error))
                 if error.kind() == std::io::ErrorKind::WouldBlock
                     && started.elapsed() < std::time::Duration::from_secs(5) =>
@@ -96,6 +104,25 @@ fn files(dir: &Path) -> Vec<String> {
     names
 }
 
+/// Every file of `dir` with its contents.
+fn file_contents(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    files(dir)
+        .into_iter()
+        .map(|name| {
+            let bytes = fs::read(dir.join(&name)).unwrap();
+            (name, bytes)
+        })
+        .collect()
+}
+
+fn assert_lock_error(result: Result<Db, RingDbError>) {
+    match result {
+        Err(RingDbError::Io(error)) => assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock),
+        Err(other) => panic!("expected a lock error, got {other}"),
+        Ok(_) => panic!("the open must fail"),
+    }
+}
+
 fn file_with_prefix(dir: &Path, prefix: &str) -> PathBuf {
     let name = files(dir)
         .into_iter()
@@ -144,12 +171,17 @@ fn merges_and_compaction_replace_files() {
         Options::default().commit_interval(None),
     )
     .unwrap();
-    for batch in 0..20 {
-        db.add_all((batch * 5..batch * 5 + 5).map(record)).unwrap();
-        db.delete(Key::new(u64::from(batch) * 5)).unwrap();
-        db.flush().unwrap();
+    // The same changes without merges.
+    let reference = Db::in_memory(schema(), manual().auto_merge(false)).unwrap();
+    for db in [&db, &reference] {
+        for batch in 0..20 {
+            db.add_all((batch * 5..batch * 5 + 5).map(record)).unwrap();
+            db.delete(Key::new(u64::from(batch) * 5)).unwrap();
+            db.flush().unwrap();
+        }
     }
     let segments = db.snapshot().segments();
+    assert!(segments < 20);
     let names = files(dir.path());
     assert_eq!(
         names.iter().filter(|n| n.starts_with("seg-")).count(),
@@ -157,8 +189,19 @@ fn merges_and_compaction_replace_files() {
     );
     assert_eq!(names.iter().filter(|n| n.starts_with("wal-")).count(), 1);
     db.compact().unwrap();
-    let expected = contents(&db);
+    let expected = contents(&reference);
     assert_eq!(expected.len(), 80);
+    assert_eq!(contents(&db), expected);
+    for filter in [
+        Filter::eq("city", "Paris"),
+        Filter::eq("tags", "t5") | Filter::range("surface", 30.0..),
+        !Filter::eq("garden", true),
+    ] {
+        assert_eq!(
+            db.count(&filter).unwrap(),
+            reference.count(&filter).unwrap()
+        );
+    }
     drop(db);
     let names = files(dir.path());
     assert_eq!(names.iter().filter(|n| n.starts_with("seg-")).count(), 1);
@@ -269,11 +312,8 @@ fn corruption_is_detected() {
 fn the_schema_and_the_lock_are_enforced() {
     let dir = tempfile::tempdir().unwrap();
     let db = open(dir.path());
-    match Db::open(dir.path(), schema(), manual()) {
-        Err(RingDbError::Io(error)) => assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock),
-        Err(other) => panic!("expected a lock error, got {other}"),
-        Ok(_) => panic!("a second open must fail"),
-    }
+    assert_lock_error(Db::open(dir.path(), schema(), manual()));
+    assert_lock_error(Db::open_read_only(dir.path(), schema(), manual()));
     drop(db);
     for other in [
         Schema::new(3),
@@ -303,16 +343,117 @@ fn leftover_files_are_removed_on_open() {
     fs::copy(&segment, dir.path().join("seg-00000000000000ff.seg")).unwrap();
     fs::write(dir.path().join("wal-00000000000000ff.log"), b"stale").unwrap();
     fs::write(dir.path().join("MANIFEST.tmp"), b"partial").unwrap();
-    fs::write(dir.path().join("notes.txt"), b"the user's file").unwrap();
+    let users = ["notes.txt", "export.tmp", "seg-notes.seg", "wal-1.log"];
+    for name in users {
+        fs::write(dir.path().join(name), b"the user's file").unwrap();
+    }
     let db = open(dir.path());
     assert_eq!(db.len(), 5);
     let names = files(dir.path());
-    assert!(names.contains(&"notes.txt".to_string()));
+    for name in users {
+        assert!(names.contains(&name.to_string()), "{name} was removed");
+    }
     assert!(
         !names
             .iter()
-            .any(|n| n.contains("ff") || n.ends_with(".tmp"))
+            .any(|n| n.contains("ff") || n == "MANIFEST.tmp")
     );
+}
+
+#[test]
+fn read_only_opens_change_no_file() {
+    if let Some(dir) = std::env::var_os(CHILD) {
+        let db = open(Path::new(&dir));
+        let keys = db.add_all((0..10).map(record)).unwrap();
+        db.flush().unwrap();
+        // Logged but never committed.
+        db.apply(Batch::new().delete(keys[3]).add(record(10)))
+            .unwrap();
+        std::process::abort();
+    }
+    let dir = tempfile::tempdir().unwrap();
+    crash("read_only_opens_change_no_file", dir.path());
+    // A torn tail and a left-over file, which a writer would remove.
+    let wal = file_with_prefix(dir.path(), "wal-");
+    OpenOptions::new()
+        .append(true)
+        .open(&wal)
+        .unwrap()
+        .write_all(&[40, 0, 0, 0, 1, 2, 3, 4, 1, 9])
+        .unwrap();
+    fs::write(dir.path().join("MANIFEST.tmp"), b"partial").unwrap();
+    let before = file_contents(dir.path());
+
+    let db = open_read_only(dir.path()).unwrap();
+    let keys: Vec<u64> = contents(&db).iter().map(|c| c.0).collect();
+    assert_eq!(keys, [0, 1, 2, 4, 5, 6, 7, 8, 9, 10]);
+    assert_eq!(db.get(Key::new(10)).unwrap().vector(), [10.0, 3.0]);
+    assert!(matches!(db.add(record(11)), Err(RingDbError::ReadOnly)));
+    assert!(matches!(db.delete(Key::new(0)), Err(RingDbError::ReadOnly)));
+    assert!(matches!(db.flush(), Err(RingDbError::ReadOnly)));
+    assert!(matches!(db.compact(), Err(RingDbError::ReadOnly)));
+    let backup = tempfile::tempdir().unwrap();
+    assert!(matches!(
+        db.backup(backup.path()),
+        Err(RingDbError::ReadOnly)
+    ));
+    // Readers share the directory, and keep writers out.
+    let other = open_read_only(dir.path()).unwrap();
+    assert_eq!(other.len(), 10);
+    assert_lock_error(Db::open(dir.path(), schema(), manual()));
+    drop((db, other));
+    assert_eq!(file_contents(dir.path()), before);
+
+    let db = open(dir.path());
+    assert_eq!(contents(&db).len(), 10);
+}
+
+#[test]
+fn read_only_opens_need_an_existing_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing");
+    match Db::open_read_only(&missing, schema(), manual()) {
+        Err(RingDbError::Io(error)) => assert_eq!(error.kind(), std::io::ErrorKind::NotFound),
+        other => panic!("expected NotFound, got {:?}", other.err()),
+    }
+    assert!(!missing.exists());
+    {
+        let db = open(dir.path());
+        db.add_all((0..5).map(record)).unwrap();
+    }
+    assert!(matches!(
+        retry(|| Db::open_read_only(dir.path(), Schema::new(3), manual())),
+        Err(RingDbError::InvalidSchema(_))
+    ));
+    // A backup has no LOCK file.
+    let backup = dir.path().join("backup");
+    open(dir.path()).backup(&backup).unwrap();
+    assert!(!backup.join("LOCK").exists());
+    assert_eq!(open_read_only(&backup).unwrap().len(), 5);
+}
+
+#[cfg(unix)]
+#[test]
+fn read_only_opens_work_without_write_permission() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = open(dir.path());
+        db.add_all((0..5).map(record)).unwrap();
+        db.flush().unwrap();
+        db.add(record(5)).unwrap();
+    }
+    let set_mode = |file: u32, dir_mode: u32| {
+        for name in files(dir.path()) {
+            fs::set_permissions(dir.path().join(name), fs::Permissions::from_mode(file)).unwrap();
+        }
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(dir_mode)).unwrap();
+    };
+    set_mode(0o444, 0o555);
+    let result = open_read_only(dir.path()).map(|db| db.len());
+    set_mode(0o644, 0o755);
+    assert_eq!(result.unwrap(), 6);
 }
 
 #[test]
@@ -373,4 +514,107 @@ fn background_commits_are_durable() {
     drop(db);
     let db = open_with(dir.path(), schema(), options).unwrap();
     assert_eq!(contents(&db), expected);
+}
+
+#[cfg(unix)]
+#[test]
+fn background_commit_errors_are_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let options = Options::default().commit_interval(Some(std::time::Duration::from_millis(5)));
+    let db = open_with(&path, schema(), options).unwrap();
+    assert!(db.take_background_error().is_none());
+    // The open log still accepts writes, but no segment file can be created.
+    fs::remove_dir_all(&path).unwrap();
+    db.add(record(0)).unwrap();
+    let started = std::time::Instant::now();
+    let error = loop {
+        if let Some(error) = db.take_background_error() {
+            break error;
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    assert!(matches!(error, RingDbError::Io(_)), "{error}");
+    assert!(matches!(db.flush(), Err(RingDbError::Io(_))));
+}
+
+/// The changes stored in `tests/data/v0.10`, a database written by ring-db 0.10.
+fn fill_v0_10(db: &Db) {
+    db.add_all((0..200).map(record)).unwrap();
+    db.flush().unwrap();
+    db.add_all((200..300).map(record)).unwrap();
+    db.add_all((300..305).map(|i| Record::new([i as f32, 0.0])))
+        .unwrap();
+    db.flush().unwrap();
+    for key in (0..305).step_by(11) {
+        db.delete(Key::new(key)).unwrap();
+    }
+    db.flush().unwrap();
+}
+
+#[test]
+fn databases_written_by_0_10_open() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/v0.10");
+    let reference = Db::in_memory(schema(), manual()).unwrap();
+    fill_v0_10(&reference);
+    let filters = [
+        Filter::eq("city", "Lyon"),
+        Filter::eq("city", "Paris") | Filter::eq("tags", "t3"),
+        !Filter::eq("tags", "t0") & Filter::range("rooms", 1..),
+        Filter::eq("tags", "t5") | Filter::eq("tags", "t1") | Filter::eq("tags", "t2"),
+    ];
+    let check = |db: &Db| {
+        assert_eq!(contents(db), contents(&reference));
+        for filter in &filters {
+            assert_eq!(db.count(filter).unwrap(), reference.count(filter).unwrap());
+        }
+    };
+    check(&Db::open_read_only(&fixture, schema(), manual()).unwrap());
+    // A compaction rewrites the files in the current format.
+    let dir = tempfile::tempdir().unwrap();
+    for name in files(&fixture) {
+        fs::copy(fixture.join(&name), dir.path().join(&name)).unwrap();
+    }
+    let db = open(dir.path());
+    check(&db);
+    db.compact().unwrap();
+    drop(db);
+    check(&open(dir.path()));
+}
+
+#[test]
+fn imports_match_added_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let count = Db::import(&path, schema(), manual(), (0..300).map(record)).unwrap();
+    assert_eq!(count, 300);
+    assert_eq!(
+        files(&path),
+        [
+            "LOCK",
+            "MANIFEST",
+            "seg-0000000000000000.seg",
+            "wal-0000000000000000.log"
+        ]
+    );
+    let reference = Db::in_memory(schema(), manual()).unwrap();
+    reference.add_all((0..300).map(record)).unwrap();
+    reference.flush().unwrap();
+    let db = open_read_only(&path).unwrap();
+    assert_eq!(contents(&db), contents(&reference));
+    let lyon = Filter::eq("city", "Lyon") | Filter::eq("tags", "t5");
+    assert_eq!(db.count(&lyon).unwrap(), reference.count(&lyon).unwrap());
+    drop(db);
+    // Keys continue after the imported records.
+    assert_eq!(open(&path).add(record(1)).unwrap(), Key::new(300));
+
+    let error = Db::import(&path, schema(), manual(), [record(0)]).unwrap_err();
+    assert!(matches!(error, RingDbError::Io(e) if e.kind() == std::io::ErrorKind::AlreadyExists));
+    let invalid = [record(0), Record::new([f32::NAN, 0.0])];
+    let error = Db::import(dir.path().join("bad"), schema(), manual(), invalid).unwrap_err();
+    assert!(matches!(error, RingDbError::InvalidRecord(_)));
+    let empty = dir.path().join("empty");
+    assert_eq!(Db::import(&empty, schema(), manual(), []).unwrap(), 0);
+    assert!(open(&empty).is_empty());
 }

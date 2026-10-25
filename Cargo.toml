@@ -1,6 +1,6 @@
 [package]
 name = "ring-db"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2024"
 description = "Exact vector search with typed filters and durable storage, on a CPU or a Vulkan GPU."
 license = "MIT OR Apache-2.0"
@@ -33,6 +33,7 @@ smallvec = { version = "1.15", features = ["const_generics"] }
 bytemuck = { version = "1", features = ["derive", "extern_crate_alloc"] }
 ash = { version = "0.38", default-features = false, features = ["loaded", "std"] }
 crc32fast = "1"
+memmap2 = "0.9"
 
 [dev-dependencies]
 criterion = { version = "0.8.2", features = ["html_reports"] }

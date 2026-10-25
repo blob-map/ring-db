@@ -203,7 +203,7 @@ pub(crate) fn word_count(universe: usize) -> usize {
     universe.div_ceil(64)
 }
 
-fn prefer_dense(universe: usize, len: usize) -> bool {
+pub(crate) fn prefer_dense(universe: usize, len: usize) -> bool {
     // One bitmap word occupies the same space as two sparse rows.
     len > word_count(universe).saturating_mul(2)
 }

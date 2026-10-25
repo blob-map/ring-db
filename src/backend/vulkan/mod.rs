@@ -18,9 +18,10 @@ use runtime::{Buffer, Context, Execution, Pipelines, WORKGROUP_SIZE, barrier, co
 const INVALID: u32 = u32::MAX;
 const REGION: u32 = 0;
 const KNN: u32 = 1;
+const COUNT: u32 = 2;
 
-// Must match shaders/common.glsl. Addresses come first for 8-byte alignment;
-// reserved makes the final padding explicit for Pod.
+// Must match shaders/common.glsl. Addresses come first for 8-byte alignment,
+// and the u32 fields fill the struct, so Pod sees no padding.
 #[repr(C)]
 #[derive(Clone, Copy, Default, Pod, Zeroable)]
 struct Params {
@@ -44,7 +45,8 @@ struct Params {
     /// Added to region output rows: the segment's first row in a snapshot.
     row_base: u32,
     reduce_shift: u32,
-    reserved: u32,
+    /// First slot of a region batch, whose end is `work_count`.
+    slot_base: u32,
 }
 
 struct Chunk {
@@ -136,6 +138,17 @@ impl VulkanDevice {
     /// Upload row-major `vectors`. Each chunk is transposed independently so
     /// coordinate reads are coalesced across rows.
     pub(crate) fn upload(&self, dims: usize, vectors: &[f32]) -> Result<VulkanSegment> {
+        self.upload_staged(dims, vectors, UPLOAD_STAGING_BYTES)
+    }
+
+    /// [`VulkanDevice::upload`], staging about `staging_bytes` of vectors at
+    /// a time.
+    fn upload_staged(
+        &self,
+        dims: usize,
+        vectors: &[f32],
+        staging_bytes: usize,
+    ) -> Result<VulkanSegment> {
         if dims == 0 || dims > u32::MAX as usize || !vectors.len().is_multiple_of(dims) {
             return Err(RingDbError::Backend(
                 "invalid Vulkan dataset dimensions".to_string(),
@@ -151,15 +164,8 @@ impl VulkanDevice {
         for offset in (0..rows).step_by(chunk_rows) {
             let count = (rows - offset).min(chunk_rows);
             let source = &vectors[offset * dims..(offset + count) * dims];
-            let mut transposed = vec![0.0f32; source.len()];
-            for (id, row) in source.chunks_exact(dims).enumerate() {
-                for (dim, value) in row.iter().enumerate() {
-                    transposed[dim * count + id] = *value;
-                }
-            }
-            let vectors = self.resident(bytemuck::cast_slice(&transposed))?;
             chunks.push(Chunk {
-                vectors,
+                vectors: self.resident_transposed(source, dims, staging_bytes)?,
                 offset,
                 rows: count,
             });
@@ -167,13 +173,38 @@ impl VulkanDevice {
         Ok(VulkanSegment { chunks, dims })
     }
 
-    fn resident(&self, bytes: &[u8]) -> Result<Buffer> {
-        let mut staging = Buffer::new(&self.context, bytes.len(), true)?;
-        staging.write(bytes)?;
-        let buffer = Buffer::new(&self.context, bytes.len(), false)?;
-        self.execution()?
-            .execution
-            .copy(&staging, 0, &buffer, bytes.len())?;
+    /// A device buffer of row-major `source`, with the coordinates of each
+    /// dimension stored together. Blocks of rows go through a staging buffer
+    /// of about `staging_bytes`, so host memory stays bounded.
+    fn resident_transposed(
+        &self,
+        source: &[f32],
+        dims: usize,
+        staging_bytes: usize,
+    ) -> Result<Buffer> {
+        let rows = source.len() / dims;
+        let buffer = Buffer::new(&self.context, size_of_val(source), false)?;
+        let block = (staging_bytes / (dims * 4)).clamp(1, rows);
+        let mut staging = Buffer::new(&self.context, block * dims * 4, true)?;
+        let mut transposed = vec![0.0f32; block * dims];
+        let mut regions = Vec::with_capacity(dims);
+        for start in (0..rows).step_by(block) {
+            let count = (rows - start).min(block);
+            let block_rows = &source[start * dims..(start + count) * dims];
+            for (id, row) in block_rows.chunks_exact(dims).enumerate() {
+                for (dim, value) in row.iter().enumerate() {
+                    transposed[dim * count + id] = *value;
+                }
+            }
+            staging.write(bytemuck::cast_slice(&transposed[..count * dims]))?;
+            regions.clear();
+            regions.extend(
+                (0..dims).map(|dim| (dim * count * 4, (dim * rows + start) * 4, count * 4)),
+            );
+            self.execution()?
+                .execution
+                .copy_regions(&staging, &buffer, &regions)?;
+        }
         Ok(buffer)
     }
 
@@ -220,6 +251,20 @@ impl VulkanDevice {
         mask: Mask<'_>,
         records: &mut Vec<u32>,
     ) -> Result<()> {
+        self.region_batched(segment, base, disks, mask, records, REGION_OUTPUT_BYTES)
+    }
+
+    /// [`VulkanDevice::region`], with at most about `output_bytes` of records
+    /// in the output buffer at a time.
+    fn region_batched(
+        &self,
+        segment: &VulkanSegment,
+        base: u32,
+        disks: &[DiskSpec<'_>],
+        mask: Mask<'_>,
+        records: &mut Vec<u32>,
+        output_bytes: usize,
+    ) -> Result<()> {
         if disks.is_empty() || disks.len() > MAX_DISKS {
             return Err(RingDbError::InvalidQuery(format!(
                 "a region needs between 1 and {MAX_DISKS} disks"
@@ -228,9 +273,28 @@ impl VulkanDevice {
         for chunk in &segment.chunks {
             let mut query = self.prepare(segment, chunk, disks, mask)?;
             query.params.row_base = base;
-            self.region_chunk(query, records)?;
+            self.region_chunk(query, Some(records), output_bytes)?;
         }
         Ok(())
+    }
+
+    /// Number of rows of `segment` inside all `disks`.
+    pub(crate) fn region_count(
+        &self,
+        segment: &VulkanSegment,
+        disks: &[DiskSpec<'_>],
+        mask: Mask<'_>,
+    ) -> Result<usize> {
+        if disks.is_empty() || disks.len() > MAX_DISKS {
+            return Err(RingDbError::InvalidQuery(format!(
+                "a region needs between 1 and {MAX_DISKS} disks"
+            )));
+        }
+        let mut count = 0;
+        for chunk in &segment.chunks {
+            count += self.region_chunk(self.prepare(segment, chunk, disks, mask)?, None, 0)?;
+        }
+        Ok(count)
     }
 
     fn prepare(
@@ -343,77 +407,101 @@ impl VulkanDevice {
         self.context.dispatch(cmd, count);
     }
 
-    fn region_chunk(&self, mut query: PreparedQuery, records: &mut Vec<u32>) -> Result<()> {
+    /// Count the rows of a chunk inside the region, and append their records
+    /// to `records` if given. Records are read in batches of slots whose
+    /// output holds at most about `output_bytes`.
+    fn region_chunk(
+        &self,
+        mut query: PreparedQuery,
+        mut records: Option<&mut Vec<u32>>,
+        output_bytes: usize,
+    ) -> Result<usize> {
         if query.eligible == 0 {
-            return Ok(());
+            return Ok(0);
         }
         let stride = 1 + query.params.disk_count as usize;
-        let output_words = query
-            .eligible
-            .checked_mul(stride)
-            .and_then(|n| n.checked_add(1))
-            .ok_or_else(size_error)?;
-        query.params.mode = REGION;
+        let work_count = query.params.work_count as usize;
+        // A slot holds at most one record. A count needs only the count word.
+        let batch = match records {
+            Some(_) => (output_bytes / 4 / stride).max(1),
+            None => work_count,
+        };
+        query.params.mode = if records.is_some() { REGION } else { COUNT };
         let mut state = self.execution()?;
         let (execution, buffers) = state.buffers(&self.context)?;
         buffers.inputs.grow(word_bytes(query.inputs.len())?)?;
         buffers.inputs.write(bytemuck::cast_slice(&query.inputs))?;
-        buffers.output.grow(word_bytes(output_words)?)?;
         query.params.inputs = buffers.inputs.address;
-        query.params.output_address = buffers.output.address;
-        execution.run("region", |cmd| {
-            unsafe {
-                self.context
-                    .device
-                    .cmd_fill_buffer(cmd, buffers.output.raw, 0, 4, 0);
-            }
-            barrier(
-                &self.context.device,
-                cmd,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::AccessFlags::TRANSFER_WRITE,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
-            );
-            self.dispatch(
-                cmd,
-                self.pipelines.scan[query.candidate_mode],
-                &query.params,
-                query.params.work_count,
-            );
-            barrier(
-                &self.context.device,
-                cmd,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::AccessFlags::SHADER_WRITE,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::AccessFlags::TRANSFER_READ,
-            );
-            // Return the count in the scan submission, avoiding a separate
-            // command-buffer submission and fence wait for four bytes.
-            unsafe {
-                self.context.device.cmd_copy_buffer(
+        let mut total = 0;
+        for start in (0..work_count).step_by(batch) {
+            let end = (start + batch).min(work_count);
+            let output_words = match records {
+                Some(_) => (end - start)
+                    .min(query.eligible)
+                    .checked_mul(stride)
+                    .and_then(|n| n.checked_add(1))
+                    .ok_or_else(size_error)?,
+                None => 1,
+            };
+            buffers.output.grow(word_bytes(output_words)?)?;
+            query.params.output_address = buffers.output.address;
+            query.params.slot_base = start as u32;
+            query.params.work_count = end as u32;
+            execution.run("region", |cmd| {
+                unsafe {
+                    self.context
+                        .device
+                        .cmd_fill_buffer(cmd, buffers.output.raw, 0, 4, 0);
+                }
+                barrier(
+                    &self.context.device,
                     cmd,
-                    buffers.output.raw,
-                    buffers.count.raw,
-                    &[vk::BufferCopy::default().size(4)],
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::AccessFlags::TRANSFER_WRITE,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
                 );
+                self.dispatch(
+                    cmd,
+                    self.pipelines.scan[query.candidate_mode],
+                    &query.params,
+                    (end - start) as u32,
+                );
+                barrier(
+                    &self.context.device,
+                    cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::AccessFlags::SHADER_WRITE,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::AccessFlags::TRANSFER_READ,
+                );
+                // Return the count in the scan submission, avoiding a separate
+                // command-buffer submission and fence wait for four bytes.
+                unsafe {
+                    self.context.device.cmd_copy_buffer(
+                        cmd,
+                        buffers.output.raw,
+                        buffers.count.raw,
+                        &[vk::BufferCopy::default().size(4)],
+                    );
+                }
+            })?;
+            let count = buffers.count.read::<u32>(1)?[0] as usize;
+            if count > (end - start).min(query.eligible) {
+                return Err(RingDbError::Backend(
+                    "Vulkan returned an invalid hit count".to_string(),
+                ));
             }
-        })?;
-        let count = buffers.count.read::<u32>(1)?[0] as usize;
-        if count > query.eligible {
-            return Err(RingDbError::Backend(
-                "Vulkan returned an invalid hit count".to_string(),
-            ));
+            total += count;
+            if let Some(records) = records.as_deref_mut().filter(|_| count > 0) {
+                // Records arrive in their final layout: one plain copy.
+                let words = count * stride;
+                buffers.readback.grow(word_bytes(words)?)?;
+                execution.copy(&buffers.output, 4, &buffers.readback, word_bytes(words)?)?;
+                buffers.readback.read_into(records, 0, words)?;
+            }
         }
-        if count == 0 {
-            return Ok(());
-        }
-        // Records arrive in their final layout: one plain copy.
-        let words = count * stride;
-        buffers.readback.grow(word_bytes(words)?)?;
-        execution.copy(&buffers.output, 4, &buffers.readback, word_bytes(words)?)?;
-        buffers.readback.read_into(records, 0, words)
+        Ok(total)
     }
 
     fn knn_chunk(&self, mut query: PreparedQuery, k: usize) -> Result<Vec<RowHit>> {
@@ -529,6 +617,12 @@ fn dense_word(words: &[u64], index: usize) -> u32 {
     (words[index / 2] >> ((index % 2) * 32)) as u32
 }
 
+/// Bytes of region records that the device holds at a time.
+const REGION_OUTPUT_BYTES: usize = 256 << 20;
+
+/// Bytes of vectors that an upload stages at a time.
+const UPLOAD_STAGING_BYTES: usize = 64 << 20;
+
 /// `RINGDB_VULKAN_CHUNK_BYTES` lowers the vector-buffer size to exercise chunked
 /// paths in tests and benchmarks. It never raises a device limit.
 fn vector_byte_limit(limit: usize) -> Result<usize> {
@@ -570,6 +664,67 @@ fn chunk_row_limit(dims: usize, vector_bytes: usize, buffer_bytes: usize) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn region_batches_return_every_record() {
+        if std::env::var("RINGDB_VULKAN_TEST").as_deref() != Ok("1") {
+            return;
+        }
+        let device = VulkanDevice::new().unwrap();
+        let (dims, rows) = (2, 5000);
+        let vectors: Vec<f32> = (0..rows * dims).map(|i| (i % 97) as f32).collect();
+        let segment = device.upload(dims, &vectors).unwrap();
+        let disks = [DiskSpec {
+            center: &[40.0, 40.0],
+            weights: None,
+            radius_sq: 900.0,
+        }];
+        let sparse: Vec<u32> = (0..rows as u32).step_by(3).collect();
+        let dense: Vec<u64> = vec![0x00ff_00ff_00ff_00ff; rows.div_ceil(64)];
+        let sorted = |records: Vec<u32>| {
+            let mut pairs = records.as_chunks::<2>().0.to_vec();
+            pairs.sort_unstable();
+            pairs
+        };
+        for mask in [Mask::All, Mask::Sparse(&sparse), Mask::Dense(&dense)] {
+            let mut expected = Vec::new();
+            device
+                .region(&segment, 10, &disks, mask, &mut expected)
+                .unwrap();
+            assert!(expected.len() > 1000);
+            // 7 records per batch, so most batches have hits and some do not.
+            let mut batched = Vec::new();
+            device
+                .region_batched(&segment, 10, &disks, mask, &mut batched, 7 * 2 * 4)
+                .unwrap();
+            assert_eq!(sorted(batched), sorted(expected));
+        }
+    }
+
+    #[test]
+    fn staged_uploads_transpose_every_block() {
+        if std::env::var("RINGDB_VULKAN_TEST").as_deref() != Ok("1") {
+            return;
+        }
+        let device = VulkanDevice::new().unwrap();
+        let (dims, rows) = (3, 1000);
+        let vectors: Vec<f32> = (0..rows * dims).map(|i| i as f32).collect();
+        // Blocks of 7 rows, the last one shorter.
+        let segment = device.upload_staged(dims, &vectors, 7 * dims * 4).unwrap();
+        let chunk = &segment.chunks[0];
+        let readback = Buffer::new(&device.context, rows * dims * 4, true).unwrap();
+        let mut state = device.execution().unwrap();
+        state
+            .execution
+            .copy(&chunk.vectors, 0, &readback, rows * dims * 4)
+            .unwrap();
+        let actual: Vec<f32> = readback.read(rows * dims).unwrap();
+        let expected: Vec<f32> = (0..dims)
+            .flat_map(|dim| (0..rows).map(move |row| (row * dims + dim) as f32))
+            .collect();
+        assert_eq!(segment.chunks.len(), 1);
+        assert_eq!(actual, expected);
+    }
 
     #[test]
     fn chunk_limits_cover_vectors_outputs_and_reductions() {

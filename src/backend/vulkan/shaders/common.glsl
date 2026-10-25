@@ -22,13 +22,13 @@ layout(push_constant) uniform Params {
     uint work_count;
     uint candidate_offset;
     uint disk_count;
-    uint mode; // 0: region, 1: KNN
+    uint mode; // 0: region, 1: KNN, 2: region count
     uint reduce_count;
     uint output_index;
     uint row_offset; // first row of the chunk within its segment
     uint row_base;   // added to region output rows
     uint reduce_shift; // 0: reduce every group; else only the group of `taken`
-    uint reserved;
+    uint slot_base;    // first slot of a region batch; work_count is its end
 } p;
 const uint INVALID = 0xffffffffu;
 const uint MAX_DISKS = 16u;

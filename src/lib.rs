@@ -33,6 +33,7 @@
 //! assert_eq!(db.get(near).unwrap().get("rooms").and_then(|v| v.as_u32()), Some(3));
 //! ```
 mod backend;
+mod buf;
 mod codec;
 mod column;
 mod config;
@@ -56,7 +57,9 @@ pub use config::{BackendPreference, Options};
 pub use db::{Batch, Db};
 pub use error::RingDbError;
 pub use filter::Filter;
-pub use query::{Disk, Hit, Key, Knn, MAX_DISKS, Metric, Query, Region, RegionHit, RegionResult};
+pub use query::{
+    Count, Disk, Facets, Hit, Key, Knn, MAX_DISKS, Metric, Query, Region, RegionHit, RegionResult,
+};
 pub use schema::{FieldType, Schema};
 pub use snapshot::Snapshot;
 pub use value::{Document, Record, Value};

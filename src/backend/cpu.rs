@@ -367,6 +367,31 @@ fn region_with(
     }
 }
 
+/// Number of rows inside all `disks`.
+pub(crate) fn region_count(
+    vectors: &[f32],
+    dims: usize,
+    disks: &[DiskSpec<'_>],
+    mask: Mask<'_>,
+) -> usize {
+    dispatch!(region_count_with(vectors, dims, disks, mask))
+}
+
+fn region_count_with(
+    d: impl Distance,
+    vectors: &[f32],
+    dims: usize,
+    disks: &[DiskSpec<'_>],
+    mask: Mask<'_>,
+) -> usize {
+    if vectors.is_empty() {
+        return 0;
+    }
+    rows(vectors, dims, mask)
+        .filter(|(_, v)| disks.iter().all(|disk| d.disk(v, disk) <= disk.radius_sq))
+        .count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
