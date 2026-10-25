@@ -33,6 +33,7 @@
 //! assert_eq!(db.get(near).unwrap().get("rooms").and_then(|v| v.as_u32()), Some(3));
 //! ```
 mod backend;
+mod buf;
 mod codec;
 mod column;
 mod config;

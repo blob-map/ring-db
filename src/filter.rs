@@ -285,7 +285,7 @@ impl Compiled {
                 _ => unreachable!("float filters apply to float columns"),
             },
             Self::Bool { field, value } => match &segment.columns[*field] {
-                Column::Bool(c) => c.select(|v| v == *value),
+                Column::Bool(c) => c.select(|v| (v == 1) == *value),
                 _ => unreachable!("bool filters apply to bool columns"),
             },
             Self::Terms { field, terms } => match &segment.columns[*field] {

@@ -63,8 +63,9 @@ src/
 ├── schema.rs          Schema and FieldType
 ├── value.rs           Value, Record, validated Row, Document
 ├── filter.rs          public Filter tree and its schema-checked Compiled form
-├── segment.rs         immutable Segment and SegmentBuilder
+├── segment.rs         immutable Segment and SegmentBuilder, mapped from files
 ├── column.rs          typed columns, keyword dictionaries, inverted indexes
+├── buf.rs             Buf: an immutable array, owned or borrowed from a mapping
 ├── rows.rs            adaptive RowSet (all, empty, sparse, dense)
 ├── store.rs           directory lock, WAL, MANIFEST, segment files, recovery
 ├── codec.rs           checked little-endian Encoder/Decoder with CRC-32
@@ -146,11 +147,16 @@ Segments in a snapshot are ordered by key with disjoint key ranges, so `get` fin
 segment by binary search on first keys, then a row by binary search on keys. Merges
 must combine adjacent segments only, to keep this property.
 
-- Scalars: `Vec<T>` plus a presence bitmap, omitted when every row has a value.
-  Numeric scalars also keep `order`, the present rows sorted by value, rebuilt when
-  a segment is built or decoded (not stored). `select_range` binary-searches it:
-  under 1/64 of rows it sorts the matches, under 1/32 it sets bitmap bits, else it
-  scans the column. Bool columns scan.
+Every array of a segment and its columns is a `Buf<T>`: a `Vec<T>` for segments
+built in memory, or a view into the segment file's `Mmap`, which the `Buf` keeps
+alive. Builders hold `Vec`s and freeze into `Buf`s.
+
+- Scalars: `Buf<T>` plus a presence bitmap, omitted when every row has a value.
+  Numeric scalars also keep `order`, the present rows sorted by value, built
+  with the segment, stored in format 2, and rebuilt when format 1 is decoded.
+  `select_range` binary-searches it: under 1/64 of rows it sorts the matches,
+  under 1/32 it sets bitmap bits, else it scans the column. Bool columns (0 or 1
+  in a `u8`) scan.
 - Keyword and Keywords: a sorted per-segment dictionary, term ids in 1, 2, or 4
   bytes (the narrowest that holds the dictionary), and an inverted index. When no
   row has two terms, `ids` has one entry per row (0 = no term, else id + 1) and
@@ -322,7 +328,21 @@ write is serialized by the writer mutex. Directory files:
   deleted rows, with a CRC; replaced by tmp file + rename + directory fsync;
 - `wal-{seq:016x}.log`: `[len u32][crc u32][payload]` frames. A payload is the
   `LogFrame` of one `Db::apply`: its deletes, then its adds (key + encoded `Row`);
-- `seg-{id:016x}.seg`: an encoded `Segment` with a trailing CRC.
+- `seg-{id:016x}.seg`: an encoded `Segment` with a trailing CRC. Format 2 uses
+  `Encoder::aligned`, which puts every slice at a multiple of 8 bytes, so
+  `Decoder::buf` borrows each array from the mapping (on little-endian targets;
+  otherwise it copies). Format 1 (0.10) is unaligned and mostly copied.
+
+Segment files are never changed after they are written, which makes mapping them
+sound. `Shared::prepare` writes a new segment's file, then replaces the built
+segment with the mapped file (`store::read_segment`), so durable databases hold
+no anonymous copy; `is_mapped` stops a retry from rewriting a mapped file. After
+`Segment::upload`, `release_vectors` drops the mapped vector pages from the
+process (`MADV_DONTNEED`); CPU searches fault them back. The Vulkan upload stages
+`UPLOAD_STAGING_BYTES` of rows at a time and copies each dimension's run with
+one `copy_regions` submission, so host memory stays bounded. Removing a mapped file
+can fail on Windows; `remove_segment` ignores the error, and the next open
+removes the file.
 
 Each `apply` (and so `add`/`add_all`/`delete`) appends one frame and calls
 `sync_data` before returning, so recovery keeps a whole batch or none of it. An

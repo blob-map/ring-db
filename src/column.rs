@@ -5,6 +5,9 @@
 //! columns keep their rows sorted by value for range filters. Keyword columns
 //! keep a sorted per-segment dictionary, the term ids of each row in 1, 2 or 4
 //! bytes, and an inverted index whose frequent terms are bitmaps.
+//!
+//! Columns hold their arrays in [`Buf`]s, which a decoded column borrows from
+//! its mapped segment file.
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::ops::{Bound, Range, RangeBounds};
@@ -12,6 +15,7 @@ use std::ops::{Bound, Range, RangeBounds};
 use bytemuck::Pod;
 use rayon::prelude::*;
 
+use crate::buf::Buf;
 use crate::codec::{Decoder, Encoder, ToLe, corrupt};
 use crate::error::Result;
 use crate::rows::{RowSet, prefer_dense, word_count};
@@ -23,7 +27,8 @@ pub(crate) enum Column {
     U64(Scalars<u64>),
     I64(Scalars<i64>),
     F32(Scalars<f32>),
-    Bool(Scalars<bool>),
+    /// Bool values as 0 or 1.
+    Bool(Scalars<u8>),
     /// `Keyword` and `Keywords` fields.
     Keywords(Keywords),
     /// `Text` and `Bytes` fields.
@@ -39,7 +44,7 @@ impl Column {
             Self::U64(c) => c.get(row).map(Value::U64),
             Self::I64(c) => c.get(row).map(Value::I64),
             Self::F32(c) => c.get(row).map(Value::F32),
-            Self::Bool(c) => c.get(row).map(Value::Bool),
+            Self::Bool(c) => c.get(row).map(|v| Value::Bool(v == 1)),
             Self::Keywords(c) => {
                 let mut terms = c.terms(row).map(str::to_string);
                 match ty {
@@ -69,7 +74,7 @@ fn utf8(bytes: &[u8]) -> &str {
 }
 
 /// Bits of rows that have a value; `None` when every row has one.
-type Presence = Option<Vec<u64>>;
+type Presence = Option<Buf<u64>>;
 
 fn present(presence: &Presence, row: usize) -> bool {
     presence
@@ -78,11 +83,10 @@ fn present(presence: &Presence, row: usize) -> bool {
 }
 
 pub(crate) struct Scalars<T> {
-    values: Vec<T>,
+    values: Buf<T>,
     present: Presence,
-    /// Rows with a value, sorted by value; empty for bool columns. Built, not
-    /// stored, so segment files do not change.
-    order: Vec<u32>,
+    /// Rows with a value, sorted by value; empty for bool columns.
+    order: Buf<u32>,
 }
 
 /// A range filter uses `order` while it matches at most one row in this many:
@@ -110,7 +114,7 @@ impl<T: Copy + Send + Sync> Scalars<T> {
         if let Some(present) = &self.present {
             words
                 .iter_mut()
-                .zip(present)
+                .zip(present.iter())
                 .for_each(|(word, p)| *word &= p);
         }
         RowSet::from_words(self.values.len(), words)
@@ -125,7 +129,11 @@ impl<T: Copy + PartialOrd + Send + Sync> Scalars<T> {
             .map(|row| (self.values[row], row as u32))
             .collect();
         pairs.par_sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
-        self.order = pairs.into_iter().map(|(_, row)| row).collect();
+        self.order = pairs
+            .into_iter()
+            .map(|(_, row)| row)
+            .collect::<Vec<_>>()
+            .into();
         self
     }
 
@@ -165,30 +173,11 @@ impl<T: Copy + PartialOrd + Send + Sync> Scalars<T> {
 
 /// Non-decreasing positions, held as `u32` while they fit.
 pub(crate) enum Offsets {
-    U32(Vec<u32>),
-    U64(Vec<u64>),
+    U32(Buf<u32>),
+    U64(Buf<u64>),
 }
 
 impl Offsets {
-    /// The offsets of no range: a single zero.
-    fn new() -> Self {
-        Self::U32(vec![0])
-    }
-
-    fn push(&mut self, offset: usize) {
-        match self {
-            Self::U32(offsets) => match u32::try_from(offset) {
-                Ok(offset) => offsets.push(offset),
-                Err(_) => {
-                    let mut wide: Vec<u64> = offsets.iter().map(|&o| u64::from(o)).collect();
-                    wide.push(offset as u64);
-                    *self = Self::U64(wide);
-                }
-            },
-            Self::U64(offsets) => offsets.push(offset as u64),
-        }
-    }
-
     /// Number of ranges, one less than the number of offsets.
     fn count(&self) -> usize {
         match self {
@@ -209,22 +198,63 @@ impl Offsets {
     }
 }
 
+/// Collects [`Offsets`], as `u32` until an offset needs `u64`.
+pub(crate) enum OffsetsBuilder {
+    U32(Vec<u32>),
+    U64(Vec<u64>),
+}
+
+impl OffsetsBuilder {
+    /// The offsets of no range: a single zero.
+    fn new() -> Self {
+        Self::U32(vec![0])
+    }
+
+    fn push(&mut self, offset: usize) {
+        match self {
+            Self::U32(offsets) => match u32::try_from(offset) {
+                Ok(offset) => offsets.push(offset),
+                Err(_) => {
+                    let mut wide: Vec<u64> = offsets.iter().map(|&o| u64::from(o)).collect();
+                    wide.push(offset as u64);
+                    *self = Self::U64(wide);
+                }
+            },
+            Self::U64(offsets) => offsets.push(offset as u64),
+        }
+    }
+
+    fn count(&self) -> usize {
+        match self {
+            Self::U32(offsets) => offsets.len() - 1,
+            Self::U64(offsets) => offsets.len() - 1,
+        }
+    }
+
+    fn finish(self) -> Offsets {
+        match self {
+            Self::U32(offsets) => Offsets::U32(offsets.into()),
+            Self::U64(offsets) => Offsets::U64(offsets.into()),
+        }
+    }
+}
+
 /// Unsigned integers in the narrowest of 1, 2 and 4 bytes that holds them.
 pub(crate) enum Ids {
-    U8(Vec<u8>),
-    U16(Vec<u16>),
-    U32(Vec<u32>),
+    U8(Buf<u8>),
+    U16(Buf<u16>),
+    U32(Buf<u32>),
 }
 
 impl Ids {
     /// `values`, none of them above `max`.
-    fn new(values: Vec<u32>, max: u32) -> Self {
+    fn new(values: &[u32], max: u32) -> Self {
         if u8::try_from(max).is_ok() {
-            Self::U8(values.iter().map(|&v| v as u8).collect())
+            Self::U8(values.iter().map(|&v| v as u8).collect::<Vec<_>>().into())
         } else if u16::try_from(max).is_ok() {
-            Self::U16(values.iter().map(|&v| v as u16).collect())
+            Self::U16(values.iter().map(|&v| v as u16).collect::<Vec<_>>().into())
         } else {
-            Self::U32(values)
+            Self::U32(values.to_vec().into())
         }
     }
 
@@ -249,22 +279,10 @@ impl Ids {
 pub(crate) struct Strings {
     /// `len() + 1` offsets into `data`, starting at zero.
     offsets: Offsets,
-    data: Vec<u8>,
+    data: Buf<u8>,
 }
 
 impl Strings {
-    fn new() -> Self {
-        Self {
-            offsets: Offsets::new(),
-            data: Vec::new(),
-        }
-    }
-
-    fn push(&mut self, bytes: &[u8]) {
-        self.data.extend_from_slice(bytes);
-        self.offsets.push(self.data.len());
-    }
-
     fn len(&self) -> usize {
         self.offsets.count()
     }
@@ -288,6 +306,37 @@ impl Strings {
     }
 }
 
+/// Collects [`Strings`].
+pub(crate) struct StringsBuilder {
+    offsets: OffsetsBuilder,
+    data: Vec<u8>,
+}
+
+impl StringsBuilder {
+    fn new() -> Self {
+        Self {
+            offsets: OffsetsBuilder::new(),
+            data: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        self.data.extend_from_slice(bytes);
+        self.offsets.push(self.data.len());
+    }
+
+    fn len(&self) -> usize {
+        self.offsets.count()
+    }
+
+    fn finish(self) -> Strings {
+        Strings {
+            offsets: self.offsets.finish(),
+            data: self.data.into(),
+        }
+    }
+}
+
 pub(crate) struct Keywords {
     rows: usize,
     /// Sorted, unique terms of this segment.
@@ -301,15 +350,15 @@ pub(crate) struct Keywords {
 
 impl Keywords {
     /// Index the sorted, unique term ids of each row, which refer to `dict`.
-    fn new(dict: Strings, offsets: Offsets, ids: Vec<u32>) -> Self {
+    fn new(dict: Strings, offsets: Offsets, ids: &[u32]) -> Self {
         let rows = offsets.count();
         let terms = dict.len() as u32;
-        let postings = Postings::new(rows, dict.len(), &offsets, &ids);
+        let postings = Postings::new(rows, dict.len(), &offsets, ids);
         let (ids, offsets) = if (0..rows).all(|row| offsets.range(row).len() <= 1) {
-            let single = (0..rows)
+            let single: Vec<u32> = (0..rows)
                 .map(|row| offsets.range(row).next().map_or(0, |index| ids[index] + 1))
                 .collect();
-            (Ids::new(single, terms), None)
+            (Ids::new(&single, terms), None)
         } else {
             (Ids::new(ids, terms.saturating_sub(1)), Some(offsets))
         };
@@ -391,11 +440,11 @@ impl Keywords {
 struct Postings {
     /// Per term, a range of `rows`; empty for the terms in `dense`.
     offsets: Offsets,
-    rows: Vec<u32>,
+    rows: Buf<u32>,
     /// Sorted ids of the terms held as bitmaps, with `word_count(rows)` words
     /// each in `words`.
-    dense: Vec<u32>,
-    words: Vec<u64>,
+    dense: Buf<u32>,
+    words: Buf<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -412,7 +461,7 @@ impl Postings {
         // Per term, its next position in the list, or the index of its bitmap.
         let mut slots = Vec::with_capacity(terms);
         let mut dense = Vec::new();
-        let mut posting_offsets = Offsets::new();
+        let mut posting_offsets = OffsetsBuilder::new();
         let mut listed = 0;
         for (id, &count) in counts.iter().enumerate() {
             if prefer_dense(rows, count) {
@@ -438,10 +487,10 @@ impl Postings {
             }
         }
         Self {
-            offsets: posting_offsets,
-            rows: list,
-            dense,
-            words,
+            offsets: posting_offsets.finish(),
+            rows: list.into(),
+            dense: dense.into(),
+            words: words.into(),
         }
     }
 
@@ -487,19 +536,19 @@ pub(crate) enum ColumnBuilder {
     U64(ScalarsBuilder<u64>),
     I64(ScalarsBuilder<i64>),
     F32(ScalarsBuilder<f32>),
-    Bool(ScalarsBuilder<bool>),
+    Bool(ScalarsBuilder<u8>),
     Keywords {
         local: HashMap<String, u32>,
-        row_offsets: Offsets,
+        row_offsets: OffsetsBuilder,
         ids: Vec<u32>,
     },
     Blobs {
-        items: Strings,
+        items: StringsBuilder,
         present: PresenceBuilder,
     },
     TextList {
-        row_offsets: Offsets,
-        items: Strings,
+        row_offsets: OffsetsBuilder,
+        items: StringsBuilder,
     },
 }
 
@@ -513,16 +562,16 @@ impl ColumnBuilder {
             FieldType::Bool => Self::Bool(ScalarsBuilder::default()),
             FieldType::Keyword | FieldType::Keywords => Self::Keywords {
                 local: HashMap::new(),
-                row_offsets: Offsets::new(),
+                row_offsets: OffsetsBuilder::new(),
                 ids: Vec::new(),
             },
             FieldType::Text | FieldType::Bytes => Self::Blobs {
-                items: Strings::new(),
+                items: StringsBuilder::new(),
                 present: PresenceBuilder::default(),
             },
             FieldType::TextList => Self::TextList {
-                row_offsets: Offsets::new(),
-                items: Strings::new(),
+                row_offsets: OffsetsBuilder::new(),
+                items: StringsBuilder::new(),
             },
         }
     }
@@ -534,7 +583,7 @@ impl ColumnBuilder {
             (Self::U64(b), v) => b.push(v.and_then(|v| v.as_u64())),
             (Self::I64(b), v) => b.push(v.and_then(|v| v.as_i64())),
             (Self::F32(b), v) => b.push(v.and_then(|v| v.as_f32())),
-            (Self::Bool(b), v) => b.push(v.and_then(|v| v.as_bool())),
+            (Self::Bool(b), v) => b.push(v.and_then(|v| v.as_bool()).map(u8::from)),
             (
                 Self::Keywords {
                     local,
@@ -589,12 +638,15 @@ impl ColumnBuilder {
                 local,
                 row_offsets,
                 ids,
-            } => Column::Keywords(finish_keywords(local, row_offsets, ids)),
+            } => Column::Keywords(finish_keywords(local, row_offsets.finish(), ids)),
             Self::Blobs { items, present } => Column::Blobs(Blobs {
                 present: present.finish(items.len()),
-                items,
+                items: items.finish(),
             }),
-            Self::TextList { row_offsets, items } => Column::TextList(Lists { row_offsets, items }),
+            Self::TextList { row_offsets, items } => Column::TextList(Lists {
+                row_offsets: row_offsets.finish(),
+                items: items.finish(),
+            }),
         }
     }
 }
@@ -608,7 +660,7 @@ fn finish_keywords(
     let mut terms: Vec<(String, u32)> = local.into_iter().collect();
     terms.sort_unstable();
     let mut renumber = vec![0u32; terms.len()];
-    let mut dict = Strings::new();
+    let mut dict = StringsBuilder::new();
     for (sorted, (term, id)) in terms.iter().enumerate() {
         renumber[*id as usize] = sorted as u32;
         dict.push(term.as_bytes());
@@ -620,7 +672,7 @@ fn finish_keywords(
             .for_each(|id| *id = renumber[*id as usize]);
         row_ids.sort_unstable();
     }
-    Keywords::new(dict, row_offsets, ids)
+    Keywords::new(dict.finish(), row_offsets, &ids)
 }
 
 #[derive(Default)]
@@ -645,7 +697,7 @@ impl PresenceBuilder {
 
     fn finish(self, rows: usize) -> Presence {
         debug_assert_eq!(self.rows, rows);
-        (self.missing > 0).then_some(self.words)
+        (self.missing > 0).then(|| self.words.into())
     }
 }
 
@@ -663,7 +715,7 @@ impl<T> Default for ScalarsBuilder<T> {
     }
 }
 
-impl<T: Default> ScalarsBuilder<T> {
+impl<T: Pod + Default + Send + Sync> ScalarsBuilder<T> {
     fn push(&mut self, value: Option<T>) {
         self.present.push(value.is_some());
         self.values.push(value.unwrap_or_default());
@@ -672,8 +724,8 @@ impl<T: Default> ScalarsBuilder<T> {
     fn finish(self) -> Scalars<T> {
         Scalars {
             present: self.present.finish(self.values.len()),
-            values: self.values,
-            order: Vec::new(),
+            values: self.values.into(),
+            order: Buf::default(),
         }
     }
 }
@@ -692,7 +744,7 @@ fn decode_presence(d: &mut Decoder<'_>, rows: usize) -> Result<Presence> {
     match d.u8()? {
         0 => Ok(None),
         1 => {
-            let words = d.slice::<u64>()?;
+            let words = d.buf::<u64>()?;
             if words.len() != word_count(rows) {
                 return Err(corrupt("presence bitmap has a wrong length"));
             }
@@ -729,8 +781,8 @@ impl Offsets {
     fn read(d: &mut Decoder<'_>, version: u32) -> Result<Self> {
         let width = if version == 1 { 8 } else { d.u8()? };
         match width {
-            4 => Ok(Self::U32(d.slice()?)),
-            8 => Ok(Self::U64(d.slice()?)),
+            4 => Ok(Self::U32(d.buf()?)),
+            8 => Ok(Self::U64(d.buf()?)),
             _ => Err(corrupt("unknown offset width")),
         }
     }
@@ -744,9 +796,9 @@ impl Offsets {
         };
         match self {
             _ if !valid => Err(corrupt("offsets are out of order or out of bounds")),
-            Self::U64(offsets) if u32::try_from(end).is_ok() => {
-                Ok(Self::U32(offsets.into_iter().map(|o| o as u32).collect()))
-            }
+            Self::U64(offsets) if u32::try_from(end).is_ok() => Ok(Self::U32(
+                offsets.iter().map(|&o| o as u32).collect::<Vec<_>>().into(),
+            )),
             offsets => Ok(offsets),
         }
     }
@@ -773,9 +825,9 @@ impl Ids {
     /// Decode ids that are all below `limit`.
     fn decode(d: &mut Decoder<'_>, limit: u64) -> Result<Self> {
         let ids = match d.u8()? {
-            1 => Self::U8(d.slice()?),
-            2 => Self::U16(d.slice()?),
-            4 => Self::U32(d.slice()?),
+            1 => Self::U8(d.buf()?),
+            2 => Self::U16(d.buf()?),
+            4 => Self::U32(d.buf()?),
             _ => return Err(corrupt("unknown id width")),
         };
         if (0..ids.len()).any(|index| u64::from(ids.get(index)) >= limit) {
@@ -785,22 +837,62 @@ impl Ids {
     }
 }
 
-impl<T: Pod + ToLe> Scalars<T> {
+impl<T: Pod + ToLe + Send + Sync> Scalars<T> {
     fn encode(&self, e: &mut Encoder) {
         e.slice(&self.values);
         encode_presence(e, &self.present);
     }
 
     fn decode(d: &mut Decoder<'_>, rows: usize) -> Result<Self> {
-        let values = d.slice::<T>()?;
+        let values = d.buf::<T>()?;
         if values.len() != rows {
             return Err(corrupt("column has a wrong length"));
         }
         Ok(Self {
             values,
             present: decode_presence(d, rows)?,
-            order: Vec::new(),
+            order: Buf::default(),
         })
+    }
+}
+
+impl<T: Pod + ToLe + PartialOrd + Send + Sync> Scalars<T> {
+    /// Encode a numeric column with its `order`.
+    fn encode_indexed(&self, e: &mut Encoder) {
+        self.encode(e);
+        e.slice(&self.order);
+    }
+
+    /// Decode a numeric column whose values are not NaN, reading its `order`
+    /// from a version 2 file and building it for a version 1 file.
+    fn decode_indexed(self, d: &mut Decoder<'_>, version: u32) -> Result<Self> {
+        if version == 1 {
+            return Ok(self.indexed());
+        }
+        let order = d.buf::<u32>()?;
+        let rows = self.values.len();
+        let mut seen = vec![0u64; word_count(rows)];
+        let mut first = |row: usize| {
+            let bit = 1 << (row % 64);
+            let new = seen[row / 64] & bit == 0;
+            seen[row / 64] |= bit;
+            new
+        };
+        let count = (0..rows).filter(|&row| present(&self.present, row)).count();
+        let valid = order.len() == count
+            && order.iter().all(|&row| {
+                let row = row as usize;
+                row < rows && present(&self.present, row) && first(row)
+            })
+            && order
+                .windows(2)
+                .all(|w| self.values[w[0] as usize] <= self.values[w[1] as usize]);
+        if !valid {
+            return Err(corrupt(
+                "column order is not sorted or refers outside the segment",
+            ));
+        }
+        Ok(Self { order, ..self })
     }
 }
 
@@ -812,7 +904,7 @@ impl Strings {
 
     fn decode(d: &mut Decoder<'_>, version: u32, count: usize, utf8: bool) -> Result<Self> {
         let offsets = Offsets::read(d, version)?;
-        let data = d.slice::<u8>()?;
+        let data = d.buf::<u8>()?;
         let strings = Self {
             offsets: offsets.checked(count, data.len())?,
             data,
@@ -879,8 +971,8 @@ impl Keywords {
     fn decode_v1(d: &mut Decoder<'_>, dict: Strings, rows: usize) -> Result<Self> {
         let offsets = Offsets::read(d, 1)?;
         let ids = d.slice::<u32>()?;
-        d.slice::<u64>()?;
-        d.slice::<u32>()?;
+        d.skip_slice::<u64>()?;
+        d.skip_slice::<u32>()?;
         let offsets = offsets.checked(rows, ids.len())?;
         let valid = (0..rows).all(|row| {
             let row_ids = &ids[offsets.range(row)];
@@ -890,7 +982,7 @@ impl Keywords {
         if !valid {
             return Err(corrupt("keyword index refers outside the segment"));
         }
-        Ok(Self::new(dict, offsets, ids))
+        Ok(Self::new(dict, offsets, &ids))
     }
 }
 
@@ -903,10 +995,10 @@ impl Postings {
     }
 
     fn decode(d: &mut Decoder<'_>, rows: usize, terms: usize) -> Result<Self> {
-        let list = d.slice::<u32>()?;
+        let list = d.buf::<u32>()?;
         let offsets = Offsets::read(d, 2)?.checked(terms, list.len())?;
-        let dense = d.slice::<u32>()?;
-        let words = d.slice::<u64>()?;
+        let dense = d.buf::<u32>()?;
+        let words = d.buf::<u64>()?;
         let width = word_count(rows);
         let used = rows % 64;
         let valid = list.iter().all(|&row| (row as usize) < rows)
@@ -934,15 +1026,11 @@ impl Postings {
 impl Column {
     pub(crate) fn encode(&self, e: &mut Encoder) {
         match self {
-            Self::U32(c) => c.encode(e),
-            Self::U64(c) => c.encode(e),
-            Self::I64(c) => c.encode(e),
-            Self::F32(c) => c.encode(e),
-            Self::Bool(c) => {
-                let bytes: Vec<u8> = c.values.iter().map(|&v| u8::from(v)).collect();
-                e.slice(&bytes);
-                encode_presence(e, &c.present);
-            }
+            Self::U32(c) => c.encode_indexed(e),
+            Self::U64(c) => c.encode_indexed(e),
+            Self::I64(c) => c.encode_indexed(e),
+            Self::F32(c) => c.encode_indexed(e),
+            Self::Bool(c) => c.encode(e),
             Self::Keywords(c) => c.encode(e),
             Self::Blobs(c) => {
                 c.items.encode(e);
@@ -965,26 +1053,22 @@ impl Column {
         version: u32,
     ) -> Result<Self> {
         Ok(match ty {
-            FieldType::U32 => Self::U32(Scalars::decode(d, rows)?.indexed()),
-            FieldType::U64 => Self::U64(Scalars::decode(d, rows)?.indexed()),
-            FieldType::I64 => Self::I64(Scalars::decode(d, rows)?.indexed()),
+            FieldType::U32 => Self::U32(Scalars::decode(d, rows)?.decode_indexed(d, version)?),
+            FieldType::U64 => Self::U64(Scalars::decode(d, rows)?.decode_indexed(d, version)?),
+            FieldType::I64 => Self::I64(Scalars::decode(d, rows)?.decode_indexed(d, version)?),
             FieldType::F32 => {
                 let column = Scalars::<f32>::decode(d, rows)?;
                 if column.values.iter().any(|v| !v.is_finite()) {
                     return Err(corrupt("f32 column holds a value that is not finite"));
                 }
-                Self::F32(column.indexed())
+                Self::F32(column.decode_indexed(d, version)?)
             }
             FieldType::Bool => {
-                let bytes = Scalars::<u8>::decode(d, rows)?;
-                if bytes.values.iter().any(|&b| b > 1) {
+                let column = Scalars::<u8>::decode(d, rows)?;
+                if column.values.iter().any(|&b| b > 1) {
                     return Err(corrupt("bool column holds a value other than 0 or 1"));
                 }
-                Self::Bool(Scalars {
-                    values: bytes.values.iter().map(|&b| b == 1).collect(),
-                    present: bytes.present,
-                    order: Vec::new(),
-                })
+                Self::Bool(column)
             }
             FieldType::Keyword | FieldType::Keywords => {
                 Self::Keywords(Keywords::decode(d, version, rows)?)
@@ -1005,6 +1089,60 @@ impl Column {
                 })
             }
         })
+    }
+}
+
+#[cfg(test)]
+impl Column {
+    /// The bytes of every array of this column.
+    pub(crate) fn arrays(&self) -> Vec<&[u8]> {
+        fn bytes<T: Pod>(buf: &Buf<T>) -> &[u8] {
+            bytemuck::cast_slice(buf)
+        }
+        fn offsets(offsets: &Offsets) -> &[u8] {
+            match offsets {
+                Offsets::U32(o) => bytes(o),
+                Offsets::U64(o) => bytes(o),
+            }
+        }
+        fn strings(strings: &Strings) -> [&[u8]; 2] {
+            [offsets(&strings.offsets), bytes(&strings.data)]
+        }
+        fn scalars<T: Pod>(c: &Scalars<T>) -> Vec<&[u8]> {
+            [bytes(&c.values), bytes(&c.order)]
+                .into_iter()
+                .chain(c.present.as_ref().map(bytes))
+                .collect()
+        }
+        match self {
+            Self::U32(c) => scalars(c),
+            Self::U64(c) => scalars(c),
+            Self::I64(c) => scalars(c),
+            Self::F32(c) => scalars(c),
+            Self::Bool(c) => scalars(c),
+            Self::Keywords(c) => {
+                let ids = match &c.ids {
+                    Ids::U8(ids) => bytes(ids),
+                    Ids::U16(ids) => bytes(ids),
+                    Ids::U32(ids) => bytes(ids),
+                };
+                let p = &c.postings;
+                strings(&c.dict)
+                    .into_iter()
+                    .chain([ids, offsets(&p.offsets), bytes(&p.rows), bytes(&p.dense)])
+                    .chain([bytes(&p.words)])
+                    .chain(c.offsets.as_ref().map(offsets))
+                    .collect()
+            }
+            Self::Blobs(c) => strings(&c.items)
+                .into_iter()
+                .chain(c.present.as_ref().map(bytes))
+                .collect(),
+            Self::TextList(c) => strings(&c.items)
+                .into_iter()
+                .chain([offsets(&c.row_offsets)])
+                .collect(),
+        }
     }
 }
 
@@ -1154,9 +1292,10 @@ mod tests {
                 });
             }
             let built = builder.finish();
-            let mut e = Encoder::default();
+            let mut e = Encoder::aligned();
             built.encode(&mut e);
             let mut d = Decoder::new(e.as_bytes());
+            d.set_aligned();
             let decoded = Column::decode(&mut d, ty, values.len(), 2).unwrap();
             assert!(d.is_empty());
             let rows: Vec<Vec<String>> = values
@@ -1213,15 +1352,16 @@ mod tests {
 
     #[test]
     fn offsets_widen_past_u32_and_narrow_when_read() {
-        let mut offsets = Offsets::new();
+        let mut offsets = OffsetsBuilder::new();
         offsets.push(5);
         offsets.push(1 << 33);
-        assert!(matches!(offsets, Offsets::U64(_)));
+        assert!(matches!(offsets, OffsetsBuilder::U64(_)));
+        let offsets = offsets.finish();
         assert_eq!((offsets.count(), offsets.range(1)), (2, 5..1 << 33));
         assert!(matches!(offsets.checked(2, 1 << 33), Ok(Offsets::U64(_))));
-        let narrow = Offsets::U64(vec![0, 3, 7]).checked(2, 7);
-        assert!(matches!(narrow, Ok(Offsets::U32(o)) if o == [0, 3, 7]));
-        assert!(Offsets::U64(vec![0, 8, 7]).checked(2, 7).is_err());
-        assert!(Offsets::U32(vec![0, 7]).checked(2, 7).is_err());
+        let narrow = Offsets::U64(vec![0, 3, 7].into()).checked(2, 7);
+        assert!(matches!(narrow, Ok(Offsets::U32(o)) if o[..] == [0, 3, 7]));
+        assert!(Offsets::U64(vec![0, 8, 7].into()).checked(2, 7).is_err());
+        assert!(Offsets::U32(vec![0, 7].into()).checked(2, 7).is_err());
     }
 }

@@ -1,10 +1,16 @@
 //! Little-endian binary encoding shared by storage files.
 //!
 //! Integers are little-endian. A slice is its element count as `u64`, then its
-//! elements, then zero padding to a multiple of 8 bytes. Decoding checks every bound and
-//! returns [`RingDbError::Corrupt`] instead of panicking.
-use bytemuck::Pod;
+//! elements, then zero padding to a multiple of 8 bytes. In an aligned encoding,
+//! zero padding also puts each count at a multiple of 8 bytes, so that the
+//! elements of a mapped file can be read in place. Decoding checks every bound
+//! and returns [`RingDbError::Corrupt`] instead of panicking.
+use std::sync::Arc;
 
+use bytemuck::Pod;
+use memmap2::Mmap;
+
+use crate::buf::Buf;
 use crate::error::{Result, RingDbError};
 
 pub(crate) fn corrupt(message: impl Into<String>) -> RingDbError {
@@ -14,9 +20,22 @@ pub(crate) fn corrupt(message: impl Into<String>) -> RingDbError {
 #[derive(Default)]
 pub(crate) struct Encoder {
     bytes: Vec<u8>,
+    aligned: bool,
 }
 
 impl Encoder {
+    /// An encoder of slices that start at multiples of 8 bytes.
+    pub(crate) fn aligned() -> Self {
+        Self {
+            bytes: Vec::new(),
+            aligned: true,
+        }
+    }
+
+    fn pad(&mut self) {
+        self.bytes.resize(self.bytes.len().next_multiple_of(8), 0);
+    }
+
     pub(crate) fn as_bytes(&self) -> &[u8] {
         &self.bytes
     }
@@ -47,6 +66,9 @@ impl Encoder {
 
     /// A count, then the little-endian values, padded to 8 bytes.
     pub(crate) fn slice<T: Pod + ToLe>(&mut self, values: &[T]) {
+        if self.aligned {
+            self.pad();
+        }
         self.u64(values.len() as u64);
         if cfg!(target_endian = "little") {
             self.bytes.extend_from_slice(bytemuck::cast_slice(values));
@@ -69,11 +91,33 @@ impl Encoder {
 pub(crate) struct Decoder<'a> {
     bytes: &'a [u8],
     at: usize,
+    aligned: bool,
+    /// The mapping that `bytes` start, from which [`Decoder::buf`] borrows.
+    map: Option<&'a Arc<Mmap>>,
 }
 
 impl<'a> Decoder<'a> {
     pub(crate) fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, at: 0 }
+        Self {
+            bytes,
+            at: 0,
+            aligned: false,
+            map: None,
+        }
+    }
+
+    /// A decoder over a mapped file without its CRC-32 trailer, after checking
+    /// it. Its slices borrow from `map` where they can.
+    pub(crate) fn mapped(map: &'a Arc<Mmap>, what: &str) -> Result<Self> {
+        Ok(Self {
+            map: Some(map),
+            ..Self::with_crc(map, what)?
+        })
+    }
+
+    /// Read the rest as an aligned encoding.
+    pub(crate) fn set_aligned(&mut self) {
+        self.aligned = true;
     }
 
     /// A decoder over `bytes` without its CRC-32 trailer, after checking it.
@@ -154,17 +198,53 @@ impl<'a> Decoder<'a> {
     }
 
     pub(crate) fn slice<T: Pod + ToLe>(&mut self) -> Result<Vec<T>> {
+        let bytes = self.slice_bytes::<T>()?;
+        let mut values: Vec<T> = bytemuck::pod_collect_to_vec(bytes);
+        if cfg!(target_endian = "big") {
+            values.iter_mut().for_each(ToLe::swap);
+        }
+        Ok(values)
+    }
+
+    /// A slice, borrowed from the mapped file when its elements are aligned
+    /// and in native byte order, and copied otherwise.
+    pub(crate) fn buf<T: Pod + ToLe + Send + Sync>(&mut self) -> Result<Buf<T>> {
+        let start = self.bytes.as_ptr() as usize;
+        let bytes = self.slice_bytes::<T>()?;
+        let offset = bytes.as_ptr() as usize - start;
+        let borrowed = self
+            .map
+            .filter(|_| cfg!(target_endian = "little"))
+            .and_then(|map| Buf::mapped(map, offset..offset + bytes.len()));
+        match borrowed {
+            Some(buf) => Ok(buf),
+            None => {
+                let mut values: Vec<T> = bytemuck::pod_collect_to_vec(bytes);
+                if cfg!(target_endian = "big") {
+                    values.iter_mut().for_each(ToLe::swap);
+                }
+                Ok(values.into())
+            }
+        }
+    }
+
+    pub(crate) fn skip_slice<T>(&mut self) -> Result<()> {
+        self.slice_bytes::<T>().map(drop)
+    }
+
+    /// The bytes of the next slice of `T`, after its count.
+    fn slice_bytes<T>(&mut self) -> Result<&'a [u8]> {
+        if self.aligned {
+            let padding = self.at.next_multiple_of(8) - self.at;
+            self.take(padding)?;
+        }
         let count = usize::try_from(self.u64()?).map_err(|_| corrupt("slice is too long"))?;
         let len = count
             .checked_mul(size_of::<T>())
             .ok_or_else(|| corrupt("slice is too long"))?;
         let bytes = self.take(len)?;
         self.take(len.next_multiple_of(8) - len)?;
-        let mut values: Vec<T> = bytemuck::pod_collect_to_vec(bytes);
-        if cfg!(target_endian = "big") {
-            values.iter_mut().for_each(ToLe::swap);
-        }
-        Ok(values)
+        Ok(bytes)
     }
 }
 

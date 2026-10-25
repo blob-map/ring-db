@@ -388,11 +388,13 @@ To add many records, use one `add_all`, not many `add` calls.
 - Each file has a checksum. If a file is damaged, `Db::open` returns `Corrupt`.
 - `db.backup(directory)` copies the database to a new, empty directory. Open the copy with `Db::open`.
 
-When ring-db opens a database, it reads all segment files into memory.
-For a short time, it needs about two times the size of the files.
+ring-db maps the segment files into memory and reads them in place.
+The kernel keeps the data in its page cache, and can remove it when other programs need the memory.
+Then the next search that needs the data reads it again from the disk.
 
 The database directory is for ring-db only.
 Do not change its files, and do not put other files in it.
+If a program changes a segment file while a `Db` has it open, the process can stop with an error signal.
 
 ### 10. Use a GPU
 
@@ -421,7 +423,8 @@ If no compatible device is available, `Db::in_memory` and `Db::open` return `Bac
 ring-db does not change to the CPU automatically.
 
 ring-db copies the vectors to the GPU one time and keeps them there.
-It also keeps the vectors in the host memory, so the vectors use memory two times.
+In a database on disk, ring-db then releases the host memory of the vectors.
+`Db::in_memory` keeps a second copy of the vectors in the host memory.
 All vectors must fit in the GPU memory.
 A GPU search has a fixed cost of about 0.1 ms.
 Thus ring-db uses the CPU when a segment has few rows that pass the filter, because the CPU is faster for them.

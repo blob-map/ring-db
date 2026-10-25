@@ -196,6 +196,11 @@ pub(crate) fn write_segment(dir: &Path, segment: &Segment) -> Result<()> {
     Ok(())
 }
 
+/// Map segment file `id` of `dir`.
+pub(crate) fn read_segment(dir: &Path, schema: &Schema, id: u64) -> Result<Segment> {
+    Segment::map(&File::open(segment_path(dir, id))?, schema, id)
+}
+
 /// Read log frames until the end or the first torn frame. With `repair`, cut
 /// the file there so that new frames follow the last complete one.
 fn replay(path: &Path, schema: &Schema, repair: bool) -> Result<Vec<Change>> {
@@ -285,7 +290,7 @@ fn load(
         .parts
         .iter()
         .map(|(id, deleted)| {
-            let segment = Segment::decode(&fs::read(segment_path(dir, *id))?, schema, *id)?;
+            let segment = read_segment(dir, schema, *id)?;
             let valid = deleted.windows(2).all(|w| w[0] < w[1])
                 && deleted
                     .last()

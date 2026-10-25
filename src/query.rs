@@ -4,6 +4,7 @@ use std::sync::Arc;
 use smallvec::SmallVec;
 
 use crate::backend::DiskSpec;
+use crate::buf::Buf;
 use crate::error::{Result, RingDbError};
 use crate::filter::Filter;
 use crate::snapshot::Snapshot;
@@ -202,7 +203,7 @@ pub(crate) struct KeyLookup(Arc<[SegmentKeys]>);
 #[derive(Debug)]
 struct SegmentKeys {
     base: u32,
-    keys: Arc<[Key]>,
+    keys: Buf<Key>,
     /// Set when the keys have no gaps, so that a key is computed without
     /// reading `keys`, as in a database that was only appended to.
     contiguous: bool,
@@ -210,7 +211,7 @@ struct SegmentKeys {
 
 impl KeyLookup {
     /// `segments` gives each segment's base row and its sorted keys.
-    pub(crate) fn new(segments: impl IntoIterator<Item = (u32, Arc<[Key]>)>) -> Self {
+    pub(crate) fn new(segments: impl IntoIterator<Item = (u32, Buf<Key>)>) -> Self {
         Self(
             segments
                 .into_iter()
@@ -452,7 +453,9 @@ mod tests {
 
     #[test]
     fn keys_resolve_with_and_without_gaps() {
-        let keys = |values: &[u64]| -> Arc<[Key]> { values.iter().copied().map(Key).collect() };
+        let keys = |values: &[u64]| -> Buf<Key> {
+            values.iter().copied().map(Key).collect::<Vec<_>>().into()
+        };
         let lookup = KeyLookup::new([(0, keys(&[5, 6, 7])), (3, keys(&[9, 12])), (5, keys(&[20]))]);
         let found: Vec<u64> = (0..6).map(|row| lookup.key(row).0).collect();
         assert_eq!(found, [5, 6, 7, 9, 12, 20]);

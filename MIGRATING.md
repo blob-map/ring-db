@@ -4,8 +4,9 @@
 
 The API of 0.10 does not change.
 
-Version 0.11 writes segment files in a new format, with smaller keyword fields.
-It reads the files of version 0.10.
+Version 0.11 maps the segment files into memory and uses much less memory.
+It writes segment files in a new format, with smaller keyword fields.
+It reads the files of version 0.10, but it copies some of their data into memory.
 Each new segment file has the new format, and `db.compact()` writes all records again in the new format.
 ring-db 0.10 cannot read the new files.
 To go back to 0.10 later, keep a copy of the database before you open it for writing with 0.11.

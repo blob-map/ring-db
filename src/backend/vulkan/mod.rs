@@ -137,6 +137,17 @@ impl VulkanDevice {
     /// Upload row-major `vectors`. Each chunk is transposed independently so
     /// coordinate reads are coalesced across rows.
     pub(crate) fn upload(&self, dims: usize, vectors: &[f32]) -> Result<VulkanSegment> {
+        self.upload_staged(dims, vectors, UPLOAD_STAGING_BYTES)
+    }
+
+    /// [`VulkanDevice::upload`], staging about `staging_bytes` of vectors at
+    /// a time.
+    fn upload_staged(
+        &self,
+        dims: usize,
+        vectors: &[f32],
+        staging_bytes: usize,
+    ) -> Result<VulkanSegment> {
         if dims == 0 || dims > u32::MAX as usize || !vectors.len().is_multiple_of(dims) {
             return Err(RingDbError::Backend(
                 "invalid Vulkan dataset dimensions".to_string(),
@@ -152,15 +163,8 @@ impl VulkanDevice {
         for offset in (0..rows).step_by(chunk_rows) {
             let count = (rows - offset).min(chunk_rows);
             let source = &vectors[offset * dims..(offset + count) * dims];
-            let mut transposed = vec![0.0f32; source.len()];
-            for (id, row) in source.chunks_exact(dims).enumerate() {
-                for (dim, value) in row.iter().enumerate() {
-                    transposed[dim * count + id] = *value;
-                }
-            }
-            let vectors = self.resident(bytemuck::cast_slice(&transposed))?;
             chunks.push(Chunk {
-                vectors,
+                vectors: self.resident_transposed(source, dims, staging_bytes)?,
                 offset,
                 rows: count,
             });
@@ -168,13 +172,38 @@ impl VulkanDevice {
         Ok(VulkanSegment { chunks, dims })
     }
 
-    fn resident(&self, bytes: &[u8]) -> Result<Buffer> {
-        let mut staging = Buffer::new(&self.context, bytes.len(), true)?;
-        staging.write(bytes)?;
-        let buffer = Buffer::new(&self.context, bytes.len(), false)?;
-        self.execution()?
-            .execution
-            .copy(&staging, 0, &buffer, bytes.len())?;
+    /// A device buffer of row-major `source`, with the coordinates of each
+    /// dimension stored together. Blocks of rows go through a staging buffer
+    /// of about `staging_bytes`, so host memory stays bounded.
+    fn resident_transposed(
+        &self,
+        source: &[f32],
+        dims: usize,
+        staging_bytes: usize,
+    ) -> Result<Buffer> {
+        let rows = source.len() / dims;
+        let buffer = Buffer::new(&self.context, size_of_val(source), false)?;
+        let block = (staging_bytes / (dims * 4)).clamp(1, rows);
+        let mut staging = Buffer::new(&self.context, block * dims * 4, true)?;
+        let mut transposed = vec![0.0f32; block * dims];
+        let mut regions = Vec::with_capacity(dims);
+        for start in (0..rows).step_by(block) {
+            let count = (rows - start).min(block);
+            let block_rows = &source[start * dims..(start + count) * dims];
+            for (id, row) in block_rows.chunks_exact(dims).enumerate() {
+                for (dim, value) in row.iter().enumerate() {
+                    transposed[dim * count + id] = *value;
+                }
+            }
+            staging.write(bytemuck::cast_slice(&transposed[..count * dims]))?;
+            regions.clear();
+            regions.extend(
+                (0..dims).map(|dim| (dim * count * 4, (dim * rows + start) * 4, count * 4)),
+            );
+            self.execution()?
+                .execution
+                .copy_regions(&staging, &buffer, &regions)?;
+        }
         Ok(buffer)
     }
 
@@ -562,6 +591,9 @@ fn dense_word(words: &[u64], index: usize) -> u32 {
 
 /// `RINGDB_VULKAN_CHUNK_BYTES` lowers the vector-buffer size to exercise chunked
 /// paths in tests and benchmarks. It never raises a device limit.
+/// Bytes of vectors that an upload stages at a time.
+const UPLOAD_STAGING_BYTES: usize = 64 << 20;
+
 fn vector_byte_limit(limit: usize) -> Result<usize> {
     match std::env::var("RINGDB_VULKAN_CHUNK_BYTES") {
         Ok(value) => Ok(value
@@ -601,6 +633,31 @@ fn chunk_row_limit(dims: usize, vector_bytes: usize, buffer_bytes: usize) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn staged_uploads_transpose_every_block() {
+        if std::env::var("RINGDB_VULKAN_TEST").as_deref() != Ok("1") {
+            return;
+        }
+        let device = VulkanDevice::new().unwrap();
+        let (dims, rows) = (3, 1000);
+        let vectors: Vec<f32> = (0..rows * dims).map(|i| i as f32).collect();
+        // Blocks of 7 rows, the last one shorter.
+        let segment = device.upload_staged(dims, &vectors, 7 * dims * 4).unwrap();
+        let chunk = &segment.chunks[0];
+        let readback = Buffer::new(&device.context, rows * dims * 4, true).unwrap();
+        let mut state = device.execution().unwrap();
+        state
+            .execution
+            .copy(&chunk.vectors, 0, &readback, rows * dims * 4)
+            .unwrap();
+        let actual: Vec<f32> = readback.read(rows * dims).unwrap();
+        let expected: Vec<f32> = (0..dims)
+            .flat_map(|dim| (0..rows).map(move |row| (row * dims + dim) as f32))
+            .collect();
+        assert_eq!(segment.chunks.len(), 1);
+        assert_eq!(actual, expected);
+    }
 
     #[test]
     fn chunk_limits_cover_vectors_outputs_and_reductions() {

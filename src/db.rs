@@ -475,13 +475,17 @@ impl Shared {
         self.next_segment.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Upload `segment` and write its file, as configured.
+    /// Write the file of `segment` and upload it, as configured. A written
+    /// segment is then read from its mapped file, so that the kernel can evict
+    /// its pages.
     fn prepare(&self, segment: &mut Segment) -> Result<()> {
-        upload(self.device.as_ref(), &self.options, segment)?;
-        if let Some(dir) = &self.dir {
+        if let Some(dir) = &self.dir
+            && !segment.is_mapped()
+        {
             store::write_segment(dir, segment)?;
+            *segment = store::read_segment(dir, &self.schema, segment.id)?;
         }
-        Ok(())
+        upload(self.device.as_ref(), &self.options, segment)
     }
 
     fn manifest(&self, writer: &Writer, parts: &[Part]) -> Manifest {
