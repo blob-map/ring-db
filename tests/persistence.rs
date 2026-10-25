@@ -499,3 +499,26 @@ fn background_commits_are_durable() {
     let db = open_with(dir.path(), schema(), options).unwrap();
     assert_eq!(contents(&db), expected);
 }
+
+#[cfg(unix)]
+#[test]
+fn background_commit_errors_are_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let options = Options::default().commit_interval(Some(std::time::Duration::from_millis(5)));
+    let db = open_with(&path, schema(), options).unwrap();
+    assert!(db.take_background_error().is_none());
+    // The open log still accepts writes, but no segment file can be created.
+    fs::remove_dir_all(&path).unwrap();
+    db.add(record(0)).unwrap();
+    let started = std::time::Instant::now();
+    let error = loop {
+        if let Some(error) = db.take_background_error() {
+            break error;
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    assert!(matches!(error, RingDbError::Io(_)), "{error}");
+    assert!(matches!(db.flush(), Err(RingDbError::Io(_))));
+}

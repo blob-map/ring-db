@@ -62,6 +62,8 @@ struct Shared {
     current: RwLock<Snapshot>,
     /// Held while a merge builds, so that only one merge runs at a time.
     merging: Mutex<()>,
+    /// The last error of the commit thread, not yet taken.
+    background_error: Mutex<Option<RingDbError>>,
 }
 
 /// Changes since the last commit. Lock `writer` before `current`.
@@ -261,6 +263,7 @@ impl Db {
             writer: Mutex::new(writer),
             current: RwLock::new(current),
             merging: Mutex::new(()),
+            background_error: Mutex::new(None),
             next_segment: AtomicU64::new(next_segment),
             dir,
             read_only,
@@ -430,6 +433,13 @@ impl Db {
 
     pub fn backend(&self) -> BackendPreference {
         self.shared.options.backend
+    }
+
+    /// Take the last error of a background commit or merge, if one failed
+    /// since the previous call. The changes of a failed commit stay pending,
+    /// and the next commit retries them.
+    pub fn take_background_error(&self) -> Option<RingDbError> {
+        lock(&self.shared.background_error).take()
     }
 }
 
@@ -703,9 +713,11 @@ impl Committer {
                         .0;
                     if !*stopped {
                         drop(stopped);
-                        // A failure leaves the changes pending; the next
-                        // commit or `flush` retries and reports it.
-                        let _ = shared.flush();
+                        // A failure leaves the changes pending, and the
+                        // next commit retries them.
+                        if let Err(error) = shared.flush() {
+                            *lock(&shared.background_error) = Some(error);
+                        }
                         stopped = lock(&signal.0);
                     }
                 }
