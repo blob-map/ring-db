@@ -35,7 +35,7 @@ Add ring-db to `Cargo.toml`:
 
 ```toml
 [dependencies]
-ring-db = "0.9"
+ring-db = "0.10"
 ```
 
 The crate name is `ring-db`, and the library name is `ringdb`.

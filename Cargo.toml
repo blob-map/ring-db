@@ -1,6 +1,6 @@
 [package]
 name = "ring-db"
-version = "0.9.1"
+version = "0.10.0"
 edition = "2024"
 description = "Exact vector search with typed filters and durable storage, on a CPU or a Vulkan GPU."
 license = "MIT OR Apache-2.0"
