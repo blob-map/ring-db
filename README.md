@@ -35,7 +35,7 @@ Add ring-db to `Cargo.toml`:
 
 ```toml
 [dependencies]
-ring-db = "0.10"
+ring-db = "0.11"
 ```
 
 The crate name is `ring-db`, and the library name is `ringdb`.
@@ -433,7 +433,7 @@ If no compatible device is available, `Db::in_memory` and `Db::open` return `Bac
 ring-db does not change to the CPU automatically.
 
 ring-db copies the vectors to the GPU one time and keeps them there.
-In a database on disk, ring-db then releases the host memory of the vectors.
+On Linux and other Unix systems, ring-db then releases the host memory of the vectors of a database on disk.
 `Db::in_memory` keeps a second copy of the vectors in the host memory.
 All vectors must fit in the GPU memory.
 A GPU search has a fixed cost of about 0.1 ms.
