@@ -205,10 +205,11 @@ Each search has at most one `&Filter`; there are no per-disk filters.
 
 `RegionResult` stores flat `u32` records `[row, d0..dN-1]` (distances as `f32`
 bits). Rows are numbered across the snapshot's segments; keys resolve lazily
-through per-segment `(base row, Arc<[Key]>)` parts. A part whose keys have no gaps
-computes `keys[0] + (row - base)` without reading `keys`: GPU hits come back in
-random row order, so reading the key array cost a cache miss per hit. `RegionHit::dists_sq`
-returns every disk's squared distance in disk order; there is no combined score.
+through `KeyLookup`, one `SegmentKeys` (base row, `Buf<Key>`) per segment. A
+segment whose keys have no gaps computes `keys[0] + (row - base)` without reading
+`keys`: GPU hits come back in random row order, so reading the key array cost a
+cache miss per hit. `RegionHit::dists_sq` returns every disk's squared distance
+in disk order; there is no combined score.
 Do not split records into separate key and distance vectors: large fresh result
 allocations page-fault, and the extra bytes cost several percent on region scans.
 
@@ -351,9 +352,9 @@ process (`MADV_DONTNEED`); CPU searches fault them back. The Vulkan upload stage
 `UPLOAD_STAGING_BYTES` of rows at a time and copies each dimension's run with
 one `copy_regions` submission, so host memory stays bounded. Region searches
 read records in batches of slots (`slot_base` up to `work_count`) whose output
-fits `REGION_OUTPUT_BYTES`, so the output and readback buffers stay bounded. Removing a mapped file
-can fail on Windows; `remove_segment` ignores the error, and the next open
-removes the file.
+fits `REGION_OUTPUT_BYTES`, so the output and readback buffers stay bounded.
+Removing a mapped file can fail on Windows; `remove_segment` ignores the error,
+and the next open removes the file.
 
 Each `apply` (and so `add`/`add_all`/`delete`) appends one frame and calls
 `sync_data` before returning, so recovery keeps a whole batch or none of it. An

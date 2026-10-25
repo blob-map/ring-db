@@ -2,7 +2,13 @@
 
 ## From 0.10 to 0.11
 
-The API of 0.10 does not change.
+Code written for 0.10 compiles with 0.11 without changes.
+Version 0.11 adds `Db::import`, `Db::open_read_only`, `Db::count`, `Db::take_background_error`, the `Count` and `Facets` searches, and the error `RingDbError::ReadOnly`.
+
+Two behaviors change:
+
+- **KNN.** A record whose squared distance is too large for `f32` is not in the results. Region searches already did not return such records.
+- **Opening.** `Db::open` removes only its own files: `MANIFEST.tmp`, and segment files and logs that the manifest does not name. In 0.10, it also removed other files with a name that starts with `seg-` or `wal-`, or ends with `.tmp`.
 
 Version 0.11 maps the segment files into memory and uses much less memory.
 It writes segment files in a new format, with smaller keyword fields.

@@ -617,14 +617,14 @@ fn dense_word(words: &[u64], index: usize) -> u32 {
     (words[index / 2] >> ((index % 2) * 32)) as u32
 }
 
-/// `RINGDB_VULKAN_CHUNK_BYTES` lowers the vector-buffer size to exercise chunked
-/// paths in tests and benchmarks. It never raises a device limit.
 /// Bytes of region records that the device holds at a time.
 const REGION_OUTPUT_BYTES: usize = 256 << 20;
 
 /// Bytes of vectors that an upload stages at a time.
 const UPLOAD_STAGING_BYTES: usize = 64 << 20;
 
+/// `RINGDB_VULKAN_CHUNK_BYTES` lowers the vector-buffer size to exercise chunked
+/// paths in tests and benchmarks. It never raises a device limit.
 fn vector_byte_limit(limit: usize) -> Result<usize> {
     match std::env::var("RINGDB_VULKAN_CHUNK_BYTES") {
         Ok(value) => Ok(value
