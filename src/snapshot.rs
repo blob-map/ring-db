@@ -84,7 +84,8 @@ impl Snapshot {
         }))
     }
 
-    /// Run a [`Knn`], [`Disk`](crate::Disk), or [`Region`] search.
+    /// Run a [`Knn`], [`Disk`](crate::Disk), [`Region`], or
+    /// [`Count`](crate::Count) search.
     pub fn search<Q: Query>(&self, query: Q) -> Result<Q::Output> {
         query.execute(self)
     }
@@ -100,6 +101,12 @@ impl Snapshot {
 
     pub fn len(&self) -> usize {
         self.0.len
+    }
+
+    /// Number of records that pass `filter`. No vector is read.
+    pub fn count(&self, filter: &Filter) -> Result<usize> {
+        let eligible = self.eligible(Some(filter))?;
+        Ok(eligible.iter().map(|(_, _, rows)| rows.len()).sum())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -188,7 +195,7 @@ impl Snapshot {
         Ok(hits)
     }
 
-    pub(crate) fn region(&self, region: &Region<'_>) -> Result<RegionResult> {
+    fn disks<'a>(&self, region: &Region<'a>) -> Result<SmallVec<[DiskSpec<'a>; 1]>> {
         if region.disks.len() > MAX_DISKS {
             return Err(RingDbError::InvalidQuery(format!(
                 "a region can contain at most {MAX_DISKS} disks, got {}",
@@ -196,16 +203,29 @@ impl Snapshot {
             )));
         }
         let dims = self.0.schema.dims();
-        let disks: SmallVec<[DiskSpec<'_>; 1]> = region
+        region
             .disks
             .iter()
             .map(|disk| validate_disk(dims, disk))
-            .collect::<Result<_>>()?;
+            .collect()
+    }
+
+    pub(crate) fn region(&self, region: &Region<'_>) -> Result<RegionResult> {
+        let disks = self.disks(region)?;
         let eligible = self.eligible(region.filter)?;
         let mut out = RegionResult::new(disks.len(), self.0.keys.clone());
         for (base, segment, rows) in &eligible {
             segment.region(*base, &disks, rows, &mut out.records)?;
         }
         Ok(out)
+    }
+
+    pub(crate) fn region_count(&self, region: &Region<'_>) -> Result<usize> {
+        let disks = self.disks(region)?;
+        let mut count = 0;
+        for (_, segment, rows) in &self.eligible(region.filter)? {
+            count += segment.region_count(&disks, rows)?;
+        }
+        Ok(count)
     }
 }

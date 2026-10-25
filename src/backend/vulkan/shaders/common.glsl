@@ -22,7 +22,7 @@ layout(push_constant) uniform Params {
     uint work_count;
     uint candidate_offset;
     uint disk_count;
-    uint mode; // 0: region, 1: KNN
+    uint mode; // 0: region, 1: KNN, 2: region count
     uint reduce_count;
     uint output_index;
     uint row_offset; // first row of the chunk within its segment

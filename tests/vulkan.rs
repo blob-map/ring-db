@@ -60,10 +60,9 @@ fn parity_knn(cpu: &Db, gpu: &Db, query: Knn<'_>) {
 }
 
 fn parity_region(cpu: &Db, gpu: &Db, query: Region<'_>) {
-    same_region(
-        &cpu.search(query.clone()).unwrap(),
-        &gpu.search(query).unwrap(),
-    );
+    let expected = cpu.search(query.clone()).unwrap();
+    same_region(&expected, &gpu.search(query.clone()).unwrap());
+    assert_eq!(gpu.search(query.count()).unwrap(), expected.len());
 }
 
 #[test]

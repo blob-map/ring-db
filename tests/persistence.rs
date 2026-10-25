@@ -377,7 +377,10 @@ fn read_only_opens_change_no_file() {
     assert!(matches!(db.flush(), Err(RingDbError::ReadOnly)));
     assert!(matches!(db.compact(), Err(RingDbError::ReadOnly)));
     let backup = tempfile::tempdir().unwrap();
-    assert!(matches!(db.backup(backup.path()), Err(RingDbError::ReadOnly)));
+    assert!(matches!(
+        db.backup(backup.path()),
+        Err(RingDbError::ReadOnly)
+    ));
     // Readers share the directory, and keep writers out.
     let other = open_read_only(dir.path()).unwrap();
     assert_eq!(other.len(), 10);

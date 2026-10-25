@@ -120,6 +120,12 @@ impl<'a> Disk<'a> {
     pub fn filter(self, filter: &'a Filter) -> Region<'a> {
         Region::from(self).filter(filter)
     }
+
+    /// Count the records inside this disk.
+    #[must_use]
+    pub fn count(self) -> Count<'a> {
+        Region::from(self).count()
+    }
 }
 
 /// Every record inside all of its disks. It always contains at least one disk.
@@ -146,7 +152,27 @@ impl<'a> Region<'a> {
     pub fn disks(&self) -> &[Disk<'a>] {
         &self.disks
     }
+
+    /// Count the records inside this region, without returning them.
+    #[must_use]
+    pub fn count(self) -> Count<'a> {
+        Count(self)
+    }
 }
+
+/// The number of records inside a [`Region`]. Faster than the length of a
+/// [`RegionResult`], because no record is returned.
+///
+/// ```
+/// use ringdb::{Db, Disk, Options, Record, Schema};
+///
+/// let db = Db::in_memory(Schema::new(1), Options::default()).unwrap();
+/// db.add_all([1.0, 2.0, 5.0].map(|x| Record::new([x]))).unwrap();
+/// db.flush().unwrap();
+/// assert_eq!(db.search(Disk::new(&[0.0], 2.0).count()).unwrap(), 2);
+/// ```
+#[derive(Debug, Clone)]
+pub struct Count<'a>(Region<'a>);
 
 impl<'a> From<Disk<'a>> for Region<'a> {
     fn from(disk: Disk<'a>) -> Self {
@@ -264,7 +290,7 @@ mod sealed {
 }
 
 /// A search request accepted by `search`. Implemented by [`Knn`], [`Disk`],
-/// and [`Region`].
+/// [`Region`], and [`Count`].
 pub trait Query: sealed::Sealed {
     type Output;
 
@@ -275,6 +301,7 @@ pub trait Query: sealed::Sealed {
 impl sealed::Sealed for Knn<'_> {}
 impl sealed::Sealed for Disk<'_> {}
 impl sealed::Sealed for Region<'_> {}
+impl sealed::Sealed for Count<'_> {}
 
 impl Query for Knn<'_> {
     type Output = Vec<Hit>;
@@ -289,6 +316,14 @@ impl Query for Region<'_> {
 
     fn execute(self, snapshot: &Snapshot) -> Result<RegionResult> {
         snapshot.region(&self)
+    }
+}
+
+impl Query for Count<'_> {
+    type Output = usize;
+
+    fn execute(self, snapshot: &Snapshot) -> Result<usize> {
+        snapshot.region_count(&self.0)
     }
 }
 

@@ -18,6 +18,7 @@ use runtime::{Buffer, Context, Execution, Pipelines, WORKGROUP_SIZE, barrier, co
 const INVALID: u32 = u32::MAX;
 const REGION: u32 = 0;
 const KNN: u32 = 1;
+const COUNT: u32 = 2;
 
 // Must match shaders/common.glsl. Addresses come first for 8-byte alignment;
 // reserved makes the final padding explicit for Pod.
@@ -228,9 +229,28 @@ impl VulkanDevice {
         for chunk in &segment.chunks {
             let mut query = self.prepare(segment, chunk, disks, mask)?;
             query.params.row_base = base;
-            self.region_chunk(query, records)?;
+            self.region_chunk(query, Some(records))?;
         }
         Ok(())
+    }
+
+    /// Number of rows of `segment` inside all `disks`.
+    pub(crate) fn region_count(
+        &self,
+        segment: &VulkanSegment,
+        disks: &[DiskSpec<'_>],
+        mask: Mask<'_>,
+    ) -> Result<usize> {
+        if disks.is_empty() || disks.len() > MAX_DISKS {
+            return Err(RingDbError::InvalidQuery(format!(
+                "a region needs between 1 and {MAX_DISKS} disks"
+            )));
+        }
+        let mut count = 0;
+        for chunk in &segment.chunks {
+            count += self.region_chunk(self.prepare(segment, chunk, disks, mask)?, None)?;
+        }
+        Ok(count)
     }
 
     fn prepare(
@@ -343,17 +363,27 @@ impl VulkanDevice {
         self.context.dispatch(cmd, count);
     }
 
-    fn region_chunk(&self, mut query: PreparedQuery, records: &mut Vec<u32>) -> Result<()> {
+    /// Count the rows of a chunk inside the region, and append their records
+    /// to `records` if given.
+    fn region_chunk(
+        &self,
+        mut query: PreparedQuery,
+        records: Option<&mut Vec<u32>>,
+    ) -> Result<usize> {
         if query.eligible == 0 {
-            return Ok(());
+            return Ok(0);
         }
         let stride = 1 + query.params.disk_count as usize;
-        let output_words = query
-            .eligible
-            .checked_mul(stride)
-            .and_then(|n| n.checked_add(1))
-            .ok_or_else(size_error)?;
-        query.params.mode = REGION;
+        let output_words = match records {
+            Some(_) => query
+                .eligible
+                .checked_mul(stride)
+                .and_then(|n| n.checked_add(1))
+                .ok_or_else(size_error)?,
+            // Only the count.
+            None => 1,
+        };
+        query.params.mode = if records.is_some() { REGION } else { COUNT };
         let mut state = self.execution()?;
         let (execution, buffers) = state.buffers(&self.context)?;
         buffers.inputs.grow(word_bytes(query.inputs.len())?)?;
@@ -406,14 +436,15 @@ impl VulkanDevice {
                 "Vulkan returned an invalid hit count".to_string(),
             ));
         }
-        if count == 0 {
-            return Ok(());
-        }
+        let Some(records) = records.filter(|_| count > 0) else {
+            return Ok(count);
+        };
         // Records arrive in their final layout: one plain copy.
         let words = count * stride;
         buffers.readback.grow(word_bytes(words)?)?;
         execution.copy(&buffers.output, 4, &buffers.readback, word_bytes(words)?)?;
-        buffers.readback.read_into(records, 0, words)
+        buffers.readback.read_into(records, 0, words)?;
+        Ok(count)
     }
 
     fn knn_chunk(&self, mut query: PreparedQuery, k: usize) -> Result<Vec<RowHit>> {

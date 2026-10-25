@@ -11,6 +11,7 @@ use crate::backend::VulkanDevice;
 use crate::codec::corrupt;
 use crate::config::{BackendPreference, Options};
 use crate::error::{Result, RingDbError};
+use crate::filter::Filter;
 use crate::query::{Key, Query};
 use crate::schema::Schema;
 use crate::segment::{Segment, SegmentBuilder};
@@ -201,7 +202,11 @@ impl Db {
     /// write, including [`flush`](Self::flush), [`compact`](Self::compact), and
     /// [`backup`](Self::backup), returns [`RingDbError::ReadOnly`]. Several
     /// read-only `Db`s can share a directory, but not with a `Db` that writes.
-    pub fn open_read_only(path: impl AsRef<Path>, schema: Schema, options: Options) -> Result<Self> {
+    pub fn open_read_only(
+        path: impl AsRef<Path>,
+        schema: Schema,
+        options: Options,
+    ) -> Result<Self> {
         schema.validate()?;
         let (lock, recovered) = store::open_read_only(path.as_ref(), &schema)?;
         Self::start(schema, options, Some((Opened::Read(lock), recovered)))
@@ -395,13 +400,19 @@ impl Db {
         self.shared.snapshot()
     }
 
-    /// Run a [`Knn`](crate::Knn), [`Disk`](crate::Disk), or [`Region`](crate::Region) search.
+    /// Run a [`Knn`](crate::Knn), [`Disk`](crate::Disk), [`Region`](crate::Region),
+    /// or [`Count`](crate::Count) search.
     pub fn search<Q: Query>(&self, query: Q) -> Result<Q::Output> {
         self.snapshot().search(query)
     }
 
     pub fn get(&self, key: Key) -> Result<Document> {
         self.snapshot().get(key)
+    }
+
+    /// Number of visible records that pass `filter`. No vector is read.
+    pub fn count(&self, filter: &Filter) -> Result<usize> {
+        self.snapshot().count(filter)
     }
 
     /// Number of visible records.

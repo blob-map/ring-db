@@ -159,6 +159,17 @@ impl Segment {
             }
         }
     }
+
+    /// Number of `rows` inside all `disks`.
+    pub(crate) fn region_count(&self, disks: &[DiskSpec<'_>], rows: &RowSet) -> Result<usize> {
+        let Some(mask) = rows.mask() else {
+            return Ok(0);
+        };
+        match self.gpu(rows) {
+            Some(gpu) => gpu.device.region_count(&gpu.vectors, disks, mask),
+            None => Ok(cpu::region_count(&self.vectors, self.dims, disks, mask)),
+        }
+    }
 }
 
 /// Collects records with increasing keys into a [`Segment`].

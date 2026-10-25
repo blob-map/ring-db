@@ -205,6 +205,33 @@ fn filters_restrict_both_primitives() {
 }
 
 #[test]
+fn counts_match_results_across_segments_and_deletes() {
+    let db = Db::in_memory(Schema::new(2), Options::default().auto_merge(false)).unwrap();
+    let added = db
+        .add_all((0..6).map(|x| Record::new([x as f32, 0.0])))
+        .unwrap();
+    db.flush().unwrap();
+    db.add_all((6..10).map(|x| Record::new([x as f32, 0.0])))
+        .unwrap();
+    db.delete(added[2]).unwrap();
+    db.flush().unwrap();
+    assert_eq!(db.snapshot().segments(), 2);
+    let origin = [0.0, 0.0];
+    let wide = Disk::new(&origin, 7.0);
+    assert_eq!(db.search(wide.count()).unwrap(), 7);
+    let far = Disk::new(&[9.0, 0.0], 3.0);
+    let both = wide.and(far);
+    assert_eq!(db.search(both.clone()).unwrap().len(), 2);
+    assert_eq!(db.search(both.count()).unwrap(), 2);
+    let odd = keys([1, 3, 5, 7, 9]);
+    assert_eq!(db.search(wide.filter(&odd).count()).unwrap(), 4);
+    assert_eq!(db.count(&odd).unwrap(), 5);
+    assert_eq!(db.count(&keys([2])).unwrap(), 0);
+    assert_eq!(db.count(&!keys([0])).unwrap(), 8);
+    invalid(db.search(Disk::new(&origin, -1.0).count()));
+}
+
+#[test]
 fn empty_databases_return_no_results() {
     let db = Db::in_memory(Schema::new(2), Options::default()).unwrap();
     let origin = [0.0, 0.0];
