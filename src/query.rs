@@ -1,358 +1,370 @@
-use std::time::Duration;
+//! Search primitives: exact nearest neighbors and regions made of disks.
+use std::sync::Arc;
 
-use crate::metadata::CandidateSet;
+use smallvec::SmallVec;
 
-/// A single match returned by a query.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct Hit {
-    /// Insertion-order ID of the matching vector (first inserted = 0).
-    pub id: u32,
-    /// Squared distance under the metric used by the query.
-    ///
-    /// This is squared L2 distance for an unweighted query and squared weighted
-    /// L2 distance for a weighted query. For a [`DiskIntersectionQuery`], it is
-    /// measured using the first disk's metric.
-    pub dist_sq: f32,
+use crate::backend::DiskSpec;
+use crate::error::{Result, RingDbError};
+use crate::filter::Filter;
+use crate::snapshot::Snapshot;
+
+/// The largest number of disks one [`Region`] can contain.
+pub const MAX_DISKS: usize = 16;
+
+/// Stable identifier of one record.
+#[repr(transparent)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, bytemuck::Pod, bytemuck::Zeroable,
+)]
+pub struct Key(pub(crate) u64);
+
+impl Key {
+    /// Rebuild a key from the value returned by [`Key::get`].
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// The integer value of this key.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
 }
 
-/// A ring query: find all vectors whose query distance to `query`
-/// lies within `[d - lambda, d + lambda]`.
-///
-/// Internally, ringdb compares squared query distances to avoid computing
-/// square roots. The ring bounds become:
-///
-/// ```text
-/// lower_sq = max(0, d - lambda)²
-/// upper_sq = (d + lambda)²
-/// ```
-pub struct RingQuery<'a> {
-    /// The query vector. Must have the database dimension and finite values.
-    pub(crate) query: &'a [f32],
-    /// Finite, non-negative target distance (centre of the ring).
-    pub(crate) d: f32,
-    /// Finite, non-negative half-width of the ring.
-    pub(crate) lambda: f32,
-    /// Optional final per-dimension coefficients for weighted L2 distance.
-    pub(crate) weights: Option<&'a [f32]>,
-    /// Optional set of vector IDs eligible to match.
-    pub(crate) candidates: Option<&'a CandidateSet>,
+/// Distance function of a query or disk.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub enum Metric<'a> {
+    /// `sum((x[i] - q[i])^2)`.
+    #[default]
+    L2,
+    /// `sum(w[i] * (x[i] - q[i])^2)`. Weights are final coefficients: they are
+    /// not squared, must be finite and non-negative, and zero ignores a dimension.
+    WeightedL2(&'a [f32]),
 }
 
-impl<'a> RingQuery<'a> {
-    /// Create an unweighted ring query.
-    pub const fn new(query: &'a [f32], d: f32, lambda: f32) -> Self {
-        Self {
-            query,
-            d,
-            lambda,
-            weights: None,
-            candidates: None,
+impl<'a> Metric<'a> {
+    pub(crate) const fn weights(self) -> Option<&'a [f32]> {
+        match self {
+            Self::L2 => None,
+            Self::WeightedL2(weights) => Some(weights),
         }
     }
-
-    /// Use squared weighted L2 distance for this query.
-    ///
-    /// Each value is the final coefficient in
-    /// `sum(weights[i] * (x[i] - query[i])^2)`. Weights are not squared by
-    /// ring-db. They are validated when the query is executed.
-    #[must_use]
-    pub const fn with_weights(mut self, weights: &'a [f32]) -> Self {
-        self.weights = Some(weights);
-        self
-    }
-
-    /// Restrict this query to the vectors in `candidates`.
-    #[must_use]
-    pub const fn with_candidates(mut self, candidates: &'a CandidateSet) -> Self {
-        self.candidates = Some(candidates);
-        self
-    }
-
-    /// Query vector.
-    pub const fn query(&self) -> &'a [f32] {
-        self.query
-    }
-
-    /// Target distance (centre of the ring).
-    pub const fn d(&self) -> f32 {
-        self.d
-    }
-
-    /// Half-width of the ring.
-    pub const fn lambda(&self) -> f32 {
-        self.lambda
-    }
-
-    /// Optional per-dimension weighted-L2 coefficients.
-    pub const fn weights(&self) -> Option<&'a [f32]> {
-        self.weights
-    }
-
-    /// Optional set of vector IDs eligible to match.
-    pub const fn candidates(&self) -> Option<&'a CandidateSet> {
-        self.candidates
-    }
 }
 
-/// A range query: find all vectors whose query distance to `query`
-/// lies within `[d_min, d_max]`.
-pub struct RangeQuery<'a> {
-    /// The query vector. Must have the database dimension and finite values.
-    pub(crate) query: &'a [f32],
-    /// Inclusive lower distance bound. Must be finite and non-negative.
-    pub(crate) d_min: f32,
-    /// Inclusive upper distance bound. Must be finite and at least `d_min`.
-    pub(crate) d_max: f32,
-    /// Optional final per-dimension coefficients for weighted L2 distance.
-    pub(crate) weights: Option<&'a [f32]>,
-    /// Optional set of vector IDs eligible to match.
-    pub(crate) candidates: Option<&'a CandidateSet>,
-}
-
-impl<'a> RangeQuery<'a> {
-    /// Create an unweighted range query.
-    pub const fn new(query: &'a [f32], d_min: f32, d_max: f32) -> Self {
-        Self {
-            query,
-            d_min,
-            d_max,
-            weights: None,
-            candidates: None,
-        }
-    }
-
-    /// Use squared weighted L2 distance for this query.
-    ///
-    /// Each value is the final coefficient in
-    /// `sum(weights[i] * (x[i] - query[i])^2)`. Weights are not squared by
-    /// ring-db. They are validated when the query is executed.
-    #[must_use]
-    pub const fn with_weights(mut self, weights: &'a [f32]) -> Self {
-        self.weights = Some(weights);
-        self
-    }
-
-    /// Restrict this query to the vectors in `candidates`.
-    #[must_use]
-    pub const fn with_candidates(mut self, candidates: &'a CandidateSet) -> Self {
-        self.candidates = Some(candidates);
-        self
-    }
-
-    /// Query vector.
-    pub const fn query(&self) -> &'a [f32] {
-        self.query
-    }
-
-    /// Inclusive lower distance bound.
-    pub const fn d_min(&self) -> f32 {
-        self.d_min
-    }
-
-    /// Inclusive upper distance bound.
-    pub const fn d_max(&self) -> f32 {
-        self.d_max
-    }
-
-    /// Optional per-dimension weighted-L2 coefficients.
-    pub const fn weights(&self) -> Option<&'a [f32]> {
-        self.weights
-    }
-
-    /// Optional set of vector IDs eligible to match.
-    pub const fn candidates(&self) -> Option<&'a CandidateSet> {
-        self.candidates
-    }
-}
-
-/// A disk query: find all vectors whose query distance to `query`
-/// is at most `d_max` (i.e. the full disk/ball of radius `d_max`).
+/// Exact k-nearest-neighbor search.
 ///
-/// This is equivalent to a [`RangeQuery`] with `d_min = 0`.
-pub struct DiskQuery<'a> {
-    /// The query vector. Must have the database dimension and finite values.
+/// Returns up to `k` records ordered by ascending `(dist_sq, key)`.
+#[derive(Debug, Clone, Copy)]
+pub struct Knn<'a> {
     pub(crate) query: &'a [f32],
-    /// Inclusive radius. Must be finite and non-negative.
-    pub(crate) d_max: f32,
-    /// Optional final per-dimension coefficients for weighted L2 distance.
-    pub(crate) weights: Option<&'a [f32]>,
-    /// Optional set of vector IDs eligible to match.
-    pub(crate) candidates: Option<&'a CandidateSet>,
-}
-
-impl<'a> DiskQuery<'a> {
-    /// Create an unweighted disk query.
-    pub const fn new(query: &'a [f32], d_max: f32) -> Self {
-        Self {
-            query,
-            d_max,
-            weights: None,
-            candidates: None,
-        }
-    }
-
-    /// Use squared weighted L2 distance for this query.
-    ///
-    /// Each value is the final coefficient in
-    /// `sum(weights[i] * (x[i] - query[i])^2)`. Weights are not squared by
-    /// ring-db. They are validated when the query is executed.
-    #[must_use]
-    pub const fn with_weights(mut self, weights: &'a [f32]) -> Self {
-        self.weights = Some(weights);
-        self
-    }
-
-    /// Restrict this query to the vectors in `candidates`.
-    #[must_use]
-    pub const fn with_candidates(mut self, candidates: &'a CandidateSet) -> Self {
-        self.candidates = Some(candidates);
-        self
-    }
-
-    /// Query vector.
-    pub const fn query(&self) -> &'a [f32] {
-        self.query
-    }
-
-    /// Inclusive upper distance bound.
-    pub const fn d_max(&self) -> f32 {
-        self.d_max
-    }
-
-    /// Optional per-dimension weighted-L2 coefficients.
-    pub const fn weights(&self) -> Option<&'a [f32]> {
-        self.weights
-    }
-
-    /// Optional set of vector IDs eligible to match.
-    pub const fn candidates(&self) -> Option<&'a CandidateSet> {
-        self.candidates
-    }
-}
-
-/// A disk-intersection query: find all vectors inside every disk.
-///
-/// Each disk is a [`DiskQuery`] containing a center vector and an inclusive
-/// radius. The query must contain at least one disk. Returned [`Hit::dist_sq`]
-/// values are measured using the first disk's metric.
-pub struct DiskIntersectionQuery<'a> {
-    /// Disks that all returned vectors must satisfy.
-    pub(crate) disks: &'a [DiskQuery<'a>],
-    /// Optional set of vector IDs eligible to match.
-    pub(crate) candidates: Option<&'a CandidateSet>,
-}
-
-impl<'a> DiskIntersectionQuery<'a> {
-    /// Create a disk-intersection query.
-    pub const fn new(disks: &'a [DiskQuery<'a>]) -> Self {
-        Self {
-            disks,
-            candidates: None,
-        }
-    }
-
-    /// Restrict this query to the vectors in `candidates`.
-    #[must_use]
-    pub const fn with_candidates(mut self, candidates: &'a CandidateSet) -> Self {
-        self.candidates = Some(candidates);
-        self
-    }
-
-    /// Disks that all returned vectors must satisfy.
-    pub const fn disks(&self) -> &'a [DiskQuery<'a>] {
-        self.disks
-    }
-
-    /// Optional set of vector IDs eligible to match.
-    pub const fn candidates(&self) -> Option<&'a CandidateSet> {
-        self.candidates
-    }
-}
-
-/// An exact nearest-neighbor query.
-///
-/// Distances are evaluated exactly rather than through an approximate index.
-/// The query returns up to `k` eligible vectors ordered by ascending
-/// `(distance squared, vector ID)`. The vector ID tie-break makes results
-/// deterministic when multiple vectors have the same distance. A `k` of zero
-/// returns no hits.
-pub struct KnnQuery<'a> {
-    /// The query vector. Must have the database dimension and finite values.
-    pub(crate) query: &'a [f32],
-    /// Maximum number of nearest neighbors to return.
     pub(crate) k: usize,
-    /// Optional final per-dimension coefficients for weighted L2 distance.
-    pub(crate) weights: Option<&'a [f32]>,
-    /// Optional set of vector IDs eligible to match.
-    pub(crate) candidates: Option<&'a CandidateSet>,
+    pub(crate) metric: Metric<'a>,
+    pub(crate) filter: Option<&'a Filter>,
 }
 
-impl<'a> KnnQuery<'a> {
-    /// Create an unweighted exact nearest-neighbor query.
+impl<'a> Knn<'a> {
     pub const fn new(query: &'a [f32], k: usize) -> Self {
         Self {
             query,
             k,
-            weights: None,
-            candidates: None,
+            metric: Metric::L2,
+            filter: None,
         }
     }
 
-    /// Use squared weighted L2 distance for this query.
-    ///
-    /// Each value is the final coefficient in
-    /// `sum(weights[i] * (x[i] - query[i])^2)`. Weights are not squared by
-    /// ring-db. They are validated when the query is executed.
     #[must_use]
-    pub const fn with_weights(mut self, weights: &'a [f32]) -> Self {
-        self.weights = Some(weights);
+    pub const fn metric(mut self, metric: Metric<'a>) -> Self {
+        self.metric = metric;
         self
     }
 
-    /// Restrict this query to the vectors in `candidates`.
     #[must_use]
-    pub const fn with_candidates(mut self, candidates: &'a CandidateSet) -> Self {
-        self.candidates = Some(candidates);
+    pub const fn filter(mut self, filter: &'a Filter) -> Self {
+        self.filter = Some(filter);
+        self
+    }
+}
+
+/// A ball around `center` with an inclusive `radius`.
+///
+/// A disk is a [`Region`] with one disk: search it directly, or combine it with
+/// others through [`Disk::and`].
+#[derive(Debug, Clone, Copy)]
+pub struct Disk<'a> {
+    pub(crate) center: &'a [f32],
+    pub(crate) radius: f32,
+    pub(crate) metric: Metric<'a>,
+}
+
+impl<'a> Disk<'a> {
+    pub const fn new(center: &'a [f32], radius: f32) -> Self {
+        Self {
+            center,
+            radius,
+            metric: Metric::L2,
+        }
+    }
+
+    #[must_use]
+    pub const fn metric(mut self, metric: Metric<'a>) -> Self {
+        self.metric = metric;
         self
     }
 
-    /// Query vector.
-    pub const fn query(&self) -> &'a [f32] {
-        self.query
+    /// Intersect this disk with `other`.
+    #[must_use]
+    pub fn and(self, other: Disk<'a>) -> Region<'a> {
+        Region::from(self).and(other)
     }
 
-    /// Maximum number of nearest neighbors to return.
-    pub const fn k(&self) -> usize {
-        self.k
-    }
-
-    /// Optional per-dimension weighted-L2 coefficients.
-    pub const fn weights(&self) -> Option<&'a [f32]> {
-        self.weights
-    }
-
-    /// Optional set of vector IDs eligible to match.
-    pub const fn candidates(&self) -> Option<&'a CandidateSet> {
-        self.candidates
+    #[must_use]
+    pub fn filter(self, filter: &'a Filter) -> Region<'a> {
+        Region::from(self).filter(filter)
     }
 }
 
-/// Result of a vector query.
-pub struct QueryResult {
-    /// All matching vectors together with their squared distances.
-    pub hits: Vec<Hit>,
-    /// Name of the backend that executed the query (`"cpu"` or `"vulkan"`).
-    pub backend_used: &'static str,
-    /// Wall-clock time for the query (excluding dataset upload).
-    pub elapsed: Duration,
+/// Every record inside all of its disks. It always contains at least one disk.
+#[derive(Debug, Clone)]
+pub struct Region<'a> {
+    pub(crate) disks: SmallVec<[Disk<'a>; 1]>,
+    pub(crate) filter: Option<&'a Filter>,
 }
 
-impl QueryResult {
-    /// Convenience: collect just the IDs from `hits` into a new `Vec<u32>`.
-    ///
-    /// Useful when calling `fetch_payloads`, which takes `&[u32]`.
-    pub fn ids(&self) -> Vec<u32> {
-        self.hits.iter().map(|h| h.id).collect()
+impl<'a> Region<'a> {
+    /// Intersect this region with one more disk.
+    #[must_use]
+    pub fn and(mut self, disk: Disk<'a>) -> Self {
+        self.disks.push(disk);
+        self
     }
+
+    #[must_use]
+    pub fn filter(mut self, filter: &'a Filter) -> Self {
+        self.filter = Some(filter);
+        self
+    }
+
+    pub fn disks(&self) -> &[Disk<'a>] {
+        &self.disks
+    }
+}
+
+impl<'a> From<Disk<'a>> for Region<'a> {
+    fn from(disk: Disk<'a>) -> Self {
+        Self {
+            disks: SmallVec::from_buf([disk]),
+            filter: None,
+        }
+    }
+}
+
+/// One nearest neighbor.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Hit {
+    pub key: Key,
+    /// Squared distance under the query metric.
+    pub dist_sq: f32,
+}
+
+/// Resolves the rows of a search back to record keys.
+///
+/// Rows are numbered across the segments of a snapshot: each segment's keys
+/// start at its base row.
+#[derive(Debug, Clone)]
+pub(crate) struct KeyLookup(pub(crate) Arc<[(u32, Arc<[Key]>)]>);
+
+impl KeyLookup {
+    fn key(&self, row: u32) -> Key {
+        let part = self.0.partition_point(|(base, _)| *base <= row) - 1;
+        let (base, keys) = &self.0[part];
+        keys[(row - base) as usize]
+    }
+}
+
+/// Records inside a region, in no particular order.
+///
+/// Each record carries one squared distance per disk, in query order. Keys are
+/// resolved on access, so the result keeps the searched data alive.
+#[derive(Debug, Clone)]
+pub struct RegionResult {
+    /// Per record: its row, then `n_disks` distance bit patterns.
+    pub(crate) records: Vec<u32>,
+    pub(crate) n_disks: usize,
+    pub(crate) keys: KeyLookup,
+}
+
+impl RegionResult {
+    pub(crate) fn new(n_disks: usize, keys: KeyLookup) -> Self {
+        Self {
+            records: Vec::new(),
+            n_disks,
+            keys,
+        }
+    }
+
+    fn stride(&self) -> usize {
+        1 + self.n_disks
+    }
+
+    pub fn len(&self) -> usize {
+        self.records.len() / self.stride()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
+    /// Number of distances per record.
+    pub fn n_disks(&self) -> usize {
+        self.n_disks
+    }
+
+    pub fn get(&self, index: usize) -> Option<RegionHit<'_>> {
+        let start = index.checked_mul(self.stride())?;
+        let record = self.records.get(start..start.checked_add(self.stride())?)?;
+        Some(RegionHit {
+            key: self.keys.key(record[0]),
+            dists_sq: bytemuck::cast_slice(&record[1..]),
+        })
+    }
+
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = RegionHit<'_>> + '_ {
+        (0..self.len()).map(|index| self.get(index).expect("index is in bounds"))
+    }
+
+    pub fn keys(&self) -> impl ExactSizeIterator<Item = Key> + '_ {
+        self.iter().map(|hit| hit.key)
+    }
+}
+
+/// Equal when both contain the same records in the same order.
+impl PartialEq for RegionResult {
+    fn eq(&self, other: &Self) -> bool {
+        self.n_disks == other.n_disks
+            && self.len() == other.len()
+            && self.iter().zip(other.iter()).all(|(a, b)| a == b)
+    }
+}
+
+/// One record inside a region.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RegionHit<'a> {
+    pub key: Key,
+    dists_sq: &'a [f32],
+}
+
+impl<'a> RegionHit<'a> {
+    /// Squared distance to each disk, in query order.
+    pub fn dists_sq(&self) -> &'a [f32] {
+        self.dists_sq
+    }
+}
+
+mod sealed {
+    pub trait Sealed {}
+}
+
+/// A search request accepted by `search`. Implemented by [`Knn`], [`Disk`],
+/// and [`Region`].
+pub trait Query: sealed::Sealed {
+    type Output;
+
+    #[doc(hidden)]
+    fn execute(self, snapshot: &Snapshot) -> Result<Self::Output>;
+}
+
+impl sealed::Sealed for Knn<'_> {}
+impl sealed::Sealed for Disk<'_> {}
+impl sealed::Sealed for Region<'_> {}
+
+impl Query for Knn<'_> {
+    type Output = Vec<Hit>;
+
+    fn execute(self, snapshot: &Snapshot) -> Result<Vec<Hit>> {
+        snapshot.knn(&self)
+    }
+}
+
+impl Query for Region<'_> {
+    type Output = RegionResult;
+
+    fn execute(self, snapshot: &Snapshot) -> Result<RegionResult> {
+        snapshot.region(&self)
+    }
+}
+
+impl Query for Disk<'_> {
+    type Output = RegionResult;
+
+    fn execute(self, snapshot: &Snapshot) -> Result<RegionResult> {
+        Region::from(self).execute(snapshot)
+    }
+}
+
+/// Check the length and coordinates of `vector`. A coordinate that is not
+/// finite is reported with `invalid`.
+pub(crate) fn validate_vector(
+    dims: usize,
+    vector: &[f32],
+    label: &str,
+    invalid: fn(String) -> RingDbError,
+) -> Result<()> {
+    if vector.len() != dims {
+        return Err(RingDbError::DimensionMismatch {
+            expected: dims,
+            got: vector.len(),
+        });
+    }
+    if let Some((index, value)) = vector
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite())
+    {
+        return Err(invalid(format!(
+            "{label} coordinate at index {index} must be finite, got {value}"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_metric(dims: usize, metric: Metric<'_>) -> Result<()> {
+    let Some(weights) = metric.weights() else {
+        return Ok(());
+    };
+    if weights.len() != dims {
+        return Err(RingDbError::DimensionMismatch {
+            expected: dims,
+            got: weights.len(),
+        });
+    }
+    if let Some((index, weight)) = weights
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, weight)| !weight.is_finite() || *weight < 0.0)
+    {
+        return Err(RingDbError::InvalidQuery(format!(
+            "weight at index {index} must be finite and non-negative, got {weight}"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_disk<'a>(dims: usize, disk: &Disk<'a>) -> Result<DiskSpec<'a>> {
+    validate_vector(dims, disk.center, "disk center", RingDbError::InvalidQuery)?;
+    validate_metric(dims, disk.metric)?;
+    // A squared radius of infinity would contain the rows whose squared
+    // distance overflows, however far they are.
+    let radius_sq = disk.radius * disk.radius;
+    if !radius_sq.is_finite() || disk.radius < 0.0 {
+        return Err(RingDbError::InvalidQuery(format!(
+            "disk radius must be non-negative and its square finite, got {}",
+            disk.radius
+        )));
+    }
+    Ok(DiskSpec {
+        center: disk.center,
+        weights: disk.metric.weights(),
+        radius_sq,
+    })
 }

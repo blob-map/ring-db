@@ -16,20 +16,22 @@ layout(push_constant) uniform Params {
     uint64_t output_address;
     uint64_t reduce_src; // UINT64_MAX means the initial distance slots
     uint64_t reduce_dst;
+    uint64_t taken;      // scratch word holding the slot of the last KNN hit
     uint dims;
     uint rows;
     uint work_count;
     uint candidate_offset;
     uint disk_count;
-    uint mode; // 0: range, 1: intersection, 2: KNN
-    float lower_sq;
-    float upper_sq;
+    uint mode; // 0: region, 1: KNN
     uint reduce_count;
     uint output_index;
-    uint row_offset;
+    uint row_offset; // first row of the chunk within its segment
+    uint row_base;   // added to region output rows
+    uint reduce_shift; // 0: reduce every group; else only the group of `taken`
     uint reserved;
 } p;
 const uint INVALID = 0xffffffffu;
+const uint MAX_DISKS = 16u;
 
 uint group_index() {
     return gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;

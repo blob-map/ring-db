@@ -11,9 +11,15 @@ use ash::{Entry, vk};
 use clap::{Parser, ValueEnum};
 use rand::{RngExt, SeedableRng};
 use ringdb::{
-    BackendPreference, CandidateSet, DiskIntersectionQuery, DiskQuery, Hit, KnnQuery, QueryResult,
-    RingDb, RingDbConfig, RingQuery, SealedRingDb,
+    BackendPreference, Db, Disk, FieldType, Filter, Knn, Metric, Options, Record, Schema,
 };
+
+/// A comparable hit: key and squared distance to the first disk or query.
+#[derive(Clone, Copy, Debug)]
+struct Hit {
+    id: u64,
+    dist_sq: f32,
+}
 
 type BenchResult<T> = Result<T, Box<dyn Error>>;
 
@@ -56,7 +62,7 @@ struct Args {
     /// Per-coordinate displacement of the other two intersection centers.
     #[arg(long, default_value_t = 0.01)]
     intersection_shift: f32,
-    /// Optional single workload (ring, disk, intersection3, knn, weighted_knn, filtered_knn).
+    /// Optional single workload (disk, intersection3, knn, weighted_knn, filtered_knn).
     #[arg(long)]
     workload: Option<String>,
     #[arg(long, default_value = "target/backend-compare.csv")]
@@ -71,7 +77,6 @@ struct Args {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Workload {
-    Ring,
     Disk,
     Intersection,
     Knn,
@@ -80,8 +85,7 @@ enum Workload {
 }
 
 impl Workload {
-    const ALL: [Self; 6] = [
-        Self::Ring,
+    const ALL: [Self; 5] = [
         Self::Disk,
         Self::Intersection,
         Self::Knn,
@@ -91,7 +95,6 @@ impl Workload {
 
     fn name(self) -> &'static str {
         match self {
-            Self::Ring => "ring",
             Self::Disk => "disk",
             Self::Intersection => "intersection3",
             Self::Knn => "knn",
@@ -115,12 +118,12 @@ struct Inputs {
     queries: Vec<Query>,
     weights: Vec<f32>,
     radius: f32,
-    candidates: CandidateSet,
+    filter: Filter,
     k: usize,
 }
 
 impl Inputs {
-    fn new(db: &SealedRingDb, args: &Args) -> BenchResult<Self> {
+    fn new(args: &Args) -> BenchResult<Self> {
         let mut rng = rand::rngs::SmallRng::seed_from_u64(args.seed.wrapping_add(1));
         let queries = (0..args.queries)
             .map(|_| {
@@ -140,60 +143,92 @@ impl Inputs {
                 .map(|i| [0.25, 0.75, 1.25, 1.75][i % 4])
                 .collect(),
             radius: (2.0 * args.dims as f32 / 3.0).sqrt() * args.radius_scale,
-            // A reusable 1% candidate set, built outside query timing.
-            candidates: db.candidates_from_ids((0..args.n as u32).step_by(100))?,
+            // Every 100th record has this keyword.
+            filter: Filter::eq("bucket", "0"),
             k: args.k,
         })
     }
 
-    fn run(&self, db: &SealedRingDb, workload: Workload, index: usize) -> BenchResult<QueryResult> {
+    /// The timed call: one public search, including its result transfer.
+    fn run(&self, db: &Db, workload: Workload, index: usize) -> BenchResult<Output> {
         let q = &self.queries[index % self.queries.len()];
         Ok(match workload {
-            Workload::Ring => {
-                db.query(&RingQuery::new(&q.point, self.radius, self.radius * 0.0005))?
-            }
-            Workload::Disk => db.query_disk(&DiskQuery::new(&q.point, self.radius))?,
-            Workload::Intersection => {
-                let disks = [
-                    DiskQuery::new(&q.point, self.radius),
-                    DiskQuery::new(&q.positive, self.radius),
-                    DiskQuery::new(&q.negative, self.radius),
-                ];
-                db.query_disk_intersection(&DiskIntersectionQuery::new(&disks))?
-            }
-            Workload::Knn => db.query_knn(&KnnQuery::new(&q.point, self.k))?,
-            Workload::WeightedKnn => {
-                db.query_knn(&KnnQuery::new(&q.point, self.k).with_weights(&self.weights))?
-            }
+            Workload::Disk => Output::Region(db.search(Disk::new(&q.point, self.radius))?),
+            Workload::Intersection => Output::Region(
+                db.search(
+                    Disk::new(&q.point, self.radius)
+                        .and(Disk::new(&q.positive, self.radius))
+                        .and(Disk::new(&q.negative, self.radius)),
+                )?,
+            ),
+            Workload::Knn => Output::Knn(db.search(Knn::new(&q.point, self.k))?),
+            Workload::WeightedKnn => Output::Knn(
+                db.search(Knn::new(&q.point, self.k).metric(Metric::WeightedL2(&self.weights)))?,
+            ),
             Workload::FilteredKnn => {
-                db.query_knn(&KnnQuery::new(&q.point, self.k).with_candidates(&self.candidates))?
+                Output::Knn(db.search(Knn::new(&q.point, self.k).filter(&self.filter))?)
             }
         })
     }
 }
 
-fn build(
-    args: &Args,
-    backend: BackendPreference,
-) -> BenchResult<(SealedRingDb, Duration, Duration)> {
-    let mut db = RingDb::new(RingDbConfig::new(args.dims).with_backend_preference(backend))?;
+enum Output {
+    Knn(Vec<ringdb::Hit>),
+    Region(ringdb::RegionResult),
+}
+
+impl Output {
+    fn len(&self) -> usize {
+        match self {
+            Self::Knn(hits) => hits.len(),
+            Self::Region(result) => result.len(),
+        }
+    }
+
+    /// Untimed conversion for validation.
+    fn hits(&self) -> Vec<Hit> {
+        match self {
+            Self::Knn(hits) => hits
+                .iter()
+                .map(|hit| Hit {
+                    id: hit.key.get(),
+                    dist_sq: hit.dist_sq,
+                })
+                .collect(),
+            Self::Region(result) => result
+                .iter()
+                .map(|hit| Hit {
+                    id: hit.key.get(),
+                    dist_sq: hit.dists_sq()[0],
+                })
+                .collect(),
+        }
+    }
+}
+
+fn build(args: &Args, backend: BackendPreference) -> BenchResult<(Db, Duration, Duration)> {
+    let schema = Schema::new(args.dims).field("bucket", FieldType::Keyword);
+    // One explicit commit at the end: the measured data is a single segment.
+    let options = Options::default().backend(backend).commit_interval(None);
+    let db = Db::in_memory(schema, options)?;
     let mut rng = rand::rngs::SmallRng::seed_from_u64(args.seed);
     let mut row = vec![0.0; args.dims];
     let started = Instant::now();
-    for _ in 0..args.n {
+    let buckets: Vec<String> = (0..100).map(|i| i.to_string()).collect();
+    for id in 0..args.n {
         for x in &mut row {
             *x = rng.random_range(-1.0..1.0);
         }
-        db.add_vector(&row, ())?;
+        db.add(Record::new(row.as_slice()).set("bucket", buckets[id % 100].as_str()))?;
     }
     let generate = started.elapsed();
     let started = Instant::now();
-    let sealed = db.build()?;
-    Ok((sealed, generate, started.elapsed()))
+    db.flush()?;
+    Ok((db, generate, started.elapsed()))
 }
 
 struct BoundaryDifference {
-    id: u32,
+    id: u64,
     workload: Workload,
     query: usize,
 }
@@ -289,13 +324,6 @@ fn verify_boundaries(
             let radius = inputs.radius;
             let upper = f64::from(radius * radius);
             let gap = match difference.workload {
-                Workload::Ring => {
-                    let lower = (radius - radius * 0.0005).max(0.0);
-                    let upper = radius + radius * 0.0005;
-                    (d - f64::from(lower * lower))
-                        .abs()
-                        .min((d - f64::from(upper * upper)).abs())
-                }
                 Workload::Disk => (d - upper).abs(),
                 Workload::Intersection => {
                     let distances = [d, distance(&query.positive), distance(&query.negative)];
@@ -493,30 +521,24 @@ fn main() -> BenchResult<()> {
                 generation.as_secs_f64(),
                 upload.as_secs_f64()
             );
-            let inputs = Inputs::new(&db, &args)?;
+            let inputs = Inputs::new(&args)?;
             let mut boundaries = Vec::new();
             for (workload_index, &workload) in workloads.iter().enumerate() {
                 let reference = &mut references[workload_index];
                 let first = reference.is_empty();
                 let mut query0_hits = 0;
                 for query in 0..args.queries {
-                    let mut result = inputs.run(&db, workload, query)?;
+                    let mut result = inputs.run(&db, workload, query)?.hits();
                     if query == 0 {
-                        query0_hits = result.hits.len();
+                        query0_hits = result.len();
                     }
                     if !workload.ordered() {
-                        result.hits.sort_unstable_by_key(|h| h.id);
+                        result.sort_unstable_by_key(|h| h.id);
                     }
                     if first {
-                        reference.push(result.hits);
+                        reference.push(result);
                     } else {
-                        verify(
-                            &reference[query],
-                            &result.hits,
-                            workload,
-                            query,
-                            &mut boundaries,
-                        )?;
+                        verify(&reference[query], &result, workload, query, &mut boundaries)?;
                     }
                 }
                 for i in 0..args.warmup {
@@ -536,7 +558,7 @@ fn main() -> BenchResult<()> {
                         args.n,
                         args.dims,
                         args.k,
-                        result.hits.len()
+                        result.len()
                     )?;
                     samples.push(elapsed);
                 }

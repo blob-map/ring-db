@@ -6,17 +6,19 @@ Quick context for contributors and coding agents.
 
 ring-db is a Rust 2024 exact vector database. It supports:
 
-- ring, range, disk, and disk-intersection searches;
-- exact K-nearest-neighbor search;
-- ordinary L2 and per-query diagonal weighted L2;
-- explicit integer metadata tags compiled into candidate sets;
-- fixed-size Pod payload records with zero-copy reads;
-- CPU and Vulkan backends selected at runtime;
-- versioned persistence.
+- exact K-nearest-neighbor search (`Knn`);
+- region search: the intersection of 1 to `MAX_DISKS` disks (`Disk`, `Region`);
+- ordinary L2 and diagonal weighted L2, per KNN query or per disk (`Metric`);
+- a fixed `Schema` of typed, optional fields per record;
+- typed `Filter`s over numeric, bool, and keyword fields;
+- stored-only text, text-list, and byte fields read back with `get`;
+- generated, never-reused `Key`s, `delete`, atomic `Batch`es, and commits;
+- background commits and size-tiered merges of immutable segments;
+- durable storage: a synced WAL, segment files, an atomic manifest, and `backup`;
+- CPU and Vulkan backends selected at runtime.
 
-The project intentionally avoids general document-database behavior. Payload records are
-opaque to the search engine. Metadata filtering is equality-based and independent of the
-payload layout.
+ring-db is meant to be the source of truth for its records. Records are added and
+deleted, never changed in place. `Db::open` is durable; `Db::in_memory` is not.
 
 ## Engineering priorities
 
@@ -25,7 +27,7 @@ payload layout.
 3. Keep cyclomatic complexity low with small preparation and execution helpers.
 4. Keep validation outside hot coordinate loops.
 5. Preserve branch-free unfiltered paths.
-6. Do not make compute kernels interpret user payload layouts.
+6. Do not make compute kernels interpret field values; filters become row masks first.
 7. Add functionality only for a demonstrated use case.
 
 ## Documentation standard
@@ -38,8 +40,9 @@ Give each paragraph one topic and no more than six sentences.
 Use one instruction per sentence, consistent terms, and American English spelling.
 Review meanings as well as sentence length; automated checks cannot establish compliance.
 
-Project technical nouns include backend, candidate set, Cargo, database, dimension,
-driver, filter, GPU, ID, KNN, loader, metadata, payload, Pod, query, shader, and vector.
+Project technical nouns include backend, Cargo, database, dimension, disk, driver,
+field, filter, GPU, key, keyword, KNN, loader, record, region, schema, segment,
+shader, snapshot, and vector.
 Computer-operation verbs include allocate, build, compile, deserialize, execute,
 filter, insert, load, query, return, serialize, sort, update, and upload.
 Keep code identifiers and commands exact. Explain new technical terms at first use.
@@ -54,24 +57,32 @@ Keep release versions and commands consistent with `Cargo.toml` and the CLI.
 ```text
 src/
 ├── lib.rs             public exports
-├── config.rs          RingDbConfig and BackendPreference
-├── engine.rs          RingDb builder and immutable SealedRingDb
+├── config.rs          Options and BackendPreference
+├── db.rs              Db handle, Batch, write path, commits, merges
+├── snapshot.rs        Snapshot, its Parts, and multi-segment search
+├── schema.rs          Schema and FieldType
+├── value.rs           Value, Record, validated Row, Document
+├── filter.rs          public Filter tree and its schema-checked Compiled form
+├── segment.rs         immutable Segment and SegmentBuilder
+├── column.rs          typed columns, keyword dictionaries, inverted indexes
+├── rows.rs            adaptive RowSet (all, empty, sparse, dense)
+├── store.rs           directory lock, WAL, MANIFEST, segment files, recovery
+├── codec.rs           checked little-endian Encoder/Decoder with CRC-32
 ├── error.rs           RingDbError
-├── metadata.rs        tags, adaptive CandidateSet, metadata persistence
-├── payload.rs         fixed-size Pod persistence helpers
-├── persist.rs         database header and vector-file I/O
-├── query.rs           query types, Hit, and QueryResult
+├── query.rs           Knn, Disk, Region, Metric, Key, Hit, RegionResult
 └── backend/
-    ├── mod.rs         RingComputeBackend contract and DiskSpec
+    ├── mod.rs         kernel inputs: Mask, DiskSpec, RowHit
     ├── cpu.rs         Rayon-parallel exact reference backend
     └── vulkan/        Vulkan backend, runtime, and embedded SPIR-V shaders
 
 tests/
-├── correctness.rs
-├── metadata_knn.rs
-├── random.rs
-├── weighted.rs
-└── vulkan.rs
+├── common/mod.rs      shared builders and reference distances
+├── search.rs          analytical search semantics
+├── randomized.rs      comparison with an f64 reference
+├── fields.rs          schemas, records, typed filters, segments, get
+├── mutation.rs        deletes, commits, merges, concurrency against a model
+├── persistence.rs     reopen, crash and torn-log recovery, corruption, lock, backup
+└── vulkan.rs          CPU/Vulkan parity
 
 examples/cli.rs        filtered weighted-KNN example
 benches/query_backends.rs
@@ -80,88 +91,100 @@ benches/backend_compare.rs sequential CPU/Vulkan comparison with raw timing outp
 
 ## Public data model
 
-`RingDb<T>` and `SealedRingDb<T>` require `T: bytemuck::Pod + Send + Sync` and
-default to `T = ()`.
-
 ```rust
-#[repr(C)]
-#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct Record {
-    category_id: u32,
-    score: f32,
-}
+let schema = Schema::new(64)
+    .field("price", FieldType::U64)
+    .field("city", FieldType::Keyword)
+    .field("tags", FieldType::Keywords)
+    .field("title", FieldType::Text);
+let db = Db::in_memory(schema, Options::default())?;
+let key = db.add(Record::new(vector).set("price", 350_000).set("city", "Lyon"))?;
+db.flush()?;
+let doc = db.get(key)?;
 ```
 
-Payload records are raw fixed-size result data. They cannot contain pointers or
-heap-backed fields. Use integer interning or bounded byte arrays for strings.
+Every field is optional. `Record::validate` checks names and coerces each `Value` to
+its field's canonical variant: any integer variant fits any numeric type that holds
+it exactly, and `Text` becomes a one-item list for list fields. It rejects non-finite
+vectors and `F32` values (as `InvalidRecord`), duplicate fields, and records over `Options::max_record_bytes` (64 KiB by
+default). Keys come from a monotonic `u64` counter, only after validation succeeds.
 
-Insertion has two forms:
+`Db` methods take `&self`. Shared state is behind an `Arc` so the commit thread can
+hold it; `Drop` stops and joins that thread.
 
-```rust
-db.add_vector(&vector, record)?;
-db.add_vector_with_metadata(&vector, record, &tags)?;
-```
+## Commits, deletes, and merges
 
-IDs are sequential `u32` values in insertion order. `add_vector_with_metadata` rejects a
-new row once the ID space is exhausted.
+The writer mutex holds the next key, the pending `SegmentBuilder`, deleted pending
+rows, and visible keys to delete. `Db::apply` is the only write path: it validates the
+whole `Batch`, then logs and applies it under one writer lock, so no commit splits a
+batch. A commit freezes the builder into a `Segment`,
+uploads it, and publishes adds and deletes in one new `Snapshot` (an `Arc` replaced
+under an `RwLock`). Lock `writer` before `current`, always. Searches and `get` run
+on a snapshot clone without locks. Uncommitted changes are invisible.
 
-After sealing, payload access is always zero-copy and bounds checked:
+A segment that fails to upload stays in `Writer::unpublished` and is retried at the
+next commit, so no record is lost. The commit thread ignores errors; `flush` repeats
+the commit and reports them. A commit holds the writer lock while it builds, writes,
+and uploads its segment: writes wait, which bounds the backlog; searches do not.
 
-```rust
-let record: &Record = db.fetch_payload(id)?;
-let records: Vec<&Record> = db.fetch_payloads(&ids)?;
-```
+A snapshot `Part` is an `Arc<Segment>` plus its sorted deleted rows and a cached live
+`RowSet` (`None` when nothing is deleted, which keeps the unfiltered `Mask::All` path).
+Deletes are copy-on-write per part.
 
-## Metadata
+Merges run after commits (`Options::auto_merge`) and on `compact`, one at a time
+under `Shared::merging`. `merge_range` selects adjacent parts only: first a part with
+at least 25% deleted rows, else the newest run whose older neighbor has less than
+twice its live rows. `build_merge` copies live rows without the writer lock;
+`publish_merge` then takes it, remaps rows deleted meanwhile into the new segment,
+and replaces the inputs. Only merges remove parts, so the inputs are still contiguous.
 
-The public primitives are:
+## Segments, columns, and filters
 
-```rust
-MetadataKey::new(u32)
-MetadataValue::new(u64)
-MetadataTag::new(key, value)
-```
+A segment holds rows sorted by key, row-major vectors, and one `Column` per field.
+Segments in a snapshot are ordered by key with disjoint key ranges, so `get` finds a
+segment by binary search on first keys, then a row by binary search on keys. Merges
+must combine adjacent segments only, to keep this property.
 
-`MetadataIndexBuilder` accumulates posting IDs while vectors are inserted.
-`MetadataIndex::candidates_eq` produces a database-sized `CandidateSet`. Missing tags
-produce an empty set, not an error. Duplicate tags on one vector do not duplicate IDs.
+- Scalars: `Vec<T>` plus a presence bitmap, omitted when every row has a value.
+  Numeric scalars also keep `order`, the present rows sorted by value, rebuilt when
+  a segment is built or decoded (not stored). `select_range` binary-searches it:
+  under 1/64 of rows it sorts the matches, under 1/32 it sets bitmap bits, else it
+  scans the column. Bool columns scan.
+- Keyword and Keywords: a sorted per-segment dictionary, per-row sorted term ids,
+  and a CSR inverted index (term → sorted rows). There is no global dictionary,
+  so each segment is self-contained.
+- Text and Bytes: packed bytes with offsets plus presence; TextList: nested offsets.
 
-Candidate sets support:
-
-- `intersection(&other) -> Result<CandidateSet>`;
-- `union(&other) -> Result<CandidateSet>`;
-- `complement() -> CandidateSet`;
-- validated construction through `SealedRingDb::candidates_from_ids`;
-- `len`, `is_empty`, `universe_len`, and checked membership.
-
-Intersection and union require equal universe lengths. Queries also reject candidate sets
-whose universe length differs from the database row count.
-
-The representation is selected internally:
-
-- `All` and `Empty` are allocation-free special cases;
-- `Sparse` is a sorted, unique `u32` ID list;
-- `Dense` is a bitset.
-
-Keep this representation private. Backends consume the borrowed `CandidateSetView`.
+`Filter::compile` checks a filter against the schema once per search. The compiled
+filter evaluates per segment into a `RowSet` (All, Empty, Sparse, or Dense, chosen
+by density); `RowSet::mask` hands it to kernels without conversion. Missing values
+never match a predicate, so `Not` includes them. Integer bounds compile to inclusive
+`i128` ranges, so out-of-type bounds select everything or nothing.
 
 ## Query semantics
 
-| Type | Meaning |
-|---|---|
-| `RingQuery` | inclusive `[max(0, d - lambda), d + lambda]` |
-| `RangeQuery` | inclusive `[d_min, d_max]` |
-| `DiskQuery` | inclusive `[0, d_max]` |
-| `DiskIntersectionQuery` | vector must satisfy every disk |
-| `KnnQuery` | exact best `k`, ordered by `(dist_sq, id)` |
+Every search goes through `Db::search` or `Snapshot::search`, which take a sealed `Query`:
 
-All query builders accept `.with_candidates(&set)`. Ring, range, disk, and KNN queries
-also accept `.with_weights(&weights)` directly. Each `DiskQuery` borrows its optional weights
-and candidate set. The engine intersects candidate sets attached to individual disks with
-the outer intersection query's candidate set before backend dispatch.
+| Type | Output | Meaning |
+|---|---|---|
+| `Knn` | `Vec<Hit>` | exact best `k`, ordered by `(dist_sq, key)` |
+| `Disk` | `RegionResult` | inclusive `dist_sq <= radius^2` |
+| `Region` | `RegionResult` | vector must satisfy every disk (1..=`MAX_DISKS`) |
+
+A disk is a one-disk region: `Disk::and` and `Disk::filter` return a `Region`.
+`Knn::metric` and `Disk::metric` take `Metric::L2` or `Metric::WeightedL2(&w)`.
+Each search has at most one `&Filter`; there are no per-disk filters.
+
+`RegionResult` stores flat `u32` records `[row, d0..dN-1]` (distances as `f32`
+bits). Rows are numbered across the snapshot's segments; keys resolve lazily
+through per-segment `(base row, Arc<[Key]>)` parts. `RegionHit::dists_sq`
+returns every disk's squared distance in disk order; there is no combined score.
+Do not split records into separate key and distance vectors: large fresh result
+allocations page-fault, and the extra bytes cost several percent on region scans.
 
 `k = 0` returns no hits. If fewer than `k` candidates exist, KNN returns all of them.
-Ties are deterministic by vector ID.
+Ties are deterministic by key: each segment returns its best `k` by `(dist_sq, row)`,
+which is key order within a segment, and the snapshot merges them by `(dist_sq, key)`.
 
 The metrics are:
 
@@ -170,19 +193,8 @@ ordinary distance: dist_sq = sum((vector[i] - query[i])^2)
 weighted:        dist_sq = sum(weights[i] * (vector[i] - query[i])^2)
 ```
 
-Weights are query-only final coefficients. They must match `dims`, be finite, and be
+Weights are search-only final coefficients. They must match `dims`, be finite, and be
 non-negative. They are never persisted.
-
-## Engine lifecycle
-
-`RingDb<T>` stages row-major vectors, Pod records, and metadata postings.
-`build()` finishes immutable stores and uploads vector data once. `SealedRingDb<T>` owns:
-
-- `Box<dyn RingComputeBackend>` for hot vector data;
-- one private, aligned `Box<[T]>` for payloads;
-- `MetadataIndex` for candidate construction.
-
-The sealed database is immutable and intended for repeated queries.
 
 ## CPU backend
 
@@ -191,10 +203,16 @@ The CPU backend is the correctness reference.
 - Ordinary searches use direct coordinate deltas with four independent accumulators.
 - Unweighted KNN accumulates coordinate deltas directly to avoid cancellation.
 - Weighted distance has its own four-accumulator loop.
-- Rayon partitions vector or candidate work.
+- `Distance` selects the kernels' distance functions once per call: on x86-64
+  builds without the `fma` target feature, `Fma` wraps them in
+  `#[target_feature(enable = "fma")]` when the CPU has FMA. Otherwise each
+  `mul_add` is a libm call, 2–10× slower. All paths fuse every `mul_add`, so their
+  bits are identical (`fma_distances_have_the_portable_bits`).
+- Rayon partitions vector or candidate work, at least `MIN_JOB_VALUES` coordinates per
+  job, so a small segment scans on one thread instead of waking the pool.
 - `All` retains the existing scan with no candidate branch per row.
-- `Sparse` iterates IDs directly.
-- `Dense` tests its bit before distance calculation.
+- `Sparse` iterates rows directly.
+- `Dense` visits set bits word by word (`set_bits`), so clear bits cost nothing.
 - KNN keeps a bounded max-heap per Rayon fold and deterministically merges/sorts the
   finalists.
 
@@ -212,12 +230,18 @@ The GPU backend requires Vulkan 1.2, `bufferDeviceAddress`, and `shaderInt64`.
 Check loader/device versions and both features before device creation; reject
 unsupported devices with `BackendUnavailable`. CPU has no Vulkan requirement.
 
-`src/backend/vulkan/mod.rs` implements the existing backend trait. `runtime.rs`
+`src/backend/vulkan/mod.rs` exposes `VulkanDevice` and a `VulkanSegment` per segment. `runtime.rs`
 owns Vulkan resources and synchronous submissions; its execution mutex serializes
 the queue, command pool, and reusable query buffers shared by
-geometric and KNN queries.
-Geometric queries copy the count in the scan submission and read hits directly
-into an owned Pod `Vec<Hit>`. Buffer capacities grow on demand and remain allocated
+region and KNN queries.
+Each segment uploads its vectors when it is built, unless it has fewer rows than
+`Options::vulkan_min_rows_for(dims)` (default 6 Mi coordinates). A search of a
+segment also runs on the CPU when fewer rows than that pass its filter
+(`Segment::gpu`): a GPU search costs about 115 µs before any work (measured on
+an RTX 4080 at 64 dims), as long as a CPU scan of about 100K rows. Tests set
+`vulkan_min_rows(0)` through `common::manual`. Region scans write a count word
+followed by `[row, d0..dN-1]` records; readback appends them directly to the owned
+`RegionResult` records. Buffer capacities grow on demand and remain allocated
 until the backend is dropped; never expose references to this reusable storage.
 Large host copies use up to four workers, including the caller, with scoped
 helper threads. Do not use the caller's Rayon pool while holding the execution
@@ -230,13 +254,18 @@ indexing: Vulkan 1.2 does not guarantee 64-bit offset arithmetic in access chain
 No `VK_EXT_shader_64bit_indexing` extension is required by this approach.
 Vectors are uploaded once, transposed independently within each chunk. Chunk row
 counts fit the device's allocation limit for vectors, output, and KNN scratch.
-Each shader returns global IDs. Sparse candidates are sliced by global ID;
+`row_offset` is the chunk start inside its segment and is used to decode candidates;
+`row_base` (the segment's first snapshot row) is added only to region output rows.
+Sparse candidates are sliced by segment row;
 dense candidates retain their bit offset when a chunk starts inside a word.
-Geometric readback appends directly to the final owned result. KNN merges each
-chunk's best results and preserves exact global `(dist_sq, id)` ordering.
-The three scan pipelines specialize All/Sparse/Dense candidate handling. Small-K
-selection uses GPU reductions without 64-bit atomics or subgroup requirements.
-Large-K queries may select on the host. Preserve deterministic `(dist_sq, id)` order
+KNN merges each chunk's best results and preserves exact `(dist_sq, row)` ordering.
+The three scan pipelines specialize All/Sparse/Dense candidate handling. GPU KNN
+selection is a tournament tree without 64-bit atomics or subgroup requirements:
+`reduce` builds every level once (each entry is the best slot of 128 below it),
+then each `take` removes the root's slot, and `reduce` with `reduce_shift` rebuilds
+only the one entry per level above it. A query costs one scan plus about
+`levels × k` single-workgroup dispatches. When `k × 64` reaches the candidate
+count, the host selects from all distances instead. Preserve deterministic `(dist_sq, row)` order
 and zero-weight handling before coordinate subtraction.
 
 `RINGDB_VULKAN_TIMINGS=1` enables optional GPU timestamps around each submission.
@@ -264,29 +293,39 @@ Set `RINGDB_VULKAN_LARGE_TEST=1` with `RINGDB_VULKAN_TEST=1` to run the opt-in
 4-GiB boundary regression. It puts known nearest neighbors on both sides of the
 address boundary and exercises unfiltered, sparse, and dense queries. Run on a
 device whose allocation limit exceeds the dataset size to test one large buffer.
+Device tests also cover multi-segment databases.
 
-## Persistence format
+## Persistence
 
-The current database format version is 1. A persisted database contains:
+`Store` (only for `Db::open`) lives in `Writer`, so every log write and manifest
+write is serialized by the writer mutex. Directory files:
 
-```text
-meta.bin       magic, version, endian marker, dims, rows, Pod size/alignment
-vectors.bin    row-major little-endian f32 values
-payloads.bin   consecutive native-layout Pod records
-metadata.bin   versioned equality-tag posting sets
-```
+- `LOCK`: held with `File::try_lock` while the `Db` is open;
+- `MANIFEST`: schema, `next_key`, `next_segment`, and each part's segment id and
+  deleted rows, with a CRC; replaced by tmp file + rename + directory fsync;
+- `wal-{seq:016x}.log`: `[len u32][crc u32][payload]` frames. A payload is the
+  `LogFrame` of one `Db::apply`: its deletes, then its adds (key + encoded `Row`);
+- `seg-{id:016x}.seg`: an encoded `Segment` with a trailing CRC.
 
-`metadata.bin` also has format version 1. There is no offset file because every payload
-has `size_of::<T>()` bytes.
+Each `apply` (and so `add`/`add_all`/`delete`) appends one frame and calls
+`sync_data` before returning, so recovery keeps a whole batch or none of it. An
+I/O error on the log leaves its end unknown, so later writes fail until the next
+commit starts a new log (`Store::needs_new_log`; a commit runs for this even with
+nothing pending). A commit writes and syncs the new
+segment files, then the manifest naming them and a new WAL sequence, then deletes the
+old WAL. If the manifest write fails, the segments stay unpublished for the retry.
+Merges write their segment file before `publish_merge` writes the manifest, and
+remove replaced files after.
 
-Build requires an absent or empty persistence directory. It writes data files first and
-`meta.bin` last, so a build that returns an error is not loadable as a complete generation.
-This is not a power-loss durability guarantee.
-
-Load validates file lengths, finite vectors, geometry, row-count limits, endianness,
-metadata universe length, and payload size/alignment. The format does not encode Rust
-field names, so callers must load with the exact same Pod record layout. Older database
-layouts must be rebuilt.
+`Store::open` locks, reads or creates the manifest (a new database writes only
+the manifest, so a crash during creation leaves at most `MANIFEST.tmp`; a missing
+log is created like an empty one), rejects a different schema,
+loads and checks every named segment, replays the WAL up to the first torn or
+corrupt frame (truncating it there), and removes unnamed files. `Db::open` then
+re-applies the recovered changes and commits. `Drop` commits durable databases.
+`backup` commits, then copies the manifest, the named segments, and the current
+WAL under the writer lock.
+All decoding goes through `codec::Decoder`, which returns `Corrupt`, never panics.
 
 ## Errors
 
@@ -295,9 +334,11 @@ layouts must be rebuilt.
 - `DimensionMismatch`;
 - `Io`;
 - `Corrupt`;
-- `InvalidQuery`;
-- `InvalidVectorId`;
-- `CandidateSetMismatch`;
+- `InvalidQuery` (searches and filters);
+- `InvalidSchema`;
+- `InvalidRecord`;
+- `UnknownField`;
+- `KeyNotFound`;
 - `BackendUnavailable`;
 - `Backend`.
 
@@ -313,8 +354,8 @@ cargo test
 cargo build --release
 
 RUSTFLAGS="-C target-cpu=native" cargo bench --bench query_backends
-RINGDB_BENCH_N=100000 cargo bench --bench query_backends cpu_knn_f32
-RINGDB_BENCH_N=100000 cargo bench --bench query_backends metadata
+RINGDB_BENCH_N=100000 cargo bench --bench query_backends cpu_knn
+RINGDB_BENCH_N=100000 cargo bench --bench query_backends cpu_region
 cargo bench --bench backend_compare -- --n 10000000 --dims 64
 
 cargo run --release --example cli -- --n 100000 --dims 64 --k 10 --category 3
@@ -336,7 +377,9 @@ both backends’ dataset size; `RINGDB_VULKAN_BENCH_N` overrides Vulkan only.
 | `criterion` | benchmarks |
 | `rand` | deterministic benchmark/test data |
 | `clap` | example CLI parsing |
-| `tempfile` | isolated persistence tests |
+| `smallvec` | inline single-disk regions |
+| `crc32fast` | checksums of WAL frames, segments, and the manifest |
+| `tempfile` | isolated test directories |
 
 The release publishes one crate. Keep release scripts and CI aligned with the package
-version. Query semantics and persistence format version 1 do not depend on the backend.
+version. Query semantics do not depend on the backend.

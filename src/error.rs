@@ -14,11 +14,17 @@ pub enum RingDbError {
     #[error("invalid query: {0}")]
     InvalidQuery(String),
 
-    #[error("vector ID {id} is out of bounds for a database with {len} vectors")]
-    InvalidVectorId { id: u32, len: usize },
+    #[error("invalid schema: {0}")]
+    InvalidSchema(String),
 
-    #[error("candidate set has universe length {got}, expected {expected}")]
-    CandidateSetMismatch { expected: usize, got: usize },
+    #[error("invalid record: {0}")]
+    InvalidRecord(String),
+
+    #[error("unknown field '{0}'")]
+    UnknownField(String),
+
+    #[error("no record has key {0}")]
+    KeyNotFound(u64),
 
     #[error("backend unavailable: {0}")]
     BackendUnavailable(String),

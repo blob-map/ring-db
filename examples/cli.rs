@@ -1,18 +1,8 @@
-use bytemuck::{Pod, Zeroable};
 use clap::{Parser, ValueEnum};
 use rand::{RngExt, SeedableRng};
 use ringdb::{
-    BackendPreference, KnnQuery, MetadataKey, MetadataTag, MetadataValue, RingDb, RingDbConfig,
+    BackendPreference, Db, FieldType, Filter, Knn, Metric, Options, Record, Schema, Value,
 };
-
-const CATEGORY: MetadataKey = MetadataKey::new(1);
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Pod, Zeroable)]
-struct Record {
-    source_id: u32,
-    category_id: u32,
-}
 
 /// Build a random database, then find exact nearest neighbors in one category.
 ///
@@ -81,9 +71,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if cli.category >= cli.categories {
         return Err("--category must be smaller than --categories".into());
     }
-    if cli.n > u32::MAX as usize {
-        return Err("--n exceeds ring-db's u32 vector-ID limit".into());
-    }
     if !cli.first_dim_weight.is_finite() || cli.first_dim_weight < 0.0 {
         return Err("--first-dim-weight must be finite and non-negative".into());
     }
@@ -94,8 +81,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  neighbors  : k = {}", cli.k);
     println!("  dim-0 weight: {}", cli.first_dim_weight);
 
-    let config = RingDbConfig::new(cli.dims).with_backend_preference(cli.backend.into());
-    let mut db: RingDb<Record> = RingDb::new(config)?;
+    let schema = Schema::new(cli.dims)
+        .field("source", FieldType::U64)
+        .field("category", FieldType::U32);
+    let db = Db::in_memory(schema, Options::default().backend(cli.backend.into()))?;
     let mut rng = rand::rngs::SmallRng::seed_from_u64(cli.seed);
     let mut vector = vec![0.0f32; cli.dims];
     let query: Vec<f32> = (0..cli.dims)
@@ -107,41 +96,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for value in &mut vector {
             *value = rng.random_range(-1.0f32..1.0);
         }
-        let source_id = source_id as u32;
-        let category_id = source_id % cli.categories;
-        let tag = MetadataTag::new(CATEGORY, MetadataValue::new(u64::from(category_id)));
-        db.add_vector_with_metadata(
-            &vector,
-            Record {
-                source_id,
-                category_id,
-            },
-            &[tag],
+        let category = source_id as u32 % cli.categories;
+        db.add(
+            Record::new(vector.as_slice())
+                .set("source", source_id)
+                .set("category", category),
         )?;
     }
-    let db = db.build()?;
+    db.flush()?;
     println!("  build       : {:.2?}", build_started.elapsed());
-    println!("  backend     : {}", db.backend_name());
+    println!("  backend     : {:?}", db.backend());
 
-    let candidates = db.metadata_eq(CATEGORY, MetadataValue::new(u64::from(cli.category)));
+    let filter = Filter::eq("category", cli.category);
     let mut weights = vec![1.0f32; cli.dims];
     weights[0] = cli.first_dim_weight;
-    let result = db.query_knn(
-        &KnnQuery::new(&query, cli.k)
-            .with_weights(&weights)
-            .with_candidates(&candidates),
+    let started = std::time::Instant::now();
+    let hits = db.search(
+        Knn::new(&query, cli.k)
+            .metric(Metric::WeightedL2(&weights))
+            .filter(&filter),
     )?;
 
-    println!("  candidates  : {}", candidates.len());
-    println!("  query time  : {:.2?}", result.elapsed);
-    println!("  hits        : {}", result.hits.len());
-    for hit in result.hits.iter().take(20) {
-        let record = db.fetch_payload(hit.id)?;
+    println!("  query time  : {:.2?}", started.elapsed());
+    println!("  hits        : {}", hits.len());
+    for hit in hits.iter().take(20) {
+        let doc = db.get(hit.key)?;
+        let field = |name| doc.get(name).and_then(Value::as_u64).unwrap_or_default();
         println!(
-            "    id={} source={} category={} distance={:.6}",
-            hit.id,
-            record.source_id,
-            record.category_id,
+            "    key={} source={} category={} distance={:.6}",
+            hit.key.get(),
+            field("source"),
+            field("category"),
             hit.dist_sq.sqrt()
         );
     }

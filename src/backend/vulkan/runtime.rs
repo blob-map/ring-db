@@ -374,12 +374,22 @@ impl Buffer {
 
     pub fn read<T: bytemuck::Pod>(&self, count: usize) -> Result<Vec<T>> {
         let mut values = Vec::new();
-        self.read_into(&mut values, count)?;
+        self.read_into(&mut values, 0, count)?;
         Ok(values)
     }
 
-    pub fn read_into<T: bytemuck::Pod>(&self, values: &mut Vec<T>, count: usize) -> Result<()> {
-        if !self.host || size_of::<T>() == 0 || count > self.size / size_of::<T>() {
+    /// Append `count` values that start `offset` bytes into this buffer.
+    pub fn read_into<T: bytemuck::Pod>(
+        &self,
+        values: &mut Vec<T>,
+        offset: usize,
+        count: usize,
+    ) -> Result<()> {
+        if !self.host
+            || size_of::<T>() == 0
+            || offset > self.size
+            || count > (self.size - offset) / size_of::<T>()
+        {
             return Err(backend_error("invalid host buffer read"));
         }
         if count == 0 {
@@ -407,7 +417,7 @@ impl Buffer {
                         .map_err(backend_error)?;
                 }
                 let bytes = count * size_of::<T>();
-                let source = std::slice::from_raw_parts(ptr.cast::<u8>(), bytes);
+                let source = std::slice::from_raw_parts(ptr.cast::<u8>().add(offset), bytes);
                 let destination = std::slice::from_raw_parts_mut(
                     values.as_mut_ptr().add(start).cast::<MaybeUninit<u8>>(),
                     bytes,
@@ -665,18 +675,19 @@ impl Execution {
         Ok(())
     }
 
+    /// Copy `size` bytes from `offset` in `src` to the start of `dst`.
     pub fn copy(&mut self, src: &Buffer, offset: usize, dst: &Buffer, size: usize) -> Result<()> {
+        if offset > src.size || size > src.size - offset || size > dst.size {
+            return Err(backend_error("buffer copy exceeds allocation"));
+        }
         if size == 0 {
             return Ok(());
         }
-        if size > dst.size || offset > src.size || size > src.size - offset {
-            return Err(backend_error("buffer copy exceeds allocation"));
-        }
+        let region = vk::BufferCopy::default()
+            .src_offset(offset as u64)
+            .size(size as u64);
         let context = self.context.clone();
         self.run("copy", |cmd| unsafe {
-            let region = vk::BufferCopy::default()
-                .src_offset(offset as u64)
-                .size(size as u64);
             context
                 .device
                 .cmd_copy_buffer(cmd, src.raw, dst.raw, &[region]);

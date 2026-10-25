@@ -5,6 +5,7 @@
 void main() {
     if (gl_LocalInvocationID.x != 0u) return;
     uint slot = scratch_word(p.reduce_dst).value;
+    scratch_word(p.taken).value = slot;
     if (slot == INVALID) {
         output_word(2ul * p.output_index).value = INVALID;
         output_word(2ul * p.output_index + 1u).value = 0x7f800000u;

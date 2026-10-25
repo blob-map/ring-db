@@ -1,6 +1,6 @@
-use std::path::PathBuf;
+use std::time::Duration;
 
-/// Which compute backend to use for vector queries.
+/// Which compute backend to use for vector searches.
 ///
 /// Both backends are included in every build; selection happens at runtime.
 /// CPU needs no GPU runtime. Vulkan requires a compatible loader, driver, and device.
@@ -13,75 +13,80 @@ pub enum BackendPreference {
     /// Vulkan compute, preferring a discrete GPU, then an integrated GPU.
     ///
     /// Loads Vulkan only when selected. Requires a Vulkan loader and a compatible
-    /// driver and compute device. Otherwise construction returns
+    /// driver and compute device. Otherwise opening returns
     /// [`RingDbError::BackendUnavailable`](crate::RingDbError::BackendUnavailable).
     /// No Cargo feature, Vulkan SDK, or shader compiler is needed.
     Vulkan,
 }
 
-/// Configuration for a `RingDb` instance.
+/// Runtime settings of a [`Db`](crate::Db).
 #[derive(Debug, Clone)]
-pub struct RingDbConfig {
-    /// Number of dimensions per vector. Must be > 0.
-    pub dims: usize,
-    /// Backend selection strategy.
-    pub backend_preference: BackendPreference,
-    /// Optional directory for persisting the database.
-    ///
-    /// When set, [`RingDb::build()`](crate::engine::RingDb::build) writes the
-    /// full database (vectors, Pod payloads, and metadata indexes) to this
-    /// directory. The sealed database can later be reloaded with
-    /// [`RingDb::load()`](crate::engine::RingDb::load).
-    ///
-    /// Leave `None` (the default) for a purely in-memory database.
-    pub persist_dir: Option<PathBuf>,
+pub struct Options {
+    pub(crate) backend: BackendPreference,
+    pub(crate) max_record_bytes: usize,
+    pub(crate) commit_interval: Option<Duration>,
+    pub(crate) auto_merge: bool,
+    pub(crate) vulkan_min_rows: Option<usize>,
 }
 
-impl RingDbConfig {
-    /// Create a config with default settings (CPU backend, no persistence).
-    pub fn new(dims: usize) -> Self {
+impl Default for Options {
+    fn default() -> Self {
         Self {
-            dims,
-            backend_preference: BackendPreference::Cpu,
-            persist_dir: None,
+            backend: BackendPreference::Cpu,
+            max_record_bytes: 64 * 1024,
+            commit_interval: Some(Duration::from_secs(1)),
+            auto_merge: true,
+            vulkan_min_rows: None,
         }
     }
+}
 
-    /// Set the directory to which the database will be persisted on
-    /// [`build()`](crate::engine::RingDb::build).
-    ///
-    /// The directory is created automatically if it does not exist and must be
-    /// empty when it already exists.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use ringdb::RingDbConfig;
-    ///
-    /// let config = RingDbConfig::new(128).with_persist_dir("/var/data/mydb");
-    /// ```
+impl Options {
+    /// Select the compute backend. The default is [`BackendPreference::Cpu`].
     #[must_use]
-    pub fn with_persist_dir(mut self, dir: impl Into<PathBuf>) -> Self {
-        self.persist_dir = Some(dir.into());
+    pub fn backend(mut self, backend: BackendPreference) -> Self {
+        self.backend = backend;
         self
     }
 
-    /// Set the backend preference.
-    ///
-    /// Defaults to [`BackendPreference::Cpu`]. Use this when loading a
-    /// persisted database onto a specific backend via [`RingDb::load()`](crate::engine::RingDb::load).
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use ringdb::RingDbConfig;
-    /// use ringdb::BackendPreference;
-    ///
-    /// let config = RingDbConfig::new(128).with_backend_preference(BackendPreference::Cpu);
-    /// ```
+    /// Limit the size of one record: its vector and all field values. The
+    /// default is 64 KiB.
     #[must_use]
-    pub fn with_backend_preference(mut self, preference: BackendPreference) -> Self {
-        self.backend_preference = preference;
+    pub fn max_record_bytes(mut self, bytes: usize) -> Self {
+        self.max_record_bytes = bytes;
         self
+    }
+
+    /// Commit changes in the background at this interval, or only on
+    /// [`Db::flush`](crate::Db::flush) with `None`. The default is one second.
+    #[must_use]
+    pub fn commit_interval(mut self, interval: Option<Duration>) -> Self {
+        self.commit_interval = interval;
+        self
+    }
+
+    /// Merge segments after each commit (the default). Without it, segments
+    /// merge only on [`Db::compact`](crate::Db::compact).
+    #[must_use]
+    pub fn auto_merge(mut self, enabled: bool) -> Self {
+        self.auto_merge = enabled;
+        self
+    }
+
+    /// With [`BackendPreference::Vulkan`], search a segment on the CPU when
+    /// fewer of its rows than this pass the filter, and keep segments with
+    /// fewer rows on the CPU only. A GPU search has a fixed cost of about
+    /// 100 µs, the time that a CPU takes to scan about six million
+    /// coordinates. The default is 6 Mi divided by the dimension count, for
+    /// example 98304 rows of 64 dimensions; 0 puts every search on the GPU.
+    #[must_use]
+    pub fn vulkan_min_rows(mut self, rows: usize) -> Self {
+        self.vulkan_min_rows = Some(rows);
+        self
+    }
+
+    pub(crate) fn vulkan_min_rows_for(&self, dims: usize) -> usize {
+        self.vulkan_min_rows
+            .unwrap_or(6 * 1024 * 1024 / dims.max(1))
     }
 }

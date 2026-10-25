@@ -18,8 +18,15 @@ uint better(uint a, uint b) {
     return a_dist < b_dist || (a_dist == b_dist && a_id < b_id) ? a : b;
 }
 
+// Each output entry is the best of 128 input entries. With a shift, one
+// workgroup rebuilds only the entry above the slot that `take` removed.
 void main() {
     uint group = group_index();
+    if (p.reduce_shift != 0u) {
+        uint taken = scratch_word(p.taken).value;
+        if (taken == INVALID) return;
+        group = uint(uint64_t(taken) >> p.reduce_shift);
+    }
     if (group >= group_count(p.reduce_count)) return;
     uint lane = gl_LocalInvocationID.x;
     uint index = group * 128u + lane;
