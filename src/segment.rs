@@ -3,6 +3,7 @@ use std::fs::File;
 use std::sync::Arc;
 
 use memmap2::Mmap;
+use rayon::prelude::*;
 
 use crate::backend::{DiskSpec, RowHit, VulkanDevice, VulkanSegment, cpu};
 use crate::buf::Buf;
@@ -47,8 +48,21 @@ impl Segment {
     }
 
     /// The segment file contents, ending with a CRC-32.
+    #[cfg(test)]
     pub(crate) fn encode(&self) -> Vec<u8> {
         let mut e = Encoder::aligned();
+        self.encode_into(&mut e);
+        e.finish_with_crc()
+    }
+
+    /// Write the segment file contents to `writer`, without a copy of them.
+    pub(crate) fn write(&self, writer: &mut dyn std::io::Write) -> std::io::Result<()> {
+        let mut e = Encoder::aligned_to(writer);
+        self.encode_into(&mut e);
+        e.finish_to_writer()
+    }
+
+    fn encode_into(&self, e: &mut Encoder<'_>) {
         e.header(MAGIC, VERSION);
         e.u64(self.id);
         e.u32(self.dims as u32);
@@ -56,9 +70,8 @@ impl Segment {
         e.slice(&self.keys);
         e.slice(&self.vectors);
         for column in &self.columns {
-            column.encode(&mut e);
+            column.encode(e);
         }
-        e.finish_with_crc()
     }
 
     /// Map a segment file written by [`Segment::encode`] for `schema`, and
@@ -258,6 +271,33 @@ impl SegmentBuilder {
         for (column, value) in self.columns.iter_mut().zip(row.values) {
             column.push(value);
         }
+    }
+
+    /// Append `rows` of `segment`, whose keys must follow the keys so far.
+    pub(crate) fn extend_from(&mut self, segment: &Segment, rows: &[u32]) {
+        debug_assert!(rows.first().is_none_or(|&row| {
+            self.keys
+                .last()
+                .is_none_or(|&last| last < segment.keys[row as usize])
+        }));
+        let dims = self.dims;
+        let (keys, vectors) = (&mut self.keys, &mut self.vectors);
+        rayon::join(
+            || {
+                keys.extend(rows.iter().map(|&row| segment.keys[row as usize]));
+                vectors.reserve(rows.len() * dims);
+                for &row in rows {
+                    let start = row as usize * dims;
+                    vectors.extend_from_slice(&segment.vectors[start..start + dims]);
+                }
+            },
+            || {
+                self.columns
+                    .par_iter_mut()
+                    .zip(&segment.columns)
+                    .for_each(|(column, source)| column.extend_from(source, rows));
+            },
+        );
     }
 
     /// Freeze the records as segment `id`. Upload them separately.

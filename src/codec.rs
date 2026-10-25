@@ -5,6 +5,7 @@
 //! zero padding also puts each count at a multiple of 8 bytes, so that the
 //! elements of a mapped file can be read in place. Decoding checks every bound
 //! and returns [`RingDbError::Corrupt`] instead of panicking.
+use std::io::{self, Write};
 use std::sync::Arc;
 
 use bytemuck::Pod;
@@ -18,22 +19,57 @@ pub(crate) fn corrupt(message: impl Into<String>) -> RingDbError {
 }
 
 #[derive(Default)]
-pub(crate) struct Encoder {
+pub(crate) struct Encoder<'w> {
     bytes: Vec<u8>,
     aligned: bool,
+    sink: Option<Sink<'w>>,
 }
 
-impl Encoder {
+/// Where a streaming encoder writes full buffers and large slices.
+struct Sink<'w> {
+    writer: &'w mut dyn Write,
+    crc: crc32fast::Hasher,
+    /// Bytes written to `writer` so far.
+    written: usize,
+    /// The first write error; later writes are skipped.
+    error: Option<io::Error>,
+}
+
+/// Bytes that a streaming encoder buffers before it writes them.
+const STREAM_BUFFER: usize = 1 << 20;
+
+impl Encoder<'_> {
     /// An encoder of slices that start at multiples of 8 bytes.
     pub(crate) fn aligned() -> Self {
         Self {
-            bytes: Vec::new(),
             aligned: true,
+            ..Self::default()
         }
     }
 
+    /// Position of the next byte in the encoding.
+    fn position(&self) -> usize {
+        self.sink.as_ref().map_or(0, |sink| sink.written) + self.bytes.len()
+    }
+
     fn pad(&mut self) {
-        self.bytes.resize(self.bytes.len().next_multiple_of(8), 0);
+        let padding = self.position().next_multiple_of(8) - self.position();
+        self.bytes.resize(self.bytes.len() + padding, 0);
+    }
+
+    /// Write the buffer, then `bytes`, to the sink.
+    fn flush(&mut self, bytes: &[u8]) {
+        let Some(sink) = &mut self.sink else {
+            return;
+        };
+        for chunk in [&self.bytes[..], bytes] {
+            if sink.error.is_none() {
+                sink.crc.update(chunk);
+                sink.written += chunk.len();
+                sink.error = sink.writer.write_all(chunk).err();
+            }
+        }
+        self.bytes.clear();
     }
 
     pub(crate) fn as_bytes(&self) -> &[u8] {
@@ -70,21 +106,53 @@ impl Encoder {
             self.pad();
         }
         self.u64(values.len() as u64);
-        if cfg!(target_endian = "little") {
+        let len = size_of_val(values);
+        if cfg!(target_endian = "little") && self.sink.is_some() && len >= STREAM_BUFFER {
+            // Write a large slice in place instead of copying it.
+            self.flush(bytemuck::cast_slice(values));
+        } else if cfg!(target_endian = "little") {
             self.bytes.extend_from_slice(bytemuck::cast_slice(values));
         } else {
             values.iter().for_each(|v| v.put_le(&mut self.bytes));
         }
-        let len = size_of_val(values);
         self.bytes
             .resize(self.bytes.len() + len.next_multiple_of(8) - len, 0);
+        if self.bytes.len() >= STREAM_BUFFER {
+            self.flush(&[]);
+        }
     }
 
     /// Append the CRC-32 of everything written so far.
     pub(crate) fn finish_with_crc(mut self) -> Vec<u8> {
+        debug_assert!(self.sink.is_none());
         let crc = crc32fast::hash(&self.bytes);
         self.u32(crc);
         self.bytes
+    }
+}
+
+impl<'w> Encoder<'w> {
+    /// An aligned encoder that writes to `writer` as it goes.
+    pub(crate) fn aligned_to(writer: &'w mut dyn Write) -> Self {
+        Self {
+            sink: Some(Sink {
+                writer,
+                crc: crc32fast::Hasher::new(),
+                written: 0,
+                error: None,
+            }),
+            ..Self::aligned()
+        }
+    }
+
+    /// Write the rest and the CRC-32 of everything to the writer.
+    pub(crate) fn finish_to_writer(mut self) -> io::Result<()> {
+        self.flush(&[]);
+        let sink = self.sink.take().expect("a streaming encoder");
+        if let Some(error) = sink.error {
+            return Err(error);
+        }
+        sink.writer.write_all(&sink.crc.finalize().to_le_bytes())
     }
 }
 
@@ -316,5 +384,33 @@ mod tests {
         let mut e = Encoder::default();
         e.u64(u64::MAX / 2);
         assert!(Decoder::new(e.as_bytes()).slice::<u32>().is_err());
+    }
+
+    #[test]
+    fn streaming_encodings_match_buffered_ones() {
+        let large: Vec<u64> = (0..(STREAM_BUFFER as u64 / 8) * 3 + 5).collect();
+        let encode = |e: &mut Encoder<'_>| {
+            e.header(b"TESTFILE", 1);
+            for round in 0..3u8 {
+                e.u8(round);
+                e.slice(&[1u16, 2, 3]);
+                e.slice(&large[..large.len() >> round]);
+                e.slice(&vec![round; STREAM_BUFFER / 3]);
+            }
+        };
+        let mut buffered = Encoder::aligned();
+        encode(&mut buffered);
+        let buffered = buffered.finish_with_crc();
+        let mut streamed = Vec::new();
+        let mut e = Encoder::aligned_to(&mut streamed);
+        encode(&mut e);
+        e.finish_to_writer().unwrap();
+        assert!(streamed == buffered);
+        let mut d = Decoder::with_crc(&streamed, "test").unwrap();
+        d.header(b"TESTFILE", 1, "test").unwrap();
+        d.set_aligned();
+        assert_eq!(d.u8().unwrap(), 0);
+        assert_eq!(d.slice::<u16>().unwrap(), [1, 2, 3]);
+        assert!(d.slice::<u64>().unwrap() == large);
     }
 }

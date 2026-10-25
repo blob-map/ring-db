@@ -214,6 +214,42 @@ impl Db {
         Self::start(schema, options, Some((Opened::Read(lock), recovered)))
     }
 
+    /// Create a durable database in directory `path` that holds `records`.
+    ///
+    /// This is faster than adding the records to an open database, and needs
+    /// less memory: ring-db writes the records to one segment file, and not
+    /// to the log. `path` must not exist or must be empty. The records get the
+    /// keys 0, 1, 2, and so on, in order. Of `options`, only the record size
+    /// limit applies. Returns the number of records.
+    ///
+    /// Open the database after with [`Db::open`] or [`Db::open_read_only`].
+    /// If the import fails, delete the directory before you try again.
+    pub fn import(
+        path: impl AsRef<Path>,
+        schema: Schema,
+        options: Options,
+        records: impl IntoIterator<Item = Record>,
+    ) -> Result<usize> {
+        schema.validate()?;
+        let import = store::Import::start(path.as_ref())?;
+        let mut builder = SegmentBuilder::new(&schema);
+        for (key, record) in (0..).zip(records) {
+            if builder.len() + 1 >= u32::MAX as usize {
+                return Err(RingDbError::InvalidRecord(
+                    "a database holds at most u32::MAX - 1 rows".to_string(),
+                ));
+            }
+            builder.push(
+                Key(key),
+                record.validate(&schema, options.max_record_bytes)?,
+            );
+        }
+        let count = builder.len();
+        let segment = (!builder.is_empty()).then(|| builder.finish(0));
+        import.finish(&schema, segment.as_ref(), count as u64)?;
+        Ok(count)
+    }
+
     fn start(
         schema: Schema,
         options: Options,
@@ -577,12 +613,11 @@ impl Shared {
     fn build_merge(&self, inputs: &[Part]) -> Result<Option<Segment>> {
         let mut builder = SegmentBuilder::new(&self.schema);
         for part in inputs {
-            for row in 0..part.segment.len() as u32 {
-                if !part.is_deleted(row) {
-                    let key = part.segment.keys[row as usize];
-                    builder.push(key, part.segment.read(&self.schema, row as usize));
-                }
-            }
+            let mut deleted = part.deleted.iter().peekable();
+            let live: Vec<u32> = (0..part.segment.len() as u32)
+                .filter(|row| deleted.next_if_eq(&row).is_none())
+                .collect();
+            builder.extend_from(&part.segment, &live);
         }
         if builder.is_empty() {
             return Ok(None);

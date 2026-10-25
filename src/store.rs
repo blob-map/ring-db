@@ -73,7 +73,7 @@ impl Change {
 /// The changes of one log frame, which recovery replays all together or not
 /// at all.
 #[derive(Default)]
-pub(crate) struct LogFrame(Encoder);
+pub(crate) struct LogFrame(Encoder<'static>);
 
 impl LogFrame {
     pub(crate) fn add(&mut self, key: Key, row: &Row) {
@@ -190,10 +190,66 @@ fn decode_manifest(bytes: &[u8]) -> Result<(Schema, Manifest, u64)> {
 
 /// Write a new segment file into `dir`. It is unused until a manifest names it.
 pub(crate) fn write_segment(dir: &Path, segment: &Segment) -> Result<()> {
-    let mut file = File::create(segment_path(dir, segment.id))?;
-    file.write_all(&segment.encode())?;
-    file.sync_all()?;
+    let mut file = io::BufWriter::new(File::create(segment_path(dir, segment.id))?);
+    segment.write(&mut file)?;
+    file.into_inner()
+        .map_err(io::IntoInnerError::into_error)?
+        .sync_all()?;
     Ok(())
+}
+
+/// A new database directory that [`Db::import`](crate::Db::import) fills.
+pub(crate) struct Import {
+    dir: PathBuf,
+    _lock: File,
+}
+
+impl Import {
+    /// Lock `dir`, which must not exist or be empty.
+    pub(crate) fn start(dir: &Path) -> Result<Self> {
+        fs::create_dir_all(dir)?;
+        if fs::read_dir(dir)?.next().is_some() {
+            return Err(RingDbError::Io(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("import directory {} is not empty", dir.display()),
+            )));
+        }
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join("LOCK"))?;
+        check_lock(dir, lock.try_lock())?;
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            _lock: lock,
+        })
+    }
+
+    /// Write `segment`, which holds keys below `next_key`, then an empty log
+    /// and the manifest that names them.
+    pub(crate) fn finish(
+        self,
+        schema: &Schema,
+        segment: Option<&Segment>,
+        next_key: u64,
+    ) -> Result<()> {
+        if let Some(segment) = segment {
+            write_segment(&self.dir, segment)?;
+        }
+        create_wal(&self.dir, 0)?;
+        let manifest = Manifest {
+            next_key,
+            next_segment: segment.map_or(0, |segment| segment.id + 1),
+            parts: segment
+                .map(|segment| (segment.id, Vec::new()))
+                .into_iter()
+                .collect(),
+        };
+        let bytes = encode_manifest(schema, &manifest, 0);
+        write_atomic(&self.dir, &manifest_path(&self.dir), &bytes)?;
+        Ok(())
+    }
 }
 
 /// Map segment file `id` of `dir`.

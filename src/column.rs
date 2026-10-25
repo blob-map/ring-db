@@ -691,6 +691,55 @@ impl ColumnBuilder {
         }
     }
 
+    /// Append the values of `rows` of `source`, a column of the same field.
+    pub(crate) fn extend_from(&mut self, source: &Column, rows: &[u32]) {
+        let rows = rows.iter().map(|&row| row as usize);
+        match (self, source) {
+            (Self::U32(b), Column::U32(c)) => rows.for_each(|row| b.push(c.get(row))),
+            (Self::U64(b), Column::U64(c)) => rows.for_each(|row| b.push(c.get(row))),
+            (Self::I64(b), Column::I64(c)) => rows.for_each(|row| b.push(c.get(row))),
+            (Self::F32(b), Column::F32(c)) => rows.for_each(|row| b.push(c.get(row))),
+            (Self::Bool(b), Column::Bool(c)) => rows.for_each(|row| b.push(c.get(row))),
+            (
+                Self::Keywords {
+                    local,
+                    row_offsets,
+                    ids,
+                },
+                Column::Keywords(c),
+            ) => {
+                // Look up each source term once, and only if a row uses it.
+                let mut remap = vec![u32::MAX; c.dict.len()];
+                for row in rows {
+                    for id in c.term_ids(row) {
+                        let local_id = &mut remap[id as usize];
+                        if *local_id == u32::MAX {
+                            let next = local.len() as u32;
+                            *local_id =
+                                *local.entry(c.term(id as usize).to_string()).or_insert(next);
+                        }
+                        ids.push(*local_id);
+                    }
+                    row_offsets.push(ids.len());
+                }
+            }
+            (Self::Blobs { items, present }, Column::Blobs(c)) => {
+                for row in rows {
+                    let bytes = c.get(row);
+                    present.push(bytes.is_some());
+                    items.push(bytes.unwrap_or_default());
+                }
+            }
+            (Self::TextList { row_offsets, items }, Column::TextList(c)) => {
+                for row in rows {
+                    c.get(row).for_each(|item| items.push(item));
+                    row_offsets.push(items.len());
+                }
+            }
+            _ => unreachable!("the columns of a field have one type"),
+        }
+    }
+
     pub(crate) fn finish(self) -> Column {
         match self {
             Self::U32(b) => Column::U32(b.finish().indexed()),
@@ -715,7 +764,8 @@ impl ColumnBuilder {
     }
 }
 
-/// Sort the dictionary, renumber the ids, and build the inverted index.
+/// Sort the dictionary, renumber the ids, and build the inverted index. The
+/// ids of a row must be unique.
 fn finish_keywords(
     local: HashMap<String, u32>,
     row_offsets: Offsets,

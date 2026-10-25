@@ -381,6 +381,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+To make a new database from many records, `Db::import(directory, schema, options, records)` is faster and uses less memory.
+It writes all records to one segment file, without the log.
+Then open the database with `Db::open` or `Db::open_read_only`.
+
 Each change is on the disk before `add`, `add_all`, `delete`, or `apply` returns.
 Thus, your changes stay after a crash or a power failure.
 After a crash, a batch is fully in the database, or it is not in the database.
@@ -474,7 +478,7 @@ To change this limit, use `Options::vulkan_min_rows`.
 
 ### Tips for speed
 
-- For a large import, use `Options::commit_interval(None)` and `auto_merge(false)`. Add the records with `add_all`, then call `db.compact()` one time. A search on one segment is the fastest.
+- For a large import into a new database, use `Db::import`. To add many records to an open database, use `Options::commit_interval(None)` and `auto_merge(false)`, add the records with `add_all`, then call `db.compact()` one time. A search on one segment is the fastest.
 - To add many records, use `add_all` or `apply`, which write to the disk one time. Each write call waits for the disk, and write calls run one at a time, so many small calls are slow on a durable database.
 - Keyword filters and narrow ranges are fast. A filter that selects few records makes the search faster.
 - All methods take `&self`. To use one database from many threads, put it in an `Arc`.

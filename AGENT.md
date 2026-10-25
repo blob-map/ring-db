@@ -136,7 +136,9 @@ Deletes are copy-on-write per part.
 Merges run after commits (`Options::auto_merge`) and on `compact`, one at a time
 under `Shared::merging`. `merge_range` selects adjacent parts only: first a part with
 at least 25% deleted rows, else the newest run whose older neighbor has less than
-twice its live rows. `build_merge` copies live rows without the writer lock;
+twice its live rows. `build_merge` copies live rows without the writer lock,
+column by column (`SegmentBuilder::extend_from`; keyword ids are remapped once per
+source term, never through a `Row`);
 `publish_merge` then takes it, remaps rows deleted meanwhile into the new segment,
 and replaces the inputs. Only merges remove parts, so the inputs are still contiguous.
 
@@ -361,7 +363,13 @@ nothing pending). A commit writes and syncs the new
 segment files, then the manifest naming them and a new WAL sequence, then deletes the
 old WAL. If the manifest write fails, the segments stay unpublished for the retry.
 Merges write their segment file before `publish_merge` writes the manifest, and
-remove replaced files after.
+remove replaced files after. Segment files are streamed (`Segment::write`,
+`Encoder::aligned_to`): large slices go to the file in place, so a write keeps no
+encoded copy in memory.
+
+`Db::import` locks a new, empty directory (`store::Import`), builds one segment
+from the records (keys from 0), writes it, an empty log, and the manifest. It
+never writes the log, and the directory is a normal database afterwards.
 
 `Store::open` locks, reads or creates the manifest (a new database writes only
 the manifest, so a crash during creation leaves at most `MANIFEST.tmp`; a missing
