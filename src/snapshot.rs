@@ -73,12 +73,12 @@ impl Snapshot {
                 base += part.segment.len() as u32;
                 entry
             })
-            .collect();
+            .collect::<Vec<_>>();
         let len = parts.iter().map(Part::live).sum();
         Self(Arc::new(View {
             schema,
             parts,
-            keys: KeyLookup(keys),
+            keys: KeyLookup::new(keys),
             len,
             rows: base as usize,
         }))

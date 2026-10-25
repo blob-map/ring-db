@@ -196,13 +196,46 @@ pub struct Hit {
 /// Rows are numbered across the segments of a snapshot: each segment's keys
 /// start at its base row.
 #[derive(Debug, Clone)]
-pub(crate) struct KeyLookup(pub(crate) Arc<[(u32, Arc<[Key]>)]>);
+pub(crate) struct KeyLookup(Arc<[SegmentKeys]>);
+
+#[derive(Debug)]
+struct SegmentKeys {
+    base: u32,
+    keys: Arc<[Key]>,
+    /// Set when the keys have no gaps, so that a key is computed without
+    /// reading `keys`, as in a database that was only appended to.
+    contiguous: bool,
+}
 
 impl KeyLookup {
+    /// `segments` gives each segment's base row and its sorted keys.
+    pub(crate) fn new(segments: impl IntoIterator<Item = (u32, Arc<[Key]>)>) -> Self {
+        Self(
+            segments
+                .into_iter()
+                .map(|(base, keys)| SegmentKeys {
+                    base,
+                    contiguous: keys
+                        .last()
+                        .is_some_and(|last| last.0 - keys[0].0 == keys.len() as u64 - 1),
+                    keys,
+                })
+                .collect(),
+        )
+    }
+
     fn key(&self, row: u32) -> Key {
-        let part = self.0.partition_point(|(base, _)| *base <= row) - 1;
-        let (base, keys) = &self.0[part];
-        keys[(row - base) as usize]
+        let part = match &*self.0 {
+            [_] => 0,
+            parts => parts.partition_point(|part| part.base <= row) - 1,
+        };
+        let part = &self.0[part];
+        let index = row - part.base;
+        if part.contiguous {
+            Key(part.keys[0].0 + u64::from(index))
+        } else {
+            part.keys[index as usize]
+        }
     }
 }
 
@@ -247,18 +280,26 @@ impl RegionResult {
     pub fn get(&self, index: usize) -> Option<RegionHit<'_>> {
         let start = index.checked_mul(self.stride())?;
         let record = self.records.get(start..start.checked_add(self.stride())?)?;
-        Some(RegionHit {
+        Some(self.hit(record))
+    }
+
+    fn hit<'s>(&'s self, record: &'s [u32]) -> RegionHit<'s> {
+        RegionHit {
             key: self.keys.key(record[0]),
             dists_sq: bytemuck::cast_slice(&record[1..]),
-        })
+        }
     }
 
     pub fn iter(&self) -> impl ExactSizeIterator<Item = RegionHit<'_>> + '_ {
-        (0..self.len()).map(|index| self.get(index).expect("index is in bounds"))
+        self.records
+            .chunks_exact(self.stride())
+            .map(|record| self.hit(record))
     }
 
     pub fn keys(&self) -> impl ExactSizeIterator<Item = Key> + '_ {
-        self.iter().map(|hit| hit.key)
+        self.records
+            .chunks_exact(self.stride())
+            .map(|record| self.keys.key(record[0]))
     }
 }
 
@@ -402,4 +443,19 @@ pub(crate) fn validate_disk<'a>(dims: usize, disk: &Disk<'a>) -> Result<DiskSpec
         weights: disk.metric.weights(),
         radius_sq,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keys_resolve_with_and_without_gaps() {
+        let keys = |values: &[u64]| -> Arc<[Key]> { values.iter().copied().map(Key).collect() };
+        let lookup = KeyLookup::new([(0, keys(&[5, 6, 7])), (3, keys(&[9, 12])), (5, keys(&[20]))]);
+        let found: Vec<u64> = (0..6).map(|row| lookup.key(row).0).collect();
+        assert_eq!(found, [5, 6, 7, 9, 12, 20]);
+        let single = KeyLookup::new([(0, keys(&[3, 8]))]);
+        assert_eq!(single.key(1), Key(8));
+    }
 }
