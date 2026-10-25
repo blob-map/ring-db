@@ -590,3 +590,24 @@ fn vulkan_reads_vectors_past_four_gib() {
         [rows - 300, rows - 2, rows - 1].map(u64::from)
     );
 }
+
+#[test]
+fn vulkan_facets_match_cpu() {
+    if !requested() {
+        return;
+    }
+    let cpu = common::keyword_db(common::manual(BackendPreference::Cpu));
+    let gpu = common::keyword_db(common::manual(BackendPreference::Vulkan));
+    assert_eq!(gpu.backend(), BackendPreference::Vulkan);
+    let lille = Filter::eq("city", "Lille");
+    for filter in [None, Some(&lille)] {
+        let mut region = Disk::new(&[10.0, 10.0], 8.0).and(Disk::new(&[12.0, 12.0], 9.0));
+        if let Some(filter) = filter {
+            region = region.filter(filter);
+        }
+        let facets = region.facets(&["city", "tags"]);
+        let expected = cpu.search(facets.clone()).unwrap();
+        assert!(!expected[0].is_empty());
+        assert_eq!(gpu.search(facets).unwrap(), expected);
+    }
+}

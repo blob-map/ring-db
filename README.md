@@ -291,6 +291,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 Keyword filters compare the full string, with the same uppercase and lowercase letters.
 `db.count(&filter)` returns the number of records that pass a filter. It does not read the vectors.
 
+Facets count the records for each value of `Keyword` and `Keywords` fields:
+
+- `db.search(region.facets(&["city"]))` counts the records in a region, for example `[[("Lille", 120), ("Roubaix", 45)]]`, with one list for each field.
+- `db.search(Facets::new(&["city"]).filter(&filter))` counts all the records that pass a filter.
+- Add `.top(n)` to keep only the `n` values with the most records.
+
 A record with no value for a field does not pass a filter on that field.
 Thus, `!Filter::eq("garden", true)` includes the records with no value for `garden`.
 

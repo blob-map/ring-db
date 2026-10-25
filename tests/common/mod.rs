@@ -126,3 +126,49 @@ pub fn reference_dist(vector: &[f32], query: &[f32], weights: Option<&[f32]>) ->
         })
         .sum()
 }
+
+/// 900 records in 3 segments, 40 of them deleted in the first two, with a
+/// `city` keyword (or none), up to three `tags`, and `rooms`. Record `i` is at
+/// `[i / 30, i % 30]`.
+pub fn keyword_db(options: Options) -> Db {
+    let schema = Schema::new(2)
+        .field("city", FieldType::Keyword)
+        .field("tags", FieldType::Keywords)
+        .field("rooms", FieldType::U32);
+    let db = Db::in_memory(schema, options).unwrap();
+    let mut x = 5u64;
+    let mut next = move |n: u64| {
+        x = x
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (x >> 33) % n
+    };
+    for part in 0..3 {
+        let records: Vec<Record> = (part * 300..part * 300 + 300)
+            .map(|i| {
+                let mut record = Record::new([(i / 30) as f32, (i % 30) as f32])
+                    .set("rooms", next(6) as u32)
+                    .set(
+                        "tags",
+                        (0..next(4))
+                            .map(|_| format!("tag{}", next(6)))
+                            .collect::<Vec<_>>(),
+                    );
+                // Lille is in about half of the records, so it is a bitmap.
+                match next(10) {
+                    0 => {}
+                    1..5 => record = record.set("city", "Lille"),
+                    n => record = record.set("city", format!("city{}", n * 7 + next(7))),
+                }
+                record
+            })
+            .collect();
+        db.add_all(records).unwrap();
+        db.flush().unwrap();
+    }
+    for key in (0..600).step_by(15) {
+        db.delete(Key::new(key)).unwrap();
+    }
+    db.flush().unwrap();
+    db
+}

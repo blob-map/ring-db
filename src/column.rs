@@ -15,6 +15,7 @@ use std::ops::{Bound, Range, RangeBounds};
 use bytemuck::Pod;
 use rayon::prelude::*;
 
+use crate::backend::Mask;
 use crate::buf::Buf;
 use crate::codec::{Decoder, Encoder, ToLe, corrupt};
 use crate::error::Result;
@@ -380,8 +381,71 @@ impl Keywords {
     }
 
     fn terms(&self, row: usize) -> impl Iterator<Item = &str> {
-        self.term_ids(row)
-            .map(|id| utf8(self.dict.get(id as usize)))
+        self.term_ids(row).map(|id| self.term(id as usize))
+    }
+
+    pub(crate) fn term(&self, id: usize) -> &str {
+        utf8(self.dict.get(id))
+    }
+
+    /// Number of `rows` that hold each term, by term id.
+    pub(crate) fn term_counts(&self, rows: Mask<'_>) -> Vec<u32> {
+        match rows {
+            Mask::All => (0..self.dict.len())
+                .map(|id| match self.postings.get(id, self.rows) {
+                    Posting::Sparse(rows) => rows.len() as u32,
+                    Posting::Dense(words) => words.iter().map(|w| w.count_ones()).sum(),
+                })
+                .collect(),
+            Mask::Sparse(rows) => self.count_rows(rows),
+            Mask::Dense(words) => self.sum_counts(
+                words.par_chunks(64).enumerate(),
+                |counts, (chunk, words)| {
+                    for (index, &word) in words.iter().enumerate() {
+                        let first = (chunk * 64 + index) * 64;
+                        let mut bits = word;
+                        while bits != 0 {
+                            self.count_row(counts, first + bits.trailing_zeros() as usize);
+                            bits &= bits - 1;
+                        }
+                    }
+                },
+            ),
+        }
+    }
+
+    /// [`Keywords::term_counts`] for rows in any order, without duplicates.
+    pub(crate) fn count_rows(&self, rows: &[u32]) -> Vec<u32> {
+        self.sum_counts(rows.par_chunks(4096), |counts, rows| {
+            rows.iter()
+                .for_each(|&row| self.count_row(counts, row as usize));
+        })
+    }
+
+    fn count_row(&self, counts: &mut [u32], row: usize) {
+        self.term_ids(row).for_each(|id| counts[id as usize] += 1);
+    }
+
+    /// Count terms into one array per task, then add the arrays.
+    fn sum_counts<I: ParallelIterator>(
+        &self,
+        items: I,
+        count: impl Fn(&mut [u32], I::Item) + Send + Sync,
+    ) -> Vec<u32> {
+        let terms = self.dict.len();
+        items
+            .fold(
+                || vec![0u32; terms],
+                |mut counts, item| {
+                    count(&mut counts, item);
+                    counts
+                },
+            )
+            .reduce_with(|mut a, b| {
+                a.iter_mut().zip(&b).for_each(|(a, b)| *a += b);
+                a
+            })
+            .unwrap_or_else(|| vec![0; terms])
     }
 
     /// Rows holding at least one of `terms`.

@@ -70,7 +70,7 @@ src/
 ├── store.rs           directory lock, WAL, MANIFEST, segment files, recovery
 ├── codec.rs           checked little-endian Encoder/Decoder with CRC-32
 ├── error.rs           RingDbError
-├── query.rs           Knn, Disk, Region, Count, Metric, Key, Hit, RegionResult
+├── query.rs           Knn, Disk, Region, Count, Facets, Metric, Key, Hit, RegionResult
 └── backend/
     ├── mod.rs         kernel inputs: Mask, DiskSpec, RowHit
     ├── cpu.rs         Rayon-parallel exact reference backend
@@ -185,10 +185,17 @@ Every search goes through `Db::search` or `Snapshot::search`, which take a seale
 | `Disk` | `RegionResult` | inclusive `dist_sq <= radius^2` |
 | `Region` | `RegionResult` | vector must satisfy every disk (1..=`MAX_DISKS`) |
 | `Count` | `usize` | number of records in a `Region` (`Region::count`, `Disk::count`) |
+| `Facets` | `Vec<Vec<(String, usize)>>` | per keyword field, record counts per value, by count desc then value |
 
 `Snapshot::count(&Filter)` (and `Db::count`) sums the eligible `RowSet` lengths
 without reading vectors. On Vulkan, `Count` runs the scan in mode 2, which only
 increments the output count word.
+
+`Snapshot::facets` checks that every field is `Keyword`/`Keywords`, then per
+segment takes the eligible rows (`Facets::new`) or the region hits (rows taken
+from the region records, any order) and counts term ids per thread
+(`Keywords::term_counts`; `Mask::All` reads posting lengths). Counts merge by
+string across segments; `top(n)` selects before the final sort.
 
 A disk is a one-disk region: `Disk::and` and `Disk::filter` return a `Region`.
 `Knn::metric` and `Disk::metric` take `Metric::L2` or `Metric::WeightedL2(&w)`.

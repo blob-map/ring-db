@@ -128,6 +128,12 @@ impl<'a> Disk<'a> {
     pub fn count(self) -> Count<'a> {
         Region::from(self).count()
     }
+
+    /// Count the values of keyword `fields` among the records inside this disk.
+    #[must_use]
+    pub fn facets(self, fields: &'a [&'a str]) -> Facets<'a> {
+        Region::from(self).facets(fields)
+    }
 }
 
 /// Every record inside all of its disks. It always contains at least one disk.
@@ -160,6 +166,21 @@ impl<'a> Region<'a> {
     pub fn count(self) -> Count<'a> {
         Count(self)
     }
+
+    /// Count the values of keyword `fields` among the records inside this
+    /// region.
+    #[must_use]
+    pub fn facets(self, fields: &'a [&'a str]) -> Facets<'a> {
+        Facets {
+            fields,
+            filter: self.filter,
+            region: Some(Self {
+                filter: None,
+                ..self
+            }),
+            top: None,
+        }
+    }
 }
 
 /// The number of records inside a [`Region`]. Faster than the length of a
@@ -175,6 +196,64 @@ impl<'a> Region<'a> {
 /// ```
 #[derive(Debug, Clone)]
 pub struct Count<'a>(Region<'a>);
+
+/// The number of records with each value of `Keyword` and `Keywords` fields.
+///
+/// A facet search counts the records inside a region (see [`Region::facets`])
+/// or all records (see [`Facets::new`]), that pass the filter if one is set.
+/// The output has one list per field, in the order of the fields. A list has
+/// each value with its number of records, from the largest number to the
+/// smallest, then in the order of the values. A value without records is not
+/// in the list. A record with many values of a `Keywords` field counts one time
+/// for each of the values.
+///
+/// ```
+/// use ringdb::{Db, Disk, Facets, FieldType, Options, Record, Schema};
+///
+/// let schema = Schema::new(1).field("city", FieldType::Keyword);
+/// let db = Db::in_memory(schema, Options::default()).unwrap();
+/// let cities = [(1.0, "Lille"), (2.0, "Roubaix"), (3.0, "Lille"), (9.0, "Paris")];
+/// db.add_all(cities.map(|(x, city)| Record::new([x]).set("city", city))).unwrap();
+/// db.flush().unwrap();
+///
+/// let near = db.search(Disk::new(&[0.0], 5.0).facets(&["city"])).unwrap();
+/// assert_eq!(near[0], [("Lille".to_string(), 2), ("Roubaix".to_string(), 1)]);
+/// let all = db.search(Facets::new(&["city"]).top(1)).unwrap();
+/// assert_eq!(all[0], [("Lille".to_string(), 2)]);
+/// ```
+#[derive(Debug, Clone)]
+pub struct Facets<'a> {
+    pub(crate) fields: &'a [&'a str],
+    pub(crate) region: Option<Region<'a>>,
+    pub(crate) filter: Option<&'a Filter>,
+    pub(crate) top: Option<usize>,
+}
+
+impl<'a> Facets<'a> {
+    /// Count the values of `fields` among all records.
+    pub const fn new(fields: &'a [&'a str]) -> Self {
+        Self {
+            fields,
+            region: None,
+            filter: None,
+            top: None,
+        }
+    }
+
+    /// Count only the records that pass `filter`.
+    #[must_use]
+    pub const fn filter(mut self, filter: &'a Filter) -> Self {
+        self.filter = Some(filter);
+        self
+    }
+
+    /// Keep only the `n` values with the most records in each list.
+    #[must_use]
+    pub const fn top(mut self, n: usize) -> Self {
+        self.top = Some(n);
+        self
+    }
+}
 
 impl<'a> From<Disk<'a>> for Region<'a> {
     fn from(disk: Disk<'a>) -> Self {
@@ -333,7 +412,7 @@ mod sealed {
 }
 
 /// A search request accepted by `search`. Implemented by [`Knn`], [`Disk`],
-/// [`Region`], and [`Count`].
+/// [`Region`], [`Count`], and [`Facets`].
 pub trait Query: sealed::Sealed {
     type Output;
 
@@ -345,6 +424,7 @@ impl sealed::Sealed for Knn<'_> {}
 impl sealed::Sealed for Disk<'_> {}
 impl sealed::Sealed for Region<'_> {}
 impl sealed::Sealed for Count<'_> {}
+impl sealed::Sealed for Facets<'_> {}
 
 impl Query for Knn<'_> {
     type Output = Vec<Hit>;
@@ -367,6 +447,14 @@ impl Query for Count<'_> {
 
     fn execute(self, snapshot: &Snapshot) -> Result<usize> {
         snapshot.region_count(&self.0)
+    }
+}
+
+impl Query for Facets<'_> {
+    type Output = Vec<Vec<(String, usize)>>;
+
+    fn execute(self, snapshot: &Snapshot) -> Result<Self::Output> {
+        snapshot.facets(&self)
     }
 }
 

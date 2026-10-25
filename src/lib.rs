@@ -58,7 +58,7 @@ pub use db::{Batch, Db};
 pub use error::RingDbError;
 pub use filter::Filter;
 pub use query::{
-    Count, Disk, Hit, Key, Knn, MAX_DISKS, Metric, Query, Region, RegionHit, RegionResult,
+    Count, Disk, Facets, Hit, Key, Knn, MAX_DISKS, Metric, Query, Region, RegionHit, RegionResult,
 };
 pub use schema::{FieldType, Schema};
 pub use snapshot::Snapshot;
