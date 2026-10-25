@@ -32,12 +32,20 @@ fn open(dir: &Path) -> Db {
     open_with(dir, schema(), manual()).unwrap()
 }
 
+fn open_with(dir: &Path, schema: Schema, options: Options) -> Result<Db, RingDbError> {
+    retry(|| Db::open(dir, schema.clone(), options.clone()))
+}
+
+fn open_read_only(dir: &Path) -> Result<Db, RingDbError> {
+    retry(|| Db::open_read_only(dir, schema(), manual()))
+}
+
 /// Open, waiting while another test's child process briefly holds the lock: a
 /// process forked by any thread keeps a copy of every open file until it execs.
-fn open_with(dir: &Path, schema: Schema, options: Options) -> Result<Db, RingDbError> {
+fn retry(open: impl Fn() -> Result<Db, RingDbError>) -> Result<Db, RingDbError> {
     let started = std::time::Instant::now();
     loop {
-        match Db::open(dir, schema.clone(), options.clone()) {
+        match open() {
             Err(RingDbError::Io(error))
                 if error.kind() == std::io::ErrorKind::WouldBlock
                     && started.elapsed() < std::time::Duration::from_secs(5) =>
@@ -94,6 +102,25 @@ fn files(dir: &Path) -> Vec<String> {
         .collect();
     names.sort();
     names
+}
+
+/// Every file of `dir` with its contents.
+fn file_contents(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    files(dir)
+        .into_iter()
+        .map(|name| {
+            let bytes = fs::read(dir.join(&name)).unwrap();
+            (name, bytes)
+        })
+        .collect()
+}
+
+fn assert_lock_error(result: Result<Db, RingDbError>) {
+    match result {
+        Err(RingDbError::Io(error)) => assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock),
+        Err(other) => panic!("expected a lock error, got {other}"),
+        Ok(_) => panic!("the open must fail"),
+    }
 }
 
 fn file_with_prefix(dir: &Path, prefix: &str) -> PathBuf {
@@ -269,11 +296,8 @@ fn corruption_is_detected() {
 fn the_schema_and_the_lock_are_enforced() {
     let dir = tempfile::tempdir().unwrap();
     let db = open(dir.path());
-    match Db::open(dir.path(), schema(), manual()) {
-        Err(RingDbError::Io(error)) => assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock),
-        Err(other) => panic!("expected a lock error, got {other}"),
-        Ok(_) => panic!("a second open must fail"),
-    }
+    assert_lock_error(Db::open(dir.path(), schema(), manual()));
+    assert_lock_error(Db::open_read_only(dir.path(), schema(), manual()));
     drop(db);
     for other in [
         Schema::new(3),
@@ -303,16 +327,114 @@ fn leftover_files_are_removed_on_open() {
     fs::copy(&segment, dir.path().join("seg-00000000000000ff.seg")).unwrap();
     fs::write(dir.path().join("wal-00000000000000ff.log"), b"stale").unwrap();
     fs::write(dir.path().join("MANIFEST.tmp"), b"partial").unwrap();
-    fs::write(dir.path().join("notes.txt"), b"the user's file").unwrap();
+    let users = ["notes.txt", "export.tmp", "seg-notes.seg", "wal-1.log"];
+    for name in users {
+        fs::write(dir.path().join(name), b"the user's file").unwrap();
+    }
     let db = open(dir.path());
     assert_eq!(db.len(), 5);
     let names = files(dir.path());
-    assert!(names.contains(&"notes.txt".to_string()));
+    for name in users {
+        assert!(names.contains(&name.to_string()), "{name} was removed");
+    }
     assert!(
         !names
             .iter()
-            .any(|n| n.contains("ff") || n.ends_with(".tmp"))
+            .any(|n| n.contains("ff") || n == "MANIFEST.tmp")
     );
+}
+
+#[test]
+fn read_only_opens_change_no_file() {
+    if let Some(dir) = std::env::var_os(CHILD) {
+        let db = open(Path::new(&dir));
+        let keys = db.add_all((0..10).map(record)).unwrap();
+        db.flush().unwrap();
+        // Logged but never committed.
+        db.apply(Batch::new().delete(keys[3]).add(record(10)))
+            .unwrap();
+        std::process::abort();
+    }
+    let dir = tempfile::tempdir().unwrap();
+    crash("read_only_opens_change_no_file", dir.path());
+    // A torn tail and a left-over file, which a writer would remove.
+    let wal = file_with_prefix(dir.path(), "wal-");
+    OpenOptions::new()
+        .append(true)
+        .open(&wal)
+        .unwrap()
+        .write_all(&[40, 0, 0, 0, 1, 2, 3, 4, 1, 9])
+        .unwrap();
+    fs::write(dir.path().join("MANIFEST.tmp"), b"partial").unwrap();
+    let before = file_contents(dir.path());
+
+    let db = open_read_only(dir.path()).unwrap();
+    let keys: Vec<u64> = contents(&db).iter().map(|c| c.0).collect();
+    assert_eq!(keys, [0, 1, 2, 4, 5, 6, 7, 8, 9, 10]);
+    assert_eq!(db.get(Key::new(10)).unwrap().vector(), [10.0, 3.0]);
+    assert!(matches!(db.add(record(11)), Err(RingDbError::ReadOnly)));
+    assert!(matches!(db.delete(Key::new(0)), Err(RingDbError::ReadOnly)));
+    assert!(matches!(db.flush(), Err(RingDbError::ReadOnly)));
+    assert!(matches!(db.compact(), Err(RingDbError::ReadOnly)));
+    let backup = tempfile::tempdir().unwrap();
+    assert!(matches!(db.backup(backup.path()), Err(RingDbError::ReadOnly)));
+    // Readers share the directory, and keep writers out.
+    let other = open_read_only(dir.path()).unwrap();
+    assert_eq!(other.len(), 10);
+    assert_lock_error(Db::open(dir.path(), schema(), manual()));
+    drop((db, other));
+    assert_eq!(file_contents(dir.path()), before);
+
+    let db = open(dir.path());
+    assert_eq!(contents(&db).len(), 10);
+}
+
+#[test]
+fn read_only_opens_need_an_existing_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing");
+    match Db::open_read_only(&missing, schema(), manual()) {
+        Err(RingDbError::Io(error)) => assert_eq!(error.kind(), std::io::ErrorKind::NotFound),
+        other => panic!("expected NotFound, got {:?}", other.err()),
+    }
+    assert!(!missing.exists());
+    {
+        let db = open(dir.path());
+        db.add_all((0..5).map(record)).unwrap();
+    }
+    assert!(matches!(
+        Db::open_read_only(dir.path(), Schema::new(3), manual()),
+        Err(RingDbError::InvalidSchema(_))
+    ));
+    // A backup has no LOCK file.
+    let backup = dir.path().join("backup");
+    open(dir.path()).backup(&backup).unwrap();
+    assert!(!backup.join("LOCK").exists());
+    assert_eq!(open_read_only(&backup).unwrap().len(), 5);
+}
+
+#[cfg(unix)]
+#[test]
+fn read_only_opens_work_without_write_permission() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = open(dir.path());
+        db.add_all((0..5).map(record)).unwrap();
+        db.flush().unwrap();
+        db.add(record(5)).unwrap();
+    }
+    let set_mode = |file: u32, dir_mode: u32| {
+        for name in files(dir.path()) {
+            fs::set_permissions(dir.path().join(name), fs::Permissions::from_mode(file)).unwrap();
+        }
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(dir_mode)).unwrap();
+    };
+    set_mode(0o444, 0o555);
+    let result = open_read_only(dir.path()).map(|db| db.len());
+    set_mode(0o644, 0o755);
+    assert_eq!(result.unwrap(), 6);
 }
 
 #[test]

@@ -52,8 +52,10 @@ struct Shared {
     schema: Arc<Schema>,
     options: Options,
     device: Option<Arc<VulkanDevice>>,
-    /// The database directory, or `None` in memory.
+    /// The database directory, or `None` in memory or read-only.
     dir: Option<PathBuf>,
+    /// Set when the database is open read-only.
+    read_only: Option<store::ReadLock>,
     next_segment: AtomicU64,
     writer: Mutex<Writer>,
     current: RwLock<Snapshot>,
@@ -181,19 +183,34 @@ impl Db {
     /// Open the durable database in directory `path`, or create it there.
     ///
     /// An existing database must have exactly `schema`; otherwise this returns
-    /// [`RingDbError::InvalidSchema`]. Only one `Db` can have a directory open:
-    /// a second open returns an [`RingDbError::Io`] error. Opening recovers the
-    /// changes that were synced but not yet committed and commits them.
+    /// [`RingDbError::InvalidSchema`]. Only one `Db` can have a directory open
+    /// for writing: another open returns an [`RingDbError::Io`] error. Opening
+    /// recovers the changes that were synced but not yet committed and commits
+    /// them.
     pub fn open(path: impl AsRef<Path>, schema: Schema, options: Options) -> Result<Self> {
         schema.validate()?;
         let (store, recovered) = Store::open(path.as_ref(), &schema)?;
-        Self::start(schema, options, Some((store, recovered)))
+        Self::start(schema, options, Some((Opened::Write(store), recovered)))
+    }
+
+    /// Open the durable database in directory `path` without changing any of
+    /// its files, for example on a read-only mount.
+    ///
+    /// The database must exist and have exactly `schema`. Changes that are
+    /// logged but not committed are visible, and kept in memory only. Every
+    /// write, including [`flush`](Self::flush), [`compact`](Self::compact), and
+    /// [`backup`](Self::backup), returns [`RingDbError::ReadOnly`]. Several
+    /// read-only `Db`s can share a directory, but not with a `Db` that writes.
+    pub fn open_read_only(path: impl AsRef<Path>, schema: Schema, options: Options) -> Result<Self> {
+        schema.validate()?;
+        let (lock, recovered) = store::open_read_only(path.as_ref(), &schema)?;
+        Self::start(schema, options, Some((Opened::Read(lock), recovered)))
     }
 
     fn start(
         schema: Schema,
         options: Options,
-        storage: Option<(Store, store::Recovered)>,
+        storage: Option<(Opened, store::Recovered)>,
     ) -> Result<Self> {
         let device = match options.backend {
             BackendPreference::Cpu => None,
@@ -212,7 +229,8 @@ impl Db {
         let mut next_segment = 0;
         let mut changes = Vec::new();
         let mut dir = None;
-        if let Some((store, recovered)) = storage {
+        let mut read_only = None;
+        if let Some((opened, recovered)) = storage {
             let manifest = recovered.manifest;
             for (mut segment, (_, deleted)) in recovered.segments.into_iter().zip(manifest.parts) {
                 if segment.id >= manifest.next_segment {
@@ -224,8 +242,13 @@ impl Db {
             writer.next_key = manifest.next_key;
             next_segment = manifest.next_segment;
             changes = recovered.changes;
-            dir = Some(store.dir().to_path_buf());
-            writer.store = Some(store);
+            match opened {
+                Opened::Write(store) => {
+                    dir = Some(store.dir().to_path_buf());
+                    writer.store = Some(store);
+                }
+                Opened::Read(lock) => read_only = Some(lock),
+            }
         }
         let current = Snapshot::new(schema.clone(), parts);
         writer.replay(changes, &current)?;
@@ -235,6 +258,7 @@ impl Db {
             merging: Mutex::new(()),
             next_segment: AtomicU64::new(next_segment),
             dir,
+            read_only,
             schema,
             options,
             device,
@@ -243,6 +267,7 @@ impl Db {
         let committer = shared
             .options
             .commit_interval
+            .filter(|_| shared.read_only.is_none())
             .map(|interval| Committer::start(shared.clone(), interval));
         Ok(Self { shared, committer })
     }
@@ -281,6 +306,7 @@ impl Db {
     /// returns an error and makes no change.
     pub fn apply(&self, batch: Batch) -> Result<Vec<Key>> {
         let shared = &self.shared;
+        shared.writable()?;
         let rows = batch
             .adds
             .into_iter()
@@ -326,12 +352,14 @@ impl Db {
     /// Commit every change now. With [`Options::auto_merge`], then merge
     /// segments as the merge policy asks.
     pub fn flush(&self) -> Result<()> {
+        self.shared.writable()?;
         self.shared.flush()
     }
 
     /// Commit, then merge all segments into one without deleted rows. Searches
     /// are fastest on a single segment, for example after a bulk import.
     pub fn compact(&self) -> Result<()> {
+        self.shared.writable()?;
         self.shared.commit()?;
         self.shared.merge(|parts| {
             (parts.len() > 1 || parts.iter().any(|p| !p.deleted.is_empty()))
@@ -344,6 +372,7 @@ impl Db {
     /// files are copied. An in-memory database returns an [`RingDbError::Io`]
     /// error of kind `Unsupported`.
     pub fn backup(&self, dest: impl AsRef<Path>) -> Result<()> {
+        self.shared.writable()?;
         self.shared.commit()?;
         let writer = lock(&self.shared.writer);
         let Some(store) = &writer.store else {
@@ -412,6 +441,13 @@ impl Shared {
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    fn writable(&self) -> Result<()> {
+        match self.read_only {
+            Some(_) => Err(RingDbError::ReadOnly),
+            None => Ok(()),
+        }
     }
 
     fn segment_id(&self) -> u64 {
@@ -626,6 +662,12 @@ fn merge_range(parts: &[Part]) -> Option<Range<usize>> {
         run += parts[start].live();
     }
     (start < last).then_some(start..last + 1)
+}
+
+/// How [`Db::start`] reaches the files of a durable database.
+enum Opened {
+    Write(Store),
+    Read(store::ReadLock),
 }
 
 /// Commits in the background every `interval` until stopped.

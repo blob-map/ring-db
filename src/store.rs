@@ -2,7 +2,8 @@
 //!
 //! A database directory contains:
 //!
-//! - `LOCK`, locked exclusively while a [`Db`](crate::Db) has the directory open;
+//! - `LOCK`, locked exclusively while a [`Db`](crate::Db) has the directory open
+//!   for writing, and shared while it is open read-only;
 //! - `MANIFEST`, the schema, counters, live segment files, and their deleted rows;
 //! - `seg-<id>.seg`, one immutable file per segment;
 //! - `wal-<seq>.log`, the changes since the manifest was written.
@@ -13,6 +14,9 @@
 //! then replaces the manifest with a rename. Recovery loads the manifest's
 //! segments and replays its log up to the first torn frame. Files that the manifest does not name
 //! are left over from an interrupted commit or merge and are removed.
+//!
+//! A read-only open changes no file: it skips the cleanup and keeps the
+//! changes of the log in memory.
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -113,6 +117,14 @@ fn segment_path(dir: &Path, id: u64) -> PathBuf {
     dir.join(format!("seg-{id:016x}.seg"))
 }
 
+/// Whether `name` is `prefix`, 16 hexadecimal digits, and `suffix`, as in the
+/// names of segment files and logs.
+fn is_numbered(name: &str, prefix: &str, suffix: &str) -> bool {
+    name.strip_prefix(prefix)
+        .and_then(|rest| rest.strip_suffix(suffix))
+        .is_some_and(|id| id.len() == 16 && id.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
 fn sync_dir(dir: &Path) -> io::Result<()> {
     File::open(dir)?.sync_all()
 }
@@ -184,9 +196,9 @@ pub(crate) fn write_segment(dir: &Path, segment: &Segment) -> Result<()> {
     Ok(())
 }
 
-/// Read log frames until the end or the first torn frame, and cut the file
-/// there so that new frames follow the last complete one.
-fn replay(path: &Path, schema: &Schema) -> Result<Vec<Change>> {
+/// Read log frames until the end or the first torn frame. With `repair`, cut
+/// the file there so that new frames follow the last complete one.
+fn replay(path: &Path, schema: &Schema, repair: bool) -> Result<Vec<Change>> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -214,7 +226,7 @@ fn replay(path: &Path, schema: &Schema) -> Result<Vec<Change>> {
         }
         at += 8 + len;
     }
-    if at < bytes.len() {
+    if repair && at < bytes.len() {
         let file = OpenOptions::new().write(true).open(path)?;
         file.set_len(at as u64)?;
         file.sync_all()?;
@@ -237,6 +249,105 @@ fn create_wal(dir: &Path, seq: u64) -> io::Result<File> {
     Ok(file)
 }
 
+/// Turn the result of locking the directory into an error if the lock is held.
+fn check_lock(dir: &Path, locked: std::result::Result<(), TryLockError>) -> Result<()> {
+    match locked {
+        Ok(()) => Ok(()),
+        Err(TryLockError::WouldBlock) => Err(RingDbError::Io(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!("{} is open in another Db", dir.display()),
+        ))),
+        Err(TryLockError::Error(error)) => Err(error.into()),
+    }
+}
+
+/// Decode the manifest `bytes` of `dir` and check that it holds `schema`.
+fn read_manifest(dir: &Path, bytes: &[u8], schema: &Schema) -> Result<(Manifest, u64)> {
+    let (stored, manifest, wal_seq) = decode_manifest(bytes)?;
+    if stored != *schema {
+        return Err(RingDbError::InvalidSchema(format!(
+            "{} holds a database with a different schema: {stored:?}",
+            dir.display()
+        )));
+    }
+    Ok((manifest, wal_seq))
+}
+
+/// Read the segments that `manifest` names and the changes of log `wal_seq`.
+fn load(
+    dir: &Path,
+    schema: &Schema,
+    manifest: &Manifest,
+    wal_seq: u64,
+    repair: bool,
+) -> Result<(Vec<Segment>, Vec<Change>)> {
+    let segments = manifest
+        .parts
+        .iter()
+        .map(|(id, deleted)| {
+            let segment = Segment::decode(&fs::read(segment_path(dir, *id))?, schema, *id)?;
+            let valid = deleted.windows(2).all(|w| w[0] < w[1])
+                && deleted
+                    .last()
+                    .is_none_or(|&row| (row as usize) < segment.len());
+            if !valid {
+                return Err(corrupt(format!("deleted rows of segment {id} are invalid")));
+            }
+            Ok(segment)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let ordered = segments
+        .windows(2)
+        .all(|w| w[0].keys[w[0].len() - 1] < w[1].keys[0])
+        && segments
+            .last()
+            .is_none_or(|s| s.keys[s.len() - 1].0 < manifest.next_key);
+    if !ordered {
+        return Err(corrupt("segment key ranges overlap"));
+    }
+    let changes = replay(&wal_path(dir, wal_seq), schema, repair)?;
+    Ok((segments, changes))
+}
+
+/// The shared lock of a database opened read-only, if its directory has a
+/// `LOCK` file.
+pub(crate) struct ReadLock {
+    _lock: Option<File>,
+}
+
+/// Open the database in `dir` without changing any file.
+pub(crate) fn open_read_only(dir: &Path, schema: &Schema) -> Result<(ReadLock, Recovered)> {
+    // A backup has no `LOCK`, and no writer can have it open without one.
+    let lock = match File::open(dir.join("LOCK")) {
+        Ok(lock) => {
+            check_lock(dir, lock.try_lock_shared())?;
+            Some(lock)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let bytes = fs::read(manifest_path(dir)).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            RingDbError::Io(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{} holds no database", dir.display()),
+            ))
+        } else {
+            error.into()
+        }
+    })?;
+    let (manifest, wal_seq) = read_manifest(dir, &bytes, schema)?;
+    let (segments, changes) = load(dir, schema, &manifest, wal_seq, false)?;
+    Ok((
+        ReadLock { _lock: lock },
+        Recovered {
+            manifest,
+            segments,
+            changes,
+        },
+    ))
+}
+
 impl Store {
     /// Open or create the database in `dir`, which must hold `schema`.
     pub(crate) fn open(dir: &Path, schema: &Schema) -> Result<(Self, Recovered)> {
@@ -246,59 +357,16 @@ impl Store {
             .truncate(false)
             .write(true)
             .open(dir.join("LOCK"))?;
-        match lock.try_lock() {
-            Ok(()) => {}
-            Err(TryLockError::WouldBlock) => {
-                return Err(RingDbError::Io(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    format!("{} is open in another Db", dir.display()),
-                )));
-            }
-            Err(TryLockError::Error(error)) => return Err(error.into()),
-        }
+        check_lock(dir, lock.try_lock())?;
 
         let (manifest, wal_seq) = match fs::read(manifest_path(dir)) {
-            Ok(bytes) => {
-                let (stored, manifest, wal_seq) = decode_manifest(&bytes)?;
-                if stored != *schema {
-                    return Err(RingDbError::InvalidSchema(format!(
-                        "{} holds a database with a different schema: {stored:?}",
-                        dir.display()
-                    )));
-                }
-                (manifest, wal_seq)
-            }
+            Ok(bytes) => read_manifest(dir, &bytes, schema)?,
             Err(error) if error.kind() == io::ErrorKind::NotFound => Self::initialize(dir, schema)?,
             Err(error) => return Err(error.into()),
         };
-
-        let segments = manifest
-            .parts
-            .iter()
-            .map(|(id, deleted)| {
-                let segment = Segment::decode(&fs::read(segment_path(dir, *id))?, schema, *id)?;
-                let valid = deleted.windows(2).all(|w| w[0] < w[1])
-                    && deleted
-                        .last()
-                        .is_none_or(|&row| (row as usize) < segment.len());
-                if !valid {
-                    return Err(corrupt(format!("deleted rows of segment {id} are invalid")));
-                }
-                Ok(segment)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let ordered = segments
-            .windows(2)
-            .all(|w| w[0].keys[w[0].len() - 1] < w[1].keys[0])
-            && segments
-                .last()
-                .is_none_or(|s| s.keys[s.len() - 1].0 < manifest.next_key);
-        if !ordered {
-            return Err(corrupt("segment key ranges overlap"));
-        }
+        let (segments, changes) = load(dir, schema, &manifest, wal_seq, true)?;
 
         let wal = wal_path(dir, wal_seq);
-        let changes = replay(&wal, schema)?;
         let wal = if wal.exists() && fs::metadata(&wal)?.len() >= WAL_HEADER_LEN {
             OpenOptions::new().append(true).open(&wal)?
         } else {
@@ -350,7 +418,8 @@ impl Store {
         Ok((manifest, 0))
     }
 
-    /// Remove segment files, logs, and temporary files the manifest does not name.
+    /// Remove the segment files and logs that the manifest does not name, and a
+    /// left-over `MANIFEST.tmp`. Other files are not touched.
     fn remove_unreferenced(&self, manifest: &Manifest) -> Result<()> {
         let keep: Vec<String> = manifest
             .parts
@@ -361,8 +430,9 @@ impl Store {
         for entry in fs::read_dir(&self.dir)? {
             let name = entry?.file_name();
             let name = name.to_string_lossy();
-            let ours =
-                name.starts_with("seg-") || name.starts_with("wal-") || name.ends_with(".tmp");
+            let ours = name == "MANIFEST.tmp"
+                || is_numbered(&name, "seg-", ".seg")
+                || is_numbered(&name, "wal-", ".log");
             if ours && !keep.iter().any(|k| *k == name) {
                 fs::remove_file(self.dir.join(&*name))?;
             }
