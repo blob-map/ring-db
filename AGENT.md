@@ -69,7 +69,7 @@ src/
 ├── store.rs           directory lock, WAL, MANIFEST, segment files, recovery
 ├── codec.rs           checked little-endian Encoder/Decoder with CRC-32
 ├── error.rs           RingDbError
-├── query.rs           Knn, Disk, Region, Metric, Key, Hit, RegionResult
+├── query.rs           Knn, Disk, Region, Count, Metric, Key, Hit, RegionResult
 └── backend/
     ├── mod.rs         kernel inputs: Mask, DiskSpec, RowHit
     ├── cpu.rs         Rayon-parallel exact reference backend
@@ -123,8 +123,9 @@ under an `RwLock`). Lock `writer` before `current`, always. Searches and `get` r
 on a snapshot clone without locks. Uncommitted changes are invisible.
 
 A segment that fails to upload stays in `Writer::unpublished` and is retried at the
-next commit, so no record is lost. The commit thread ignores errors; `flush` repeats
-the commit and reports them. A commit holds the writer lock while it builds, writes,
+next commit, so no record is lost. The commit thread keeps its last error in
+`Shared::background_error` for `Db::take_background_error`; `flush` repeats the
+commit and reports errors directly. A commit holds the writer lock while it builds, writes,
 and uploads its segment: writes wait, which bounds the backlog; searches do not.
 
 A snapshot `Part` is an `Arc<Segment>` plus its sorted deleted rows and a cached live
@@ -170,6 +171,11 @@ Every search goes through `Db::search` or `Snapshot::search`, which take a seale
 | `Knn` | `Vec<Hit>` | exact best `k`, ordered by `(dist_sq, key)` |
 | `Disk` | `RegionResult` | inclusive `dist_sq <= radius^2` |
 | `Region` | `RegionResult` | vector must satisfy every disk (1..=`MAX_DISKS`) |
+| `Count` | `usize` | number of records in a `Region` (`Region::count`, `Disk::count`) |
+
+`Snapshot::count(&Filter)` (and `Db::count`) sums the eligible `RowSet` lengths
+without reading vectors. On Vulkan, `Count` runs the scan in mode 2, which only
+increments the output count word.
 
 A disk is a one-disk region: `Disk::and` and `Disk::filter` return a `Region`.
 `Knn::metric` and `Disk::metric` take `Metric::L2` or `Metric::WeightedL2(&w)`.
@@ -177,12 +183,15 @@ Each search has at most one `&Filter`; there are no per-disk filters.
 
 `RegionResult` stores flat `u32` records `[row, d0..dN-1]` (distances as `f32`
 bits). Rows are numbered across the snapshot's segments; keys resolve lazily
-through per-segment `(base row, Arc<[Key]>)` parts. `RegionHit::dists_sq`
+through per-segment `(base row, Arc<[Key]>)` parts. A part whose keys have no gaps
+computes `keys[0] + (row - base)` without reading `keys`: GPU hits come back in
+random row order, so reading the key array cost a cache miss per hit. `RegionHit::dists_sq`
 returns every disk's squared distance in disk order; there is no combined score.
 Do not split records into separate key and distance vectors: large fresh result
 allocations page-fault, and the extra bytes cost several percent on region scans.
 
 `k = 0` returns no hits. If fewer than `k` candidates exist, KNN returns all of them.
+KNN drops hits whose `dist_sq` overflowed to infinity, as regions do.
 Ties are deterministic by key: each segment returns its best `k` by `(dist_sq, row)`,
 which is key order within a segment, and the snapshot merges them by `(dist_sq, key)`.
 
@@ -300,7 +309,8 @@ Device tests also cover multi-segment databases.
 `Store` (only for `Db::open`) lives in `Writer`, so every log write and manifest
 write is serialized by the writer mutex. Directory files:
 
-- `LOCK`: held with `File::try_lock` while the `Db` is open;
+- `LOCK`: held with `File::try_lock` while a writing `Db` is open, and with
+  `try_lock_shared` by read-only ones;
 - `MANIFEST`: schema, `next_key`, `next_segment`, and each part's segment id and
   deleted rows, with a CRC; replaced by tmp file + rename + directory fsync;
 - `wal-{seq:016x}.log`: `[len u32][crc u32][payload]` frames. A payload is the
@@ -321,8 +331,16 @@ remove replaced files after.
 the manifest, so a crash during creation leaves at most `MANIFEST.tmp`; a missing
 log is created like an empty one), rejects a different schema,
 loads and checks every named segment, replays the WAL up to the first torn or
-corrupt frame (truncating it there), and removes unnamed files. `Db::open` then
-re-applies the recovered changes and commits. `Drop` commits durable databases.
+corrupt frame (truncating it there), and removes unnamed files: only
+`MANIFEST.tmp` and `seg-`/`wal-` names with 16 hex digits, never other files.
+`Db::open` then re-applies the recovered changes and commits. `Drop` commits
+durable databases.
+
+`store::open_read_only` shares the lock (a missing `LOCK`, as in a backup, means no
+lock), requires an existing manifest, and runs the same loading without truncating
+the log or removing files. The `Db` has no `Store` and no `dir`: replayed changes
+commit into memory only, no commit thread starts, and every write, `flush`,
+`compact`, and `backup` returns `ReadOnly` (`Shared::writable`).
 `backup` commits, then copies the manifest, the named segments, and the current
 WAL under the writer lock.
 All decoding goes through `codec::Decoder`, which returns `Corrupt`, never panics.
@@ -339,6 +357,7 @@ All decoding goes through `codec::Decoder`, which returns `Corrupt`, never panic
 - `InvalidRecord`;
 - `UnknownField`;
 - `KeyNotFound`;
+- `ReadOnly`;
 - `BackendUnavailable`;
 - `Backend`.
 

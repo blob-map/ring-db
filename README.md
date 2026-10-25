@@ -40,6 +40,7 @@ ring-db = "0.10"
 
 The crate name is `ring-db`, and the library name is `ringdb`.
 You do not need a GPU, a Vulkan SDK, or Cargo features to use the CPU.
+To update from version 0.9, read [MIGRATING.md](MIGRATING.md).
 
 ## Quick start
 
@@ -133,6 +134,7 @@ All vectors must have this number of dimensions.
 All fields are optional.
 A record has no value for a field that you do not set.
 An empty `Keywords` or `TextList` value is the same as no value.
+An empty `Keyword` string is a value.
 
 ### 2. Add records
 
@@ -219,6 +221,9 @@ Use `result.iter()` to read all hits, or `result.keys()` to read only the keys.
 Each hit has one squared distance for each disk, in the order of the disks.
 The order of the hits can change between searches.
 
+To get only the number of records in a region, use `db.search(region.count())`.
+It is faster, because ring-db does not return the records.
+
 ### 5. Give a weight to each dimension
 
 ring-db uses the Euclidean distance by default:
@@ -284,6 +289,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 Keyword filters compare the full string, with the same uppercase and lowercase letters.
+`db.count(&filter)` returns the number of records that pass a filter. It does not read the vectors.
 
 A record with no value for a field does not pass a filter on that field.
 Thus, `!Filter::eq("garden", true)` includes the records with no value for `garden`.
@@ -339,6 +345,8 @@ Changes become visible at the next commit.
 A background thread makes a commit each second.
 `db.flush()` makes a commit immediately.
 To make commits only when you call `flush`, use `Options::commit_interval(None)`.
+If a background commit fails, the changes stay, and the next commit tries again.
+`db.take_background_error()` returns the error.
 
 ### 9. Save the database to disk
 
@@ -375,11 +383,16 @@ Each write waits for the disk, which can take some milliseconds.
 To add many records, use one `add_all`, not many `add` calls.
 
 - `Db::open` returns `InvalidSchema` if the schema is different from the schema on the disk.
-- Only one `Db` can open a directory at a time. A second `Db::open` returns an `Io` error.
+- Only one `Db` can open a directory for writing. A second `Db::open` returns an `Io` error.
+- `Db::open_read_only` opens a database and changes no file, for example on a read-only mount. Writes return `ReadOnly`. Many read-only `Db`s can open the same directory.
 - Each file has a checksum. If a file is damaged, `Db::open` returns `Corrupt`.
 - `db.backup(directory)` copies the database to a new, empty directory. Open the copy with `Db::open`.
 
-Do not change the files in the database directory.
+When ring-db opens a database, it reads all segment files into memory.
+For a short time, it needs about two times the size of the files.
+
+The database directory is for ring-db only.
+Do not change its files, and do not put other files in it.
 
 ### 10. Use a GPU
 
@@ -408,6 +421,7 @@ If no compatible device is available, `Db::in_memory` and `Db::open` return `Bac
 ring-db does not change to the CPU automatically.
 
 ring-db copies the vectors to the GPU one time and keeps them there.
+It also keeps the vectors in the host memory, so the vectors use memory two times.
 All vectors must fit in the GPU memory.
 A GPU search has a fixed cost of about 0.1 ms.
 Thus ring-db uses the CPU when a segment has few rows that pass the filter, because the CPU is faster for them.
@@ -434,6 +448,7 @@ To change this limit, use `Options::vulkan_min_rows`.
 | `UnknownField` | A record or a filter uses a field that is not in the schema. |
 | `InvalidQuery` | A search or a filter is not correct, for example a point that is not finite, or a filter on a `Text` field. |
 | `KeyNotFound` | No record has this key, or the record is deleted. |
+| `ReadOnly` | A write to a database that `Db::open_read_only` opened. |
 | `InvalidSchema` | The schema is not correct, or it is different from the schema on the disk. |
 | `Io` | A file operation failed, or a different `Db` has the directory open. |
 | `Corrupt` | A database file is damaged. |
@@ -450,7 +465,7 @@ To change this limit, use `Options::vulkan_min_rows`.
 
 ### Tips for speed
 
-- After a large import, call `db.compact()`. A search on one segment is the fastest.
+- For a large import, use `Options::commit_interval(None)` and `auto_merge(false)`. Add the records with `add_all`, then call `db.compact()` one time. A search on one segment is the fastest.
 - To add many records, use `add_all` or `apply`, which write to the disk one time. Each write call waits for the disk, and write calls run one at a time, so many small calls are slow on a durable database.
 - Keyword filters and narrow ranges are fast. A filter that selects few records makes the search faster.
 - All methods take `&self`. To use one database from many threads, put it in an `Arc`.
